@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="ru">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Graph Service UI</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+    <style>
+        html,
+        body {
+            height: 100%;
+        }
+        
+        body {
+            margin: 0;
+            font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+        }
+        
+        #map {
+            position: fixed;
+            inset: 0;
+        }
+        
+        .floating-btn {
+            background: #2563eb;
+            color: #fff;
+            border: none;
+            border-radius: 8px;
+            padding: 10px 14px;
+            cursor: pointer;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, .25);
+        }
+        
+        .sidebar {
+            position: fixed;
+            top: 80px;
+            left: 16px;
+            z-index: 1200;
+            width: 320px;
+            background: #fff;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, .35);
+            padding: 16px;
+        }
+        
+        .modal-backdrop {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, .35);
+            display: none;
+            z-index: 1100;
+        }
+        
+        .modal {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: #fff;
+            border-radius: 12px;
+            width: min(92vw, 720px);
+            padding: 16px;
+            display: none;
+            z-index: 1200;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, .35);
+        }
+        
+        .row {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        
+        label {
+            display: flex;
+            gap: 6px;
+            align-items: center;
+        }
+        
+        input,
+        select {
+            padding: 8px 12px;
+            border: 1px solid #d1d5db;
+            border-radius: 8px;
+        }
+        
+        .modal-footer {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 12px;
+        }
+        
+        .btn-secondary {
+            background: #6b7280;
+        }
+        
+        pre {
+            background: #0b1021;
+            color: #d1d5db;
+            padding: 12px;
+            border-radius: 8px;
+            max-height: 220px;
+            overflow: auto;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="map"></div>
+    <div class="sidebar">
+        <h2 style="margin:0 0 12px">Параметры графа</h2>
+        <div class="row">
+            <label>Город <input id="city" placeholder="Например: Volgograd, Russia" /></label>
+            <label>Сеть 
+                <select id="network">
+                    <option value="all">all</option>
+                    <option value="drive" selected>drive</option>
+                    <option value="walk">walk</option>
+                    <option value="bike">bike</option>
+                    <option value="all_private">all_private</option>
+                </select>
+            </label>
+            <label> Simplify <input id="simplify" type="checkbox" checked /></label>
+        </div>
+        <div class="modal-footer">
+            <div><span id="status"></span></div>
+            <div>
+                <button class="floating-btn" style="position:static" onclick="buildGraph()">Загрузить граф</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let map, edgesLayer;
+
+        function ensureMap(center = [55.751244, 37.618423]) {
+            if (!map) {
+                map = L.map('map').setView(center, 10);
+                L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                    maxZoom: 19,
+                    attribution: '&copy; OpenStreetMap contributors'
+                }).addTo(map);
+            }
+        }
+
+        async function buildGraph() {
+            const city = document.getElementById('city').value;
+            const network = document.getElementById('network').value;
+            const simplify = document.getElementById('simplify').checked;
+            const statusEl = document.getElementById('status');
+            if (!city) {
+                alert('Укажите город');
+                return;
+            }
+            statusEl.textContent = 'Загрузка...';
+            try {
+                const cityUrl = new URL('/api/city', window.location.origin);
+                cityUrl.searchParams.set('city', city);
+                cityUrl.searchParams.set('network_type', network);
+                cityUrl.searchParams.set('simplify', simplify);
+                const cityResp = await fetch(cityUrl);
+                const cityData = await cityResp.json();
+                if (!cityResp.ok) throw new Error(cityData.detail || 'Ошибка загрузки графа');
+
+                const graphUrl = new URL('/api/graph', window.location.origin);
+                graphUrl.searchParams.set('city', city);
+                graphUrl.searchParams.set('network_type', network);
+                graphUrl.searchParams.set('simplify', simplify);
+                const graphResp = await fetch(graphUrl);
+                const graphData = await graphResp.json();
+                if (!graphResp.ok) throw new Error(graphData.detail || 'Ошибка GeoJSON');
+
+                ensureMap([graphData.center.lat, graphData.center.lon]);
+                if (edgesLayer) {
+                    map.removeLayer(edgesLayer);
+                }
+                edgesLayer = L.geoJSON(graphData.edges, {
+                    style: {
+                        color: '#2563eb',
+                        weight: 2,
+                        opacity: 0.8
+                    }
+                }).addTo(map);
+                const [
+                    [minLon, minLat, maxLon, maxLat]
+                ] = [graphData.bbox];
+                const bounds = L.latLngBounds([
+                    [minLat, minLon],
+                    [maxLat, maxLon]
+                ]);
+                map.fitBounds(bounds, {
+                    padding: [20, 20]
+                });
+                statusEl.textContent = 'Готово';
+            } catch (e) {
+                statusEl.textContent = 'Ошибка: ' + e.message;
+            }
+        }
+
+        ensureMap();
+    </script>
+</body>
+
+</html>

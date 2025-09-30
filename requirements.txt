@@ -1,0 +1,9 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+osmnx==1.9.3
+geopandas==1.0.1
+geopy==2.4.1
+redis==5.0.7
+requests==2.32.3
+
+
