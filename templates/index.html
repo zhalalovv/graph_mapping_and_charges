@@ -107,36 +107,130 @@
             max-height: 220px;
             overflow: auto;
         }
+        
+        .legend {
+            position: fixed;
+            bottom: 16px;
+            right: 16px;
+            z-index: 1200;
+            background: #fff;
+            border-radius: 8px;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, .25);
+            padding: 12px;
+            font-size: 13px;
+        }
+        
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 6px;
+        }
+        
+        .legend-item:last-child {
+            margin-bottom: 0;
+        }
+        
+        .legend-line {
+            width: 24px;
+            height: 3px;
+            border-radius: 2px;
+        }
     </style>
 </head>
 
 <body>
     <div id="map"></div>
+    
+    <div class="legend" id="legend" style="display:none">
+        <div style="font-weight:600; margin-bottom:8px">Типы рёбер:</div>
+        <div class="legend-item">
+            <div class="legend-line" style="background:#2563eb"></div>
+            <span>Дороги</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-line" style="background:#10b981"></div>
+            <span>Свободное пространство</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-line" style="background:#f59e0b"></div>
+            <span>Соединения</span>
+        </div>
+    </div>
+    
     <div class="sidebar">
         <h2 style="margin:0 0 12px">Параметры графа</h2>
-        <div class="row">
-            <label>Город <input id="city" placeholder="Например: Volgograd, Russia" /></label>
-            <label>Сеть 
-                <select id="network">
-                    <option value="all">all</option>
-                    <option value="drive" selected>drive</option>
-                    <option value="walk">walk</option>
-                    <option value="bike">bike</option>
-                    <option value="all_private">all_private</option>
+        <div style="display:flex; flex-direction:column; gap:12px">
+            <label style="display:flex; flex-direction:column; gap:4px">
+                Город
+                <input 
+                    id="cityInput" 
+                    list="cityList"
+                    placeholder="Начните вводить название..." 
+                    style="width:100%"
+                    autocomplete="off"
+                />
+                <datalist id="cityList"></datalist>
+            </label>
+            
+            <label style="display:flex; flex-direction:column; gap:4px">
+                Тип графа
+                <select id="graphType" style="width:100%">
+                    <option value="road">Дороги (OSM)</option>
+                    <option value="grid">Сеточный граф</option>
+                    <option value="delaunay">Delaunay триангуляция</option>
+                    <option value="merged" selected>Объединенный (дороги + сетка)</option>
                 </select>
             </label>
-            <label> Simplify <input id="simplify" type="checkbox" checked /></label>
         </div>
+        
         <div class="modal-footer">
-            <div><span id="status"></span></div>
+            <div style="font-size:14px">
+                <div id="status"></div>
+                <div id="statsInfo" style="margin-top:4px; color:#6b7280; font-size:12px"></div>
+            </div>
             <div>
-                <button class="floating-btn" style="position:static" onclick="buildGraph()">Загрузить граф</button>
+                <button class="floating-btn" style="position:static" onclick="buildGraph()">Построить</button>
             </div>
         </div>
     </div>
 
     <script>
         let map, edgesLayer;
+        
+        // Список популярных городов
+        const CITIES = [
+            { name: 'Москва', query: 'Moscow, Russia' },
+            { name: 'Санкт-Петербург', query: 'Saint Petersburg, Russia' },
+            { name: 'Новосибирск', query: 'Novosibirsk, Russia' },
+            { name: 'Екатеринбург', query: 'Yekaterinburg, Russia' },
+            { name: 'Казань', query: 'Kazan, Russia' },
+            { name: 'Нижний Новгород', query: 'Nizhny Novgorod, Russia' },
+            { name: 'Челябинск', query: 'Chelyabinsk, Russia' },
+            { name: 'Самара', query: 'Samara, Russia' },
+            { name: 'Омск', query: 'Omsk, Russia' },
+            { name: 'Ростов-на-Дону', query: 'Rostov-on-Don, Russia' },
+            { name: 'Уфа', query: 'Ufa, Russia' },
+            { name: 'Красноярск', query: 'Krasnoyarsk, Russia' },
+            { name: 'Воронеж', query: 'Voronezh, Russia' },
+            { name: 'Пермь', query: 'Perm, Russia' },
+            { name: 'Волгоград', query: 'Volgograd, Russia' },
+            { name: 'Краснодар', query: 'Krasnodar, Russia' },
+            { name: 'Саратов', query: 'Saratov, Russia' },
+            { name: 'Тюмень', query: 'Tyumen, Russia' },
+            { name: 'Тольятти', query: 'Tolyatti, Russia' },
+            { name: 'Ижевск', query: 'Izhevsk, Russia' },
+            { name: 'Барнаул', query: 'Barnaul, Russia' },
+            { name: 'Ульяновск', query: 'Ulyanovsk, Russia' },
+            { name: 'Иркутск', query: 'Irkutsk, Russia' },
+            { name: 'Хабаровск', query: 'Khabarovsk, Russia' },
+            { name: 'Владивосток', query: 'Vladivostok, Russia' },
+            { name: 'Ярославль', query: 'Yaroslavl, Russia' },
+            { name: 'Махачкала', query: 'Makhachkala, Russia' },
+            { name: 'Томск', query: 'Tomsk, Russia' },
+            { name: 'Оренбург', query: 'Orenburg, Russia' },
+            { name: 'Кемерово', query: 'Kemerovo, Russia' },
+        ];
 
         function ensureMap(center = [55.751244, 37.618423]) {
             if (!map) {
@@ -147,62 +241,174 @@
                 }).addTo(map);
             }
         }
+        
+        function initCityAutocomplete() {
+            const datalist = document.getElementById('cityList');
+            const input = document.getElementById('cityInput');
+            
+            // Заполняем datalist городами
+            CITIES.forEach(city => {
+                const option = document.createElement('option');
+                option.value = city.name;
+                option.setAttribute('data-query', city.query);
+                datalist.appendChild(option);
+            });
+            
+            // Обработка выбора города
+            input.addEventListener('input', function() {
+                const selectedCity = CITIES.find(c => c.name === this.value);
+                if (selectedCity) {
+                    this.setAttribute('data-query', selectedCity.query);
+                }
+            });
+        }
+        
+        function getCityQuery() {
+            const input = document.getElementById('cityInput');
+            const value = input.value.trim();
+            
+            if (!value) return null;
+            
+            // Проверяем, выбран ли город из списка
+            const selectedCity = CITIES.find(c => c.name === value);
+            if (selectedCity) {
+                return selectedCity.query;
+            }
+            
+            // Иначе используем введенное значение как есть
+            return value;
+        }
+
+        function getEdgeColor(edgeType) {
+            switch(edgeType) {
+                case 'road': return '#2563eb';      // синий для дорог
+                case 'free': return '#10b981';      // зеленый для свободного пространства
+                case 'connection': return '#f59e0b'; // оранжевый для соединений
+                default: return '#6b7280';          // серый по умолчанию
+            }
+        }
+
+        function getEdgeWeight(edgeType) {
+            switch(edgeType) {
+                case 'road': return 2.5;
+                case 'free': return 1.5;
+                case 'connection': return 2;
+                default: return 2;
+            }
+        }
 
         async function buildGraph() {
-            const city = document.getElementById('city').value;
-            const network = document.getElementById('network').value;
-            const simplify = document.getElementById('simplify').checked;
+            const city = getCityQuery();
+            const graphType = document.getElementById('graphType').value;
+            
+            // Фиксированные параметры (оптимальные)
+            const network = 'all';           // всегда все типы дорог
+            const simplify = true;           // всегда упрощаем
+            const gridSpacing = 0.001;       // фиксированный размер ячейки ~100м
+            const connectDiagonal = true;    // всегда с диагоналями
+            
             const statusEl = document.getElementById('status');
+            const statsEl = document.getElementById('statsInfo');
+            
             if (!city) {
-                alert('Укажите город');
+                alert('Выберите или введите город');
                 return;
             }
-            statusEl.textContent = 'Загрузка...';
+            
+            statusEl.textContent = 'Загрузка данных города...';
+            statsEl.textContent = '';
+            
             try {
+                // Сначала загружаем данные города
                 const cityUrl = new URL('/api/city', window.location.origin);
                 cityUrl.searchParams.set('city', city);
                 cityUrl.searchParams.set('network_type', network);
                 cityUrl.searchParams.set('simplify', simplify);
                 const cityResp = await fetch(cityUrl);
                 const cityData = await cityResp.json();
-                if (!cityResp.ok) throw new Error(cityData.detail || 'Ошибка загрузки графа');
+                if (!cityResp.ok) throw new Error(cityData.detail || 'Ошибка загрузки данных');
 
+                statusEl.textContent = 'Генерация графа...';
+
+                // Затем загружаем граф нужного типа
                 const graphUrl = new URL('/api/graph', window.location.origin);
                 graphUrl.searchParams.set('city', city);
                 graphUrl.searchParams.set('network_type', network);
                 graphUrl.searchParams.set('simplify', simplify);
+                graphUrl.searchParams.set('graph_type', graphType);
+                graphUrl.searchParams.set('grid_spacing', gridSpacing);
+                graphUrl.searchParams.set('connect_diagonal', connectDiagonal);
+                
                 const graphResp = await fetch(graphUrl);
                 const graphData = await graphResp.json();
-                if (!graphResp.ok) throw new Error(graphData.detail || 'Ошибка GeoJSON');
+                if (!graphResp.ok) throw new Error(graphData.detail || 'Ошибка генерации графа');
+
+                statusEl.textContent = 'Отрисовка...';
 
                 ensureMap([graphData.center.lat, graphData.center.lon]);
+                
+                // Удаляем старый слой
                 if (edgesLayer) {
                     map.removeLayer(edgesLayer);
                 }
+
+                // Добавляем новый слой с учетом типов рёбер
                 edgesLayer = L.geoJSON(graphData.edges, {
-                    style: {
-                        color: '#2563eb',
-                        weight: 2,
-                        opacity: 0.8
+                    style: function(feature) {
+                        const edgeType = feature.properties?.edge_type || 'unknown';
+                        return {
+                            color: getEdgeColor(edgeType),
+                            weight: getEdgeWeight(edgeType),
+                            opacity: 0.7
+                        };
+                    },
+                    onEachFeature: function(feature, layer) {
+                        if (feature.properties) {
+                            const props = feature.properties;
+                            layer.bindPopup(`
+                                Тип: ${props.edge_type || 'unknown'}<br>
+                                Длина: ${(props.length || 0).toFixed(4)} км
+                            `);
+                        }
                     }
                 }).addTo(map);
-                const [
-                    [minLon, minLat, maxLon, maxLat]
-                ] = [graphData.bbox];
+                
+                // Подгоняем карту под границы
+                const [minLon, minLat, maxLon, maxLat] = graphData.bbox;
                 const bounds = L.latLngBounds([
                     [minLat, minLon],
                     [maxLat, maxLon]
                 ]);
-                map.fitBounds(bounds, {
-                    padding: [20, 20]
-                });
-                statusEl.textContent = 'Готово';
+                map.fitBounds(bounds, { padding: [20, 20] });
+                
+                // Обновляем статус и статистику
+                statusEl.textContent = '✓ Готово';
+                
+                const stats = graphData.stats || {};
+                let statsText = `Узлов: ${stats.nodes || 0}, Рёбер: ${stats.edges || 0}`;
+                if (stats.road_nodes) {
+                    statsText += `\nДороги: ${stats.road_nodes}, Свободные: ${stats.free_nodes}`;
+                }
+                statsEl.textContent = statsText;
+                
+                // Показываем легенду для объединенного графа
+                const legendEl = document.getElementById('legend');
+                if (graphType === 'merged') {
+                    legendEl.style.display = 'block';
+                } else {
+                    legendEl.style.display = 'none';
+                }
+                
             } catch (e) {
-                statusEl.textContent = 'Ошибка: ' + e.message;
+                console.error(e);
+                statusEl.textContent = '✗ Ошибка: ' + e.message;
+                statsEl.textContent = '';
             }
         }
 
+        // Инициализация
         ensureMap();
+        initCityAutocomplete();
     </script>
 </body>
 

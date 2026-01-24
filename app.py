@@ -7,6 +7,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
 from data_service import DataService
+from graph_service import GraphService
 import json
 import osmnx as ox
 
@@ -23,6 +24,7 @@ app.add_middleware(
 )
 
 data_service = DataService()
+graph_service = GraphService()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -76,31 +78,100 @@ def graph_geojson(
     city: str = Query(..., description="Название города, как в /api/city"),
     network_type: str = Query('drive', description="Тип сети OSM"),
     simplify: bool = Query(True, description="Упрощение графа"),
+    graph_type: str = Query('road', description="Тип графа: road, grid, delaunay, merged"),
+    grid_spacing: float = Query(0.001, description="Размер ячейки сетки (в градусах)"),
+    connect_diagonal: bool = Query(True, description="Соединять диагональные узлы в сетке"),
 ):
     try:
         # Загружаем (или берём из кэша) данные города
         data = data_service.get_city_data(city, network_type=network_type, simplify=simplify)
-        graph = data.get("road_graph")
-        if graph is None:
+        road_graph = data.get("road_graph")
+        if road_graph is None:
             raise HTTPException(status_code=404, detail="Граф не найден")
 
-        # Преобразуем граф в GeoDataFrame и далее в GeoJSON
-        gdf_nodes, gdf_edges = ox.graph_to_gdfs(graph)
-        xmin, ymin, xmax, ymax = gdf_nodes.total_bounds  # lon/lat
+        buildings = data.get("buildings")
+        no_fly_zones = data.get("no_fly_zones", [])
+
+        # Получаем границы
+        gdf_nodes, gdf_edges = ox.graph_to_gdfs(road_graph)
+        xmin, ymin, xmax, ymax = gdf_nodes.total_bounds
         center_lat = (ymin + ymax) / 2.0
         center_lon = (xmin + xmax) / 2.0
+        bounds = (xmin, ymin, xmax, ymax)
 
-        edges_geojson = json.loads(gdf_edges.to_json())
+        # Генерируем нужный тип графа
+        if graph_type == 'road':
+            # Только дорожный граф
+            edges_geojson = json.loads(gdf_edges.to_json())
+            stats = data.get("stats", {})
+            
+        elif graph_type == 'grid':
+            # Сеточный граф
+            grid_graph = graph_service.create_grid_graph(
+                bounds=bounds,
+                grid_spacing=grid_spacing,
+                buildings=buildings,
+                no_fly_zones=no_fly_zones,
+                connect_diagonal=connect_diagonal
+            )
+            edges_geojson = graph_service.graph_to_geojson(grid_graph)
+            stats = {
+                "nodes": len(grid_graph.nodes),
+                "edges": len(grid_graph.edges),
+                "type": "grid"
+            }
+            
+        elif graph_type == 'delaunay':
+            # Delaunay триангуляция
+            num_points = int((xmax - xmin) * (ymax - ymin) / (grid_spacing ** 2))
+            num_points = min(max(num_points, 100), 1000)  # ограничиваем 100-1000
+            
+            delaunay_graph = graph_service.create_delaunay_graph(
+                bounds=bounds,
+                num_points=num_points,
+                buildings=buildings,
+                no_fly_zones=no_fly_zones
+            )
+            edges_geojson = graph_service.graph_to_geojson(delaunay_graph)
+            stats = {
+                "nodes": len(delaunay_graph.nodes),
+                "edges": len(delaunay_graph.edges),
+                "type": "delaunay"
+            }
+            
+        elif graph_type == 'merged':
+            # Объединенный граф
+            grid_graph = graph_service.create_grid_graph(
+                bounds=bounds,
+                grid_spacing=grid_spacing,
+                buildings=buildings,
+                no_fly_zones=no_fly_zones,
+                connect_diagonal=connect_diagonal
+            )
+            merged_graph = graph_service.merge_graphs(road_graph, grid_graph)
+            edges_geojson = graph_service.graph_to_geojson(merged_graph)
+            stats = {
+                "nodes": len(merged_graph.nodes),
+                "edges": len(merged_graph.edges),
+                "road_nodes": len([n for n, d in merged_graph.nodes(data=True) if d.get('graph_type') == 'road']),
+                "free_nodes": len([n for n, d in merged_graph.nodes(data=True) if d.get('graph_type') == 'free']),
+                "type": "merged"
+            }
+        else:
+            raise HTTPException(status_code=400, detail=f"Неизвестный тип графа: {graph_type}")
 
         return JSONResponse({
             "bbox": [xmin, ymin, xmax, ymax],
             "center": {"lat": center_lat, "lon": center_lon},
             "edges": edges_geojson,
-            "stats": data.get("stats", {}),
+            "stats": stats,
+            "graph_type": graph_type,
         })
     except HTTPException:
         raise
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
