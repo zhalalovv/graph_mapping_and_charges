@@ -6,7 +6,8 @@ from shapely.strtree import STRtree
 import geopandas as gpd
 from scipy.spatial import Delaunay, cKDTree
 import logging
-from typing import Tuple, List, Optional
+import osmnx as ox
+from typing import Tuple, List, Optional, Union
 from dataclasses import dataclass
 
 
@@ -53,10 +54,11 @@ class GraphService:
         bounds: Tuple[float, float, float, float],
         grid_spacing: float = 0.001,
         buildings: Optional[gpd.GeoDataFrame] = None,
-        no_fly_zones: Optional[List] = None,
+        no_fly_zones: Optional[Union[gpd.GeoDataFrame, List]] = None,
         connect_diagonal: bool = True,
         min_clearance: float = 0.0001,
-        use_adaptive: bool = True
+        use_adaptive: bool = True,
+        city_boundary: Optional[Polygon] = None
     ) -> nx.Graph:
         """
         Создает сеточный граф для свободного пространства
@@ -84,7 +86,8 @@ class GraphService:
                 base_spacing=grid_spacing,
                 min_spacing=grid_spacing * 0.5,  # 50% от базового для важных зон (увеличено для ускорения)
                 max_spacing=grid_spacing * 2.5,  # 250% от базового для неважных зон (увеличено для ускорения)
-                max_depth=4  # уменьшено для ускорения
+                max_depth=4,  # уменьшено для ускорения
+                city_boundary=city_boundary
             )
         
         # Старый метод с фиксированной сеткой (для совместимости)
@@ -107,15 +110,29 @@ class GraphService:
         
         self.logger.info(f"Фильтрация точек через пространственный индекс...")
         
-        # Фильтруем точки используя пространственный индекс
+        # Фильтруем точки используя пространственный индекс и границы города
         valid_indices = []
-        if spatial_index is not None:
-            for idx, (lon, lat) in enumerate(all_points):
-                point = Point(lon, lat)
+        for idx, (lon, lat) in enumerate(all_points):
+            point = Point(lon, lat)
+            
+            # СТРОГАЯ проверка: точка должна быть ВНУТРИ границ города
+            if city_boundary is not None:
+                try:
+                    # Проверяем вхождение точки в границы
+                    if not city_boundary.contains(point):
+                        if not city_boundary.touches(point):
+                            attempts += 1
+                            continue  # Точка вне границ - пропускаем
+                except Exception:
+                    attempts += 1
+                    continue
+            
+            # Проверяем препятствия
+            if spatial_index is not None:
                 if not self._point_intersects_index(point, spatial_index):
                     valid_indices.append(idx)
-        else:
-            valid_indices = list(range(len(all_points)))
+            else:
+                valid_indices.append(idx)
         
         self.logger.info(f"Найдено {len(valid_indices)} валидных точек из {len(all_points)}")
         
@@ -190,8 +207,9 @@ class GraphService:
         bounds: Tuple[float, float, float, float],
         num_points: int = 500,
         buildings: Optional[gpd.GeoDataFrame] = None,
-        no_fly_zones: Optional[List] = None,
-        min_clearance: float = 0.0001
+        no_fly_zones: Optional[Union[gpd.GeoDataFrame, List]] = None,
+        min_clearance: float = 0.0001,
+        city_boundary: Optional[Polygon] = None
     ) -> nx.Graph:
         """
         Создает граф на основе триангуляции Делоне
@@ -222,6 +240,12 @@ class GraphService:
             lon = np.random.uniform(min_lon, max_lon)
             lat = np.random.uniform(min_lat, max_lat)
             point = Point(lon, lat)
+            
+            # СТРОГАЯ проверка: точка должна быть ВНУТРИ границ города
+            if city_boundary is not None:
+                if not city_boundary.contains(point) and not city_boundary.touches(point):
+                    attempts += 1
+                    continue
             
             if not self._is_point_in_obstacles(point, obstacles):
                 points.append([lon, lat])
@@ -329,7 +353,7 @@ class GraphService:
     def _create_spatial_index(
         self,
         buildings: Optional[gpd.GeoDataFrame],
-        no_fly_zones: Optional[List],
+        no_fly_zones: Optional[Union[gpd.GeoDataFrame, List]],
         buffer_distance: float
     ) -> Optional[STRtree]:
         """Создает пространственный индекс для быстрой проверки препятствий"""
@@ -350,10 +374,35 @@ class GraphService:
             except Exception as e:
                 self.logger.warning(f"Ошибка обработки зданий: {e}")
         
-        if no_fly_zones:
-            for zone in no_fly_zones:
-                if hasattr(zone, 'geometry') and zone.geometry is not None:
-                    geometries.append(zone.geometry.buffer(buffer_distance))
+        # Проверяем no_fly_zones правильно (GeoDataFrame нельзя использовать в if напрямую)
+        if no_fly_zones is not None:
+            # Поддержка GeoDataFrame и списка геометрий
+            if isinstance(no_fly_zones, gpd.GeoDataFrame):
+                # Проверяем, не пустой ли GeoDataFrame
+                if len(no_fly_zones) > 0:
+                    # Если это GeoDataFrame, обрабатываем каждую строку
+                    for idx, row in no_fly_zones.iterrows():
+                        if row.geometry is not None and row.geometry.is_valid:
+                            # Зоны уже имеют буфер, добавляем дополнительный для безопасности
+                            geometries.append(row.geometry.buffer(buffer_distance))
+                    self.logger.info(f"Добавлено {len(no_fly_zones)} беспилотных зон из GeoDataFrame")
+            elif isinstance(no_fly_zones, list):
+                # Если это список геометрий или объектов с geometry
+                for zone in no_fly_zones:
+                    if hasattr(zone, 'geometry') and zone.geometry is not None:
+                        geometries.append(zone.geometry.buffer(buffer_distance))
+                    elif hasattr(zone, '__geo_interface__'):
+                        # Если это shapely геометрия
+                        from shapely.geometry import shape
+                        geom = shape(zone)
+                        if geom.is_valid:
+                            geometries.append(geom.buffer(buffer_distance))
+                    elif hasattr(zone, 'is_valid'):
+                        # Если это прямая shapely геометрия
+                        if zone.is_valid:
+                            geometries.append(zone.buffer(buffer_distance))
+                if len(no_fly_zones) > 0:
+                    self.logger.info(f"Добавлено беспилотных зон из списка")
         
         if not geometries:
             return None
@@ -401,7 +450,7 @@ class GraphService:
     def _prepare_obstacles(
         self,
         buildings: Optional[gpd.GeoDataFrame],
-        no_fly_zones: Optional[List],
+        no_fly_zones: Optional[Union[gpd.GeoDataFrame, List]],
         buffer_distance: float
     ) -> Optional[Polygon]:
         """Подготавливает объединенную геометрию препятствий с буфером (legacy method)"""
@@ -415,10 +464,21 @@ class GraphService:
             except Exception as e:
                 self.logger.warning(f"Ошибка обработки зданий: {e}")
         
-        if no_fly_zones:
-            for zone in no_fly_zones:
-                if hasattr(zone, 'geometry') and zone.geometry is not None:
-                    geometries.append(zone.geometry.buffer(buffer_distance))
+        # Проверяем no_fly_zones правильно (GeoDataFrame нельзя использовать в if напрямую)
+        if no_fly_zones is not None:
+            # Поддержка GeoDataFrame и списка геометрий
+            if isinstance(no_fly_zones, gpd.GeoDataFrame):
+                if len(no_fly_zones) > 0:
+                    for idx, row in no_fly_zones.iterrows():
+                        if row.geometry is not None and row.geometry.is_valid:
+                            geometries.append(row.geometry.buffer(buffer_distance))
+            elif isinstance(no_fly_zones, list):
+                for zone in no_fly_zones:
+                    if hasattr(zone, 'geometry') and zone.geometry is not None:
+                        geometries.append(zone.geometry.buffer(buffer_distance))
+                    elif hasattr(zone, 'is_valid'):
+                        if zone.is_valid:
+                            geometries.append(zone.buffer(buffer_distance))
         
         if not geometries:
             return None
@@ -531,7 +591,8 @@ class GraphService:
         min_lon: float, min_lat: float, max_lon: float, max_lat: float,
         max_depth: int = 4,  # Уменьшено с 6 до 4 для ускорения
         min_importance: float = 0.2,  # Увеличено для меньшего разбиения
-        min_size: float = 0.001  # Увеличено для меньшего разбиения
+        min_size: float = 0.001,  # Увеличено для меньшего разбиения
+        city_boundary: Optional[Polygon] = None
     ) -> QuadNode:
         """
         Строит квадродерево для адаптивного разбиения пространства (ОПТИМИЗИРОВАНО)
@@ -549,6 +610,17 @@ class GraphService:
             height = max_lat_zone - min_lat_zone
             if width < min_size or height < min_size:
                 return
+            
+            # Проверяем, пересекается ли зона с границами города
+            if city_boundary is not None:
+                try:
+                    zone_box = box(min_lon_zone, min_lat_zone, max_lon_zone, max_lat_zone)
+                    if not city_boundary.intersects(zone_box):
+                        # Зона полностью вне границ города - не разбиваем
+                        return
+                except Exception:
+                    # Если ошибка, продолжаем разбиение
+                    pass
             
             # Вычисляем важность зоны (упрощенная версия)
             node.importance = self._calculate_zone_importance(
@@ -573,7 +645,8 @@ class GraphService:
         spatial_index: Optional[STRtree],
         base_spacing: float,
         min_spacing: float,
-        max_spacing: float
+        max_spacing: float,
+        city_boundary: Optional[Polygon] = None
     ) -> List[Tuple[float, float]]:
         """
         Генерирует точки в узле квадродерева с адаптивным шагом (ОПТИМИЗИРОВАНО)
@@ -598,18 +671,42 @@ class GraphService:
                 # Фильтруем через пространственный индекс батчами
                 for lon, lat in all_candidates:
                     point = Point(lon, lat)
+                    
+                    # СТРОГАЯ проверка: точка должна быть ВНУТРИ границ города
+                    if city_boundary is not None:
+                        # Проверяем вхождение точки в границы (работает для Polygon и MultiPolygon)
+                        try:
+                            if not city_boundary.contains(point):
+                                # Если точка не строго внутри, проверяем, не на границе ли она
+                                if not city_boundary.touches(point):
+                                    continue  # Точка вне границ - пропускаем
+                        except Exception as e:
+                            # Если ошибка проверки, пропускаем точку для безопасности
+                            self.logger.warning(f"Ошибка проверки границ для точки {point}: {e}")
+                            continue
+                    
                     if not self._point_intersects_index(point, spatial_index):
                         points.append((lon, lat))
             else:
-                # Нет препятствий - добавляем все точки
+                # Нет препятствий - добавляем только точки внутри границ города
                 for lat in lats:
                     for lon in lons:
-                        points.append((lon, lat))
+                        point = Point(lon, lat)
+                        # СТРОГАЯ проверка: точка должна быть ВНУТРИ границ города
+                        if city_boundary is None:
+                            points.append((lon, lat))
+                        else:
+                            try:
+                                if city_boundary.contains(point) or city_boundary.touches(point):
+                                    points.append((lon, lat))
+                            except Exception:
+                                # Если ошибка проверки, пропускаем точку
+                                pass
         else:
             # Рекурсивно генерируем точки в дочерних узлах
             for child in node.children:
                 child_points = self._generate_adaptive_points(
-                    child, spatial_index, base_spacing, min_spacing, max_spacing
+                    child, spatial_index, base_spacing, min_spacing, max_spacing, city_boundary
                 )
                 points.extend(child_points)
         
@@ -619,13 +716,14 @@ class GraphService:
         self,
         bounds: Tuple[float, float, float, float],
         buildings: Optional[gpd.GeoDataFrame] = None,
-        no_fly_zones: Optional[List] = None,
+        no_fly_zones: Optional[Union[gpd.GeoDataFrame, List]] = None,
         connect_diagonal: bool = True,
         min_clearance: float = 0.0001,
         base_spacing: float = 0.001,
         min_spacing: float = 0.0005,  # увеличен для ускорения (~50м)
         max_spacing: float = 0.0025,  # увеличен для ускорения (~250м)
-        max_depth: int = 4  # уменьшено для ускорения
+        max_depth: int = 4,  # уменьшено для ускорения
+        city_boundary: Optional[Polygon] = None
     ) -> nx.Graph:
         """
         Создает адаптивный сеточный граф с использованием квадродерева
@@ -649,6 +747,10 @@ class GraphService:
         center_lat = (min_lat + max_lat) / 2.0
         
         self.logger.info(f"Генерация адаптивного сеточного графа: bounds={bounds}")
+        if city_boundary is not None:
+            self.logger.info(f"Границы города: {city_boundary.geom_type}, площадь: {city_boundary.area:.6f}")
+        else:
+            self.logger.warning("Границы города не заданы! Граф будет строиться в bounding box")
         
         # Создаем пространственный индекс
         spatial_index = self._create_spatial_index(buildings, no_fly_zones, min_clearance)
@@ -673,16 +775,31 @@ class GraphService:
         self.logger.info("Построение квадродерева...")
         quadtree = self._build_quadtree(
             bounds, (center_lon, center_lat), buildings_index,
-            min_lon, min_lat, max_lon, max_lat, max_depth
+            min_lon, min_lat, max_lon, max_lat, max_depth,
+            city_boundary=city_boundary
         )
         
         # Генерируем адаптивные точки
         self.logger.info("Генерация адаптивных точек...")
         all_points = self._generate_adaptive_points(
-            quadtree, spatial_index, base_spacing, min_spacing, max_spacing
+            quadtree, spatial_index, base_spacing, min_spacing, max_spacing, city_boundary
         )
         
         self.logger.info(f"Сгенерировано {len(all_points)} адаптивных точек")
+        
+        # Дополнительная проверка: фильтруем точки по границам города еще раз (на всякий случай)
+        if city_boundary is not None:
+            filtered_points = []
+            for lon, lat in all_points:
+                point = Point(lon, lat)
+                try:
+                    if city_boundary.contains(point) or city_boundary.touches(point):
+                        filtered_points.append((lon, lat))
+                except Exception:
+                    pass  # Пропускаем точку при ошибке
+            if len(filtered_points) < len(all_points):
+                self.logger.info(f"Дополнительная фильтрация: {len(all_points)} -> {len(filtered_points)} точек")
+                all_points = filtered_points
         
         # Создаем граф
         G = nx.Graph()

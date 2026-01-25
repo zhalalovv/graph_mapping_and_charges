@@ -10,6 +10,7 @@ from data_service import DataService
 from graph_service import GraphService
 import json
 import osmnx as ox
+import geopandas as gpd
 
 
 app = FastAPI(title="Graph Service UI", version="0.1.0")
@@ -91,12 +92,33 @@ def graph_geojson(
 
         buildings = data.get("buildings")
         no_fly_zones = data.get("no_fly_zones", [])
+        city_boundary = data.get("city_boundary")
 
-        # Получаем границы
+        # Получаем границы (для совместимости и bbox)
         gdf_nodes, gdf_edges = ox.graph_to_gdfs(road_graph)
         xmin, ymin, xmax, ymax = gdf_nodes.total_bounds
         center_lat = (ymin + ymax) / 2.0
         center_lon = (xmin + xmax) / 2.0
+        
+        # Если есть границы города, используем их для bounds и центра
+        if city_boundary is not None:
+            try:
+                boundary_bounds = city_boundary.bounds
+                # Используем границы города вместо bounding box дорожного графа
+                xmin, ymin, xmax, ymax = boundary_bounds[0], boundary_bounds[1], boundary_bounds[2], boundary_bounds[3]
+                center_lon = (xmin + xmax) / 2.0
+                center_lat = (ymin + ymax) / 2.0
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.info(f"✓ Используются границы города для bounds: {city_boundary.geom_type}")
+                logger.info(f"  Границы: lon=[{xmin:.6f}, {xmax:.6f}], lat=[{ymin:.6f}, {ymax:.6f}]")
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(f"Ошибка использования границ города: {e}")
+        else:
+            import logging
+            logging.getLogger(__name__).warning("⚠ Границы города не найдены! Используется bounding box")
+        
         bounds = (xmin, ymin, xmax, ymax)
 
         # Генерируем нужный тип графа
@@ -112,7 +134,8 @@ def graph_geojson(
                 grid_spacing=grid_spacing,
                 buildings=buildings,
                 no_fly_zones=no_fly_zones,
-                connect_diagonal=connect_diagonal
+                connect_diagonal=connect_diagonal,
+                city_boundary=city_boundary
             )
             edges_geojson = graph_service.graph_to_geojson(grid_graph)
             stats = {
@@ -130,7 +153,8 @@ def graph_geojson(
                 bounds=bounds,
                 num_points=num_points,
                 buildings=buildings,
-                no_fly_zones=no_fly_zones
+                no_fly_zones=no_fly_zones,
+                city_boundary=city_boundary
             )
             edges_geojson = graph_service.graph_to_geojson(delaunay_graph)
             stats = {
@@ -146,7 +170,8 @@ def graph_geojson(
                 grid_spacing=grid_spacing,
                 buildings=buildings,
                 no_fly_zones=no_fly_zones,
-                connect_diagonal=connect_diagonal
+                connect_diagonal=connect_diagonal,
+                city_boundary=city_boundary
             )
             merged_graph = graph_service.merge_graphs(road_graph, grid_graph)
             edges_geojson = graph_service.graph_to_geojson(merged_graph)
@@ -160,12 +185,33 @@ def graph_geojson(
         else:
             raise HTTPException(status_code=400, detail=f"Неизвестный тип графа: {graph_type}")
 
+        # Используем границы города для bbox, если они есть
+        if city_boundary is not None:
+            try:
+                boundary_bounds = city_boundary.bounds
+                bbox = [boundary_bounds[0], boundary_bounds[1], boundary_bounds[2], boundary_bounds[3]]
+            except Exception:
+                bbox = [xmin, ymin, xmax, ymax]
+        else:
+            bbox = [xmin, ymin, xmax, ymax]
+        
+        # Добавляем границы города в ответ для визуализации
+        city_boundary_geojson = None
+        if city_boundary is not None:
+            try:
+                boundary_gdf = gpd.GeoDataFrame([{'geometry': city_boundary}], crs='EPSG:4326')
+                city_boundary_geojson = json.loads(boundary_gdf.to_json())
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(f"Ошибка создания GeoJSON границ: {e}")
+        
         return JSONResponse({
-            "bbox": [xmin, ymin, xmax, ymax],
+            "bbox": bbox,
             "center": {"lat": center_lat, "lon": center_lon},
             "edges": edges_geojson,
             "stats": stats,
             "graph_type": graph_type,
+            "city_boundary": city_boundary_geojson,  # Границы города для визуализации
         })
     except HTTPException:
         raise

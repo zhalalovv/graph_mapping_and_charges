@@ -9,6 +9,8 @@ from geopy.extra.rate_limiter import RateLimiter
 import logging
 import json
 from redis import Redis
+from shapely.geometry import box, MultiPoint
+from shapely.ops import unary_union
 
 class DataService:
     def __init__(self, cache_dir="cache_data"):
@@ -34,7 +36,7 @@ class DataService:
             self._redis.ping()
         except Exception:
             self._redis = None
-            self.logger.warning("Redis not available for DataService cache; falling back to disk")
+            self.logger.info("Redis not available for DataService cache; using disk cache")
     
     def add_progress_callback(self, callback):
         self.progress_callbacks.append(callback)
@@ -55,15 +57,28 @@ class DataService:
             try:
                 blob = self._redis.get(redis_key)
                 if blob:
-                    self._update_progress("cache", 100, "Загрузка из Redis")
-                    return pickle.loads(blob)
+                    cached_data = pickle.loads(blob)
+                    # Проверяем, есть ли границы города в кэше
+                    if 'city_boundary' not in cached_data:
+                        self.logger.info("В Redis кэше нет границ города, перезагружаем данные")
+                        # Удаляем из Redis и загружаем заново
+                        self._redis.delete(redis_key)
+                    else:
+                        self._update_progress("cache", 100, "Загрузка из Redis")
+                        return cached_data
             except Exception as e:
                 self.logger.warning(f"Ошибка чтения из Redis: {e}")
 
         if os.path.exists(cache_file):
             self._update_progress("cache", 100, "Загрузка из кэша")
             try:
-                return self._load_from_cache(cache_file)
+                cached_data = self._load_from_cache(cache_file)
+                # Проверяем, есть ли границы города в кэше (для совместимости со старым кэшем)
+                if 'city_boundary' not in cached_data:
+                    self.logger.info("В кэше нет границ города, перезагружаем данные")
+                    os.remove(cache_file)
+                    return self._download_city_data(normalized_name, cache_file, redis_key, network_type=network_type, simplify=simplify)
+                return cached_data
             except Exception as e:
                 self.logger.warning(f"Ошибка загрузки кэша: {e}, перезагружаем данные")
                 os.remove(cache_file)
@@ -90,6 +105,74 @@ class DataService:
             if road_graph is None or len(road_graph.nodes) == 0:
                 raise Exception(f"Не удалось загрузить дорожную сеть для города: {city_name}")
             
+            self._update_progress("download", 40, "Загрузка границ города")
+            city_boundary = None
+            
+            # Сначала получаем узлы дорожного графа для fallback
+            gdf_nodes, _ = ox.graph_to_gdfs(road_graph)
+            
+            try:
+                # Метод 1: Пробуем получить границы через geocode_to_gdf (самый точный)
+                try:
+                    gdf_place = ox.geocode_to_gdf(city_name)
+                    if len(gdf_place) > 0 and gdf_place.geometry.iloc[0] is not None:
+                        city_boundary = gdf_place.geometry.iloc[0]
+                        if city_boundary.is_valid and city_boundary.geom_type in ['Polygon', 'MultiPolygon']:
+                            self.logger.info(f"✓ Загружены границы города через geocode_to_gdf: {city_boundary.geom_type}")
+                        else:
+                            city_boundary = None
+                            self.logger.warning("Границы из geocode_to_gdf невалидны")
+                except Exception as e:
+                    self.logger.warning(f"geocode_to_gdf не сработал: {e}")
+                
+                # Метод 2: Если не получилось, пробуем через features_from_place
+                if city_boundary is None:
+                    try:
+                        city_boundary_gdf = ox.features_from_place(
+                            city_name,
+                            tags={"boundary": "administrative"}
+                        )
+                        if len(city_boundary_gdf) > 0:
+                            # Берем самую большую границу (обычно это город)
+                            largest_idx = city_boundary_gdf.geometry.area.idxmax()
+                            city_boundary = city_boundary_gdf.geometry.iloc[largest_idx]
+                            if city_boundary.is_valid and city_boundary.geom_type in ['Polygon', 'MultiPolygon']:
+                                self.logger.info(f"✓ Загружены границы города через features_from_place: {city_boundary.geom_type}")
+                            else:
+                                city_boundary = None
+                                self.logger.warning("Границы из features_from_place невалидны")
+                    except Exception as e:
+                        self.logger.warning(f"features_from_place не сработал: {e}")
+                
+                # Метод 3: Используем выпуклую оболочку дорожного графа (всегда работает)
+                if city_boundary is None:
+                    try:
+                        # Создаем выпуклую оболочку (convex hull) из узлов дорожного графа
+                        # Это дает более точные границы, чем bounding box
+                        all_points = gdf_nodes.geometry.tolist()
+                        multipoint = MultiPoint(all_points)
+                        city_boundary = multipoint.convex_hull
+                        self.logger.info(f"✓ Используется выпуклая оболочка дорожного графа: {city_boundary.geom_type}")
+                    except Exception as e:
+                        self.logger.warning(f"Не удалось создать выпуклую оболочку: {e}")
+                        # Последний fallback: bounding box (но это нежелательно)
+                        xmin, ymin, xmax, ymax = gdf_nodes.total_bounds
+                        city_boundary = box(xmin, ymin, xmax, ymax)
+                        self.logger.warning("⚠ Используется bounding box (не рекомендуется)")
+                        
+            except Exception as e:
+                self.logger.warning(f"Ошибка загрузки границ города: {e}")
+                # Fallback: используем выпуклую оболочку
+                try:
+                    all_points = gdf_nodes.geometry.tolist()
+                    multipoint = MultiPoint(all_points)
+                    city_boundary = multipoint.convex_hull
+                    self.logger.info("Используется выпуклая оболочка (fallback)")
+                except:
+                    xmin, ymin, xmax, ymax = gdf_nodes.total_bounds
+                    city_boundary = box(xmin, ymin, xmax, ymax)
+                    self.logger.warning("Используется bounding box (последний fallback)")
+            
             self._update_progress("download", 50, "Загрузка зданий")
             buildings = gpd.GeoDataFrame()  # Пустой GeoDataFrame по умолчанию
             try:
@@ -104,6 +187,7 @@ class DataService:
                 'road_graph': road_graph,
                 'buildings': buildings,
                 'no_fly_zones': no_fly_zones,
+                'city_boundary': city_boundary,  # Добавляем границы города
                 'city_name': city_name,
                 'timestamp': time.time(),
                 'params': {
@@ -136,7 +220,147 @@ class DataService:
             raise
     
     def _get_no_fly_zones(self, city_name):
-        return []  # Заглушка - можно добавить реальные данные
+        """
+        Загружает беспилотные зоны из OpenStreetMap
+        
+        Признаки для вырезания:
+        1. Аэропорты и аэродромы (aeroway=aerodrome, airport)
+        2. Военные объекты (military=*, landuse=military)
+        3. Зоны безопасности вокруг аэропортов (buffer)
+        4. Запретные зоны (restriction:drone=no)
+        5. Зоны вокруг важных объектов (government, nuclear)
+        
+        Returns:
+            GeoDataFrame с беспилотными зонами
+        """
+        no_fly_zones = []
+        
+        try:
+            self.logger.info(f"Загрузка беспилотных зон для {city_name}")
+            
+            # 1. Аэропорты и аэродромы (самое важное!)
+            try:
+                airports = ox.features_from_place(
+                    city_name,
+                    tags={
+                        "aeroway": ["aerodrome", "airport", "heliport", "helipad"],
+                    }
+                )
+                if len(airports) > 0:
+                    self.logger.info(f"Найдено {len(airports)} аэропортов/аэродромов")
+                    # Добавляем буфер безопасности вокруг аэропортов (5 км)
+                    for idx, airport in airports.iterrows():
+                        if airport.geometry is not None and airport.geometry.is_valid:
+                            # Буфер в градусах: ~5км ≈ 0.045°
+                            buffer_zone = airport.geometry.buffer(0.045)
+                            no_fly_zones.append(buffer_zone)
+            except Exception as e:
+                self.logger.warning(f"Ошибка загрузки аэропортов: {e}")
+            
+            # 2. Военные объекты
+            try:
+                military = ox.features_from_place(
+                    city_name,
+                    tags={
+                        "military": True,
+                        "landuse": "military",
+                    }
+                )
+                if len(military) > 0:
+                    self.logger.info(f"Найдено {len(military)} военных объектов")
+                    for idx, obj in military.iterrows():
+                        if obj.geometry is not None and obj.geometry.is_valid:
+                            # Буфер 1 км вокруг военных объектов
+                            buffer_zone = obj.geometry.buffer(0.009)
+                            no_fly_zones.append(buffer_zone)
+            except Exception as e:
+                self.logger.warning(f"Ошибка загрузки военных объектов: {e}")
+            
+            # 3. Атомные станции и опасные объекты
+            try:
+                nuclear = ox.features_from_place(
+                    city_name,
+                    tags={
+                        "power": "nuclear",
+                        "nuclear": True,
+                    }
+                )
+                if len(nuclear) > 0:
+                    self.logger.info(f"Найдено {len(nuclear)} атомных объектов")
+                    for idx, obj in nuclear.iterrows():
+                        if obj.geometry is not None and obj.geometry.is_valid:
+                            # Буфер 3 км вокруг атомных объектов
+                            buffer_zone = obj.geometry.buffer(0.027)
+                            no_fly_zones.append(buffer_zone)
+            except Exception as e:
+                self.logger.warning(f"Ошибка загрузки атомных объектов: {e}")
+            
+            # 4. Правительственные объекты (опционально, меньший буфер)
+            try:
+                government = ox.features_from_place(
+                    city_name,
+                    tags={
+                        "office": "government",
+                        "government": True,
+                    }
+                )
+                if len(government) > 0:
+                    self.logger.info(f"Найдено {len(government)} правительственных объектов")
+                    for idx, obj in government.iterrows():
+                        if obj.geometry is not None and obj.geometry.is_valid:
+                            # Буфер 500м вокруг правительственных объектов
+                            buffer_zone = obj.geometry.buffer(0.0045)
+                            no_fly_zones.append(buffer_zone)
+            except Exception as e:
+                self.logger.warning(f"Ошибка загрузки правительственных объектов: {e}")
+            
+            # 5. Явные запретные зоны из OSM (если есть теги)
+            try:
+                restricted = ox.features_from_place(
+                    city_name,
+                    tags={
+                        "restriction:drone": "no",
+                        "drone": "no",
+                    }
+                )
+                if len(restricted) > 0:
+                    self.logger.info(f"Найдено {len(restricted)} явных запретных зон")
+                    for idx, zone in restricted.iterrows():
+                        if zone.geometry is not None and zone.geometry.is_valid:
+                            no_fly_zones.append(zone.geometry)
+            except Exception as e:
+                self.logger.warning(f"Ошибка загрузки запретных зон: {e}")
+            
+            if len(no_fly_zones) > 0:
+                # Объединяем все зоны в один GeoDataFrame
+                from shapely.geometry import Polygon, MultiPolygon
+                
+                try:
+                    # Объединяем все зоны
+                    union_zones = unary_union(no_fly_zones)
+                    
+                    # Создаем GeoDataFrame
+                    if isinstance(union_zones, Polygon):
+                        zones_gdf = gpd.GeoDataFrame([{'geometry': union_zones}], crs='EPSG:4326')
+                    elif isinstance(union_zones, MultiPolygon):
+                        zones_gdf = gpd.GeoDataFrame(
+                            [{'geometry': geom} for geom in union_zones.geoms],
+                            crs='EPSG:4326'
+                        )
+                    else:
+                        zones_gdf = gpd.GeoDataFrame([{'geometry': union_zones}], crs='EPSG:4326')
+                    
+                    self.logger.info(f"Создано {len(zones_gdf)} беспилотных зон")
+                    return zones_gdf
+                except Exception as e:
+                    self.logger.warning(f"Ошибка объединения беспилотных зон: {e}")
+                    # Возвращаем как список геометрий
+                    return no_fly_zones
+            
+        except Exception as e:
+            self.logger.warning(f"Ошибка загрузки беспилотных зон: {e}")
+        
+        return []
     
     def address_to_coords(self, address, city_name=None):
         """Улучшенное геокодирование с поддержкой российских адресов"""

@@ -179,7 +179,7 @@
                     <option value="road">Дороги (OSM)</option>
                     <option value="grid">Сеточный граф</option>
                     <option value="delaunay">Delaunay триангуляция</option>
-                    <option value="merged" selected>Объединенный (дороги + сетка)</option>
+                    <option value="merged">Объединенный (дороги + сетка)</option>
                 </select>
             </label>
         </div>
@@ -196,7 +196,7 @@
     </div>
 
     <script>
-        let map, edgesLayer;
+        let map, edgesLayer, boundaryLayer;
         
         // Список популярных городов
         const CITIES = [
@@ -347,9 +347,26 @@
 
                 ensureMap([graphData.center.lat, graphData.center.lon]);
                 
-                // Удаляем старый слой
+                // Удаляем старые слои
                 if (edgesLayer) {
                     map.removeLayer(edgesLayer);
+                }
+                if (boundaryLayer) {
+                    map.removeLayer(boundaryLayer);
+                }
+
+                // Добавляем границы города (если есть)
+                if (graphData.city_boundary) {
+                    boundaryLayer = L.geoJSON(graphData.city_boundary, {
+                        style: {
+                            color: '#ef4444',
+                            weight: 3,
+                            opacity: 0.8,
+                            fillColor: '#fee2e2',
+                            fillOpacity: 0.1,
+                            dashArray: '10, 5'
+                        }
+                    }).addTo(map);
                 }
 
                 // Добавляем новый слой с учетом типов рёбер
