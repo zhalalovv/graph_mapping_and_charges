@@ -176,7 +176,21 @@ class DataService:
             self._update_progress("download", 50, "Загрузка зданий")
             buildings = gpd.GeoDataFrame()  # Пустой GeoDataFrame по умолчанию
             try:
-                buildings = ox.features_from_place(city_name, tags={"building": True})
+                # ОПТИМИЗАЦИЯ: ограничиваем загрузку зданий по bbox для ускорения
+                if city_boundary is not None:
+                    try:
+                        bbox = city_boundary.bounds
+                        # north, south, east, west (bbox: minx, miny, maxx, maxy)
+                        buildings = ox.features_from_bbox(
+                            bbox[3], bbox[1], bbox[2], bbox[0],  # north=maxy, south=miny, east=maxx, west=minx
+                            tags={"building": True}
+                        )
+                        self.logger.info(f"Загружено {len(buildings)} зданий по bbox границ города")
+                    except Exception:
+                        # Fallback на старый метод
+                        buildings = ox.features_from_place(city_name, tags={"building": True})
+                else:
+                    buildings = ox.features_from_place(city_name, tags={"building": True})
             except Exception as e:
                 self.logger.warning(f"Не удалось загрузить здания: {e}")
             
@@ -481,3 +495,22 @@ class DataService:
         import re
         name = re.sub(r'[^\w\s-]', '', name)
         return re.sub(r'[-\s]+', '_', name).strip('_')[:100]
+    
+    def get_redis_client(self):
+        """Возвращает Redis клиент для использования в других сервисах"""
+        return self._redis
+    
+    def generate_graph_cache_key(self, city_name: str, network_type: str, simplify: bool, 
+                                 graph_type: str, grid_spacing: float, connect_diagonal: bool) -> str:
+        """Генерирует ключ кэша для графа на основе всех параметров"""
+        normalized_name = city_name.strip()
+        key_parts = [
+            self._sanitize_name(normalized_name),
+            self._sanitize_name(network_type),
+            str(int(bool(simplify))),
+            self._sanitize_name(graph_type),
+            f"{grid_spacing:.6f}".replace('.', '_'),
+            str(int(bool(connect_diagonal)))
+        ]
+        key_suffix = "__".join(key_parts)
+        return f"drone_planner:graph:{key_suffix}"

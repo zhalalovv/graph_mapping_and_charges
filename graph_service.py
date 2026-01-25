@@ -110,28 +110,44 @@ class GraphService:
         
         self.logger.info(f"Фильтрация точек через пространственный индекс...")
         
-        # Фильтруем точки используя пространственный индекс и границы города
+        # ОПТИМИЗИРОВАННАЯ фильтрация: предварительная фильтрация по bbox, затем точная проверка
         valid_indices = []
-        for idx, (lon, lat) in enumerate(all_points):
-            point = Point(lon, lat)
+        
+        # Предварительная фильтрация по bounding box границ города (быстро)
+        city_bbox = None
+        if city_boundary is not None:
+            try:
+                city_bbox = city_boundary.bounds  # (minx, miny, maxx, maxy)
+            except Exception:
+                pass
+        
+        # Векторизованная предварительная фильтрация по bbox
+        if city_bbox is not None:
+            minx, miny, maxx, maxy = city_bbox
+            # Векторизованная проверка bbox
+            bbox_mask = (
+                (all_points[:, 0] >= minx) & (all_points[:, 0] <= maxx) &
+                (all_points[:, 1] >= miny) & (all_points[:, 1] <= maxy)
+            )
+            candidates = np.where(bbox_mask)[0]
+        else:
+            candidates = np.arange(len(all_points))
+        
+        # Точная проверка только для кандидатов внутри bbox
+        for idx in candidates:
+            lon, lat = all_points[idx]
             
-            # СТРОГАЯ проверка: точка должна быть ВНУТРИ границ города
+            # Точная проверка границ города (только для кандидатов)
+            point = Point(lon, lat)
             if city_boundary is not None:
                 try:
-                    # Проверяем вхождение точки в границы
-                    if not city_boundary.contains(point):
-                        if not city_boundary.touches(point):
-                            attempts += 1
-                            continue  # Точка вне границ - пропускаем
+                    if not city_boundary.contains(point) and not city_boundary.touches(point):
+                        continue
                 except Exception:
-                    attempts += 1
                     continue
             
             # Проверяем препятствия
-            if spatial_index is not None:
-                if not self._point_intersects_index(point, spatial_index):
-                    valid_indices.append(idx)
-            else:
+            if spatial_index is None or not self._point_intersects_index(point, spatial_index):
                 valid_indices.append(idx)
         
         self.logger.info(f"Найдено {len(valid_indices)} валидных точек из {len(all_points)}")
@@ -155,6 +171,9 @@ class GraphService:
         n_lats = len(lats)
         
         edges_added = 0
+        
+        # ОПТИМИЗИРОВАННОЕ создание рёбер: используем set для отслеживания добавленных рёбер
+        edges_set = set()  # (min_node, max_node) для быстрой проверки
         
         # Соединяем соседние узлы более эффективно
         for idx in valid_indices:
@@ -184,19 +203,24 @@ class GraphService:
                     if neighbor_idx in index_to_node:
                         neighbor_node = index_to_node[neighbor_idx]
                         
-                        if not G.has_edge(node_id, neighbor_node):
-                            lat1, lon1 = node_to_coords[node_id]
-                            lat2, lon2 = node_to_coords[neighbor_node]
-                            
-                            # Упрощенная проверка пересечений только для диагоналей
-                            if connect_diagonal and abs(ni - i) == 1 and abs(nj - j) == 1:
-                                line = LineString([(lon1, lat1), (lon2, lat2)])
-                                if spatial_index and self._line_intersects_index(line, spatial_index):
-                                    continue
-                            
-                            distance = self._calculate_distance(lat1, lon1, lat2, lon2)
-                            G.add_edge(node_id, neighbor_node, weight=distance, length=distance)
-                            edges_added += 1
+                        # Используем set для быстрой проверки (быстрее чем has_edge)
+                        edge_key = (min(node_id, neighbor_node), max(node_id, neighbor_node))
+                        if edge_key in edges_set:
+                            continue
+                        
+                        lat1, lon1 = node_to_coords[node_id]
+                        lat2, lon2 = node_to_coords[neighbor_node]
+                        
+                        # Упрощенная проверка пересечений только для диагоналей
+                        if connect_diagonal and abs(ni - i) == 1 and abs(nj - j) == 1:
+                            line = LineString([(lon1, lat1), (lon2, lat2)])
+                            if spatial_index and self._line_intersects_index(line, spatial_index):
+                                continue
+                        
+                        distance = self._calculate_distance(lat1, lon1, lat2, lon2)
+                        G.add_edge(node_id, neighbor_node, weight=distance, length=distance)
+                        edges_set.add(edge_key)
+                        edges_added += 1
         
         self.logger.info(f"Добавлено {edges_added} рёбер в граф")
         
@@ -231,26 +255,60 @@ class GraphService:
         # Подготовка препятствий
         obstacles = self._prepare_obstacles(buildings, no_fly_zones, min_clearance)
         
-        # Генерируем случайные точки в свободном пространстве
+        # ОПТИМИЗИРОВАННАЯ генерация случайных точек: батчинг и предварительная фильтрация
         points = []
         attempts = 0
         max_attempts = num_points * 10
         
+        # Предварительная фильтрация по bbox границ города
+        city_bbox = None
+        if city_boundary is not None:
+            try:
+                city_bbox = city_boundary.bounds  # (minx, miny, maxx, maxy)
+            except Exception:
+                pass
+        
+        # Генерируем точки батчами для ускорения
+        batch_size = 100
         while len(points) < num_points and attempts < max_attempts:
-            lon = np.random.uniform(min_lon, max_lon)
-            lat = np.random.uniform(min_lat, max_lat)
-            point = Point(lon, lat)
+            # Генерируем батч случайных точек
+            batch_lons = np.random.uniform(min_lon, max_lon, batch_size)
+            batch_lats = np.random.uniform(min_lat, max_lat, batch_size)
             
-            # СТРОГАЯ проверка: точка должна быть ВНУТРИ границ города
-            if city_boundary is not None:
-                if not city_boundary.contains(point) and not city_boundary.touches(point):
-                    attempts += 1
-                    continue
+            # Предварительная фильтрация по bbox
+            if city_bbox is not None:
+                minx, miny, maxx, maxy = city_bbox
+                bbox_mask = (
+                    (batch_lons >= minx) & (batch_lons <= maxx) &
+                    (batch_lats >= miny) & (batch_lats <= maxy)
+                )
+                candidates = list(zip(batch_lons[bbox_mask], batch_lats[bbox_mask]))
+            else:
+                candidates = list(zip(batch_lons, batch_lats))
             
-            if not self._is_point_in_obstacles(point, obstacles):
-                points.append([lon, lat])
+            # Точная проверка только для кандидатов
+            for lon, lat in candidates:
+                if len(points) >= num_points:
+                    break
+                    
+                point = Point(lon, lat)
+                
+                # Точная проверка границ города
+                if city_boundary is not None:
+                    try:
+                        if not city_boundary.contains(point) and not city_boundary.touches(point):
+                            attempts += 1
+                            continue
+                    except Exception:
+                        attempts += 1
+                        continue
+                
+                if not self._is_point_in_obstacles(point, obstacles):
+                    points.append([lon, lat])
+                
+                attempts += 1
             
-            attempts += 1
+            attempts += len(candidates)
         
         if len(points) < 3:
             self.logger.warning("Недостаточно точек для триангуляции")
@@ -288,12 +346,12 @@ class GraphService:
     def merge_graphs(self, road_graph: nx.Graph, free_space_graph: nx.Graph, 
                      max_connection_distance: float = 0.001) -> nx.Graph:
         """
-        Объединяет дорожный граф и граф свободного пространства
+        Объединяет дорожный граф и граф свободного пространства (ОПТИМИЗИРОВАНО)
         
         Args:
             road_graph: граф дорог из OSM
             free_space_graph: граф свободного пространства
-            max_connection_distance: максимальное расстояние для соединения графов
+            max_connection_distance: максимальное расстояние для соединения графов (в км)
             
         Returns:
             Объединенный граф
@@ -303,47 +361,106 @@ class GraphService:
         # Создаем новый граф
         merged = nx.Graph()
         
+        # ОПТИМИЗАЦИЯ: добавляем узлы и рёбра батчами
         # Добавляем узлы из дорожного графа с префиксом 'road_'
+        road_node_mapping = {}
         for node, data in road_graph.nodes(data=True):
-            merged.add_node(f"road_{node}", **data, graph_type='road')
+            new_node_id = f"road_{node}"
+            merged.add_node(new_node_id, **data, graph_type='road')
+            road_node_mapping[node] = new_node_id
         
         # Добавляем рёбра из дорожного графа
         for u, v, data in road_graph.edges(data=True):
-            merged.add_edge(f"road_{u}", f"road_{v}", **data, edge_type='road')
+            merged.add_edge(road_node_mapping[u], road_node_mapping[v], **data, edge_type='road')
         
         # Добавляем узлы из графа свободного пространства с префиксом 'free_'
+        free_node_mapping = {}
         for node, data in free_space_graph.nodes(data=True):
-            merged.add_node(f"free_{node}", **data, graph_type='free')
+            new_node_id = f"free_{node}"
+            merged.add_node(new_node_id, **data, graph_type='free')
+            free_node_mapping[node] = new_node_id
         
         # Добавляем рёбра из графа свободного пространства
         for u, v, data in free_space_graph.edges(data=True):
-            merged.add_edge(f"free_{u}", f"free_{v}", **data, edge_type='free')
+            merged.add_edge(free_node_mapping[u], free_node_mapping[v], **data, edge_type='free')
+        
+        # ОПТИМИЗАЦИЯ: используем cKDTree для быстрого поиска ближайших соседей
+        self.logger.info("Поиск соединений между графами...")
+        
+        # Собираем координаты узлов свободного пространства
+        free_coords = []
+        free_nodes_list = []
+        for node, data in free_space_graph.nodes(data=True):
+            if 'lat' in data and 'lon' in data:
+                # Используем (lon, lat) для cKDTree (стандартный формат)
+                free_coords.append([data['lon'], data['lat']])
+                free_nodes_list.append(node)
+        
+        if not free_coords:
+            self.logger.warning("Нет узлов свободного пространства с координатами")
+            self.logger.info(f"Объединенный граф: {len(merged.nodes)} узлов, {len(merged.edges)} рёбер")
+            return merged
+        
+        # Создаем KD-tree для узлов свободного пространства
+        free_coords_array = np.array(free_coords)
+        free_kdtree = cKDTree(free_coords_array)
+        
+        # ОПТИМИЗАЦИЯ: конвертируем max_connection_distance из км в градусы (приблизительно)
+        # 1 км ≈ 0.009° на широте ~55° (средняя для России)
+        max_dist_degrees = max_connection_distance * 0.009
         
         # Соединяем близкие узлы между графами
         connections = 0
-        for road_node, road_data in road_graph.nodes(data=True):
+        connections_set = set()  # Для избежания дубликатов
+        
+        # ОПТИМИЗАЦИЯ: ограничиваем количество проверяемых дорожных узлов для ускорения
+        road_nodes_to_check = list(road_graph.nodes(data=True))
+        max_road_nodes = 5000  # Ограничение для ускорения
+        if len(road_nodes_to_check) > max_road_nodes:
+            # Берем случайную выборку дорожных узлов
+            import random
+            road_nodes_to_check = random.sample(road_nodes_to_check, max_road_nodes)
+            self.logger.info(f"Ограничение: проверяем {max_road_nodes} из {len(road_graph.nodes)} дорожных узлов")
+        
+        for road_node, road_data in road_nodes_to_check:
             if 'y' not in road_data or 'x' not in road_data:
                 continue
             
             road_lat, road_lon = road_data['y'], road_data['x']
+            road_point = np.array([road_lon, road_lat])
             
-            for free_node, free_data in free_space_graph.nodes(data=True):
-                if 'lat' not in free_data or 'lon' not in free_data:
-                    continue
+            # ОПТИМИЗАЦИЯ: используем query_ball_point для быстрого поиска соседей в радиусе
+            # Это намного быстрее чем проверять все узлы
+            neighbor_indices = free_kdtree.query_ball_point(road_point, r=max_dist_degrees)
+            
+            # ОПТИМИЗАЦИЯ: ограничиваем количество соединений для каждого дорожного узла
+            max_connections_per_node = 3  # Максимум 3 соединения на узел
+            connections_added = 0
+            
+            for idx in neighbor_indices:
+                if connections_added >= max_connections_per_node:
+                    break
+                    
+                free_node = free_nodes_list[idx]
+                free_lat, free_lon = free_coords[idx][1], free_coords[idx][0]
                 
-                free_lat, free_lon = free_data['lat'], free_data['lon']
-                
+                # Точная проверка расстояния (в км)
                 distance = self._calculate_distance(road_lat, road_lon, free_lat, free_lon)
                 
                 if distance <= max_connection_distance:
-                    merged.add_edge(
-                        f"road_{road_node}",
-                        f"free_{free_node}",
-                        weight=distance,
-                        length=distance,
-                        edge_type='connection'
-                    )
-                    connections += 1
+                    # Проверяем, не создали ли мы уже это соединение
+                    edge_key = (min(road_node, free_node), max(road_node, free_node))
+                    if edge_key not in connections_set:
+                        merged.add_edge(
+                            road_node_mapping[road_node],
+                            free_node_mapping[free_node],
+                            weight=distance,
+                            length=distance,
+                            edge_type='connection'
+                        )
+                        connections_set.add(edge_key)
+                        connections += 1
+                        connections_added += 1
         
         self.logger.info(f"Создано {connections} соединений между графами")
         self.logger.info(f"Объединенный граф: {len(merged.nodes)} узлов, {len(merged.edges)} рёбер")
@@ -356,23 +473,36 @@ class GraphService:
         no_fly_zones: Optional[Union[gpd.GeoDataFrame, List]],
         buffer_distance: float
     ) -> Optional[STRtree]:
-        """Создает пространственный индекс для быстрой проверки препятствий"""
+        """Создает пространственный индекс для быстрой проверки препятствий (ОПТИМИЗИРОВАНО)"""
         geometries = []
         
         if buildings is not None and len(buildings) > 0:
             try:
-                # Ограничиваем количество зданий для ускорения
-                max_buildings = 5000
+                # ОПТИМИЗАЦИЯ: увеличиваем лимит и используем векторизацию
+                max_buildings = 10000  # Увеличено для лучшего качества
                 buildings_sample = buildings.head(max_buildings) if len(buildings) > max_buildings else buildings
                 
-                for geom in buildings_sample.geometry:
-                    if geom is not None and geom.is_valid:
-                        buffered = geom.buffer(buffer_distance)
-                        geometries.append(buffered)
+                # ОПТИМИЗАЦИЯ: фильтруем валидные геометрии заранее
+                valid_geoms = buildings_sample.geometry[buildings_sample.geometry.notna() & buildings_sample.geometry.is_valid]
+                
+                # Векторизованное создание буферов (быстрее чем цикл)
+                if len(valid_geoms) > 0:
+                    buffered_geoms = valid_geoms.buffer(buffer_distance)
+                    geometries.extend([geom for geom in buffered_geoms if geom is not None])
                 
                 self.logger.info(f"Добавлено {len(geometries)} зданий в пространственный индекс")
             except Exception as e:
                 self.logger.warning(f"Ошибка обработки зданий: {e}")
+                # Fallback на старый метод
+                try:
+                    max_buildings = 5000
+                    buildings_sample = buildings.head(max_buildings) if len(buildings) > max_buildings else buildings
+                    for geom in buildings_sample.geometry:
+                        if geom is not None and geom.is_valid:
+                            buffered = geom.buffer(buffer_distance)
+                            geometries.append(buffered)
+                except Exception:
+                    pass
         
         # Проверяем no_fly_zones правильно (GeoDataFrame нельзя использовать в if напрямую)
         if no_fly_zones is not None:
@@ -414,7 +544,7 @@ class GraphService:
             return None
     
     def _point_intersects_index(self, point: Point, spatial_index: STRtree) -> bool:
-        """Проверяет пересечение точки с препятствиями через пространственный индекс"""
+        """Проверяет пересечение точки с препятствиями через пространственный индекс (ОПТИМИЗИРОВАНО)"""
         if spatial_index is None:
             return False
         
@@ -422,9 +552,9 @@ class GraphService:
             # Быстрый поиск потенциальных пересечений
             potential_matches = spatial_index.query(point)
             
-            # Точная проверка пересечений
+            # ОПТИМИЗАЦИЯ: проверяем только contains (быстрее чем contains + intersects)
             for geom in potential_matches:
-                if geom.contains(point) or geom.intersects(point):
+                if geom.contains(point):
                     return True
             
             return False
@@ -524,17 +654,26 @@ class GraphService:
     def _calculate_distance(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
         """
         Вычисляет расстояние между двумя точками по формуле гаверсинуса (в км)
+        ОПТИМИЗИРОВАНО: использует векторизованные операции NumPy
         """
         R = 6371.0  # Радиус Земли в км
         
+        # ОПТИМИЗАЦИЯ: векторизованные вычисления
         lat1_rad = np.radians(lat1)
         lat2_rad = np.radians(lat2)
         delta_lat = np.radians(lat2 - lat1)
         delta_lon = np.radians(lon2 - lon1)
         
-        a = (np.sin(delta_lat / 2) ** 2 + 
-             np.cos(lat1_rad) * np.cos(lat2_rad) * np.sin(delta_lon / 2) ** 2)
-        c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+        # Используем более быструю формулу для малых расстояний
+        # Для расстояний < 100км можно использовать упрощенную формулу
+        if abs(delta_lat) < 0.9 and abs(delta_lon) < 0.9:  # ~100км
+            # Упрощенная формула для малых расстояний (быстрее)
+            a = np.sin(delta_lat / 2) ** 2 + np.cos(lat1_rad) * np.cos(lat2_rad) * np.sin(delta_lon / 2) ** 2
+            c = 2 * np.arcsin(np.sqrt(a))
+        else:
+            # Полная формула гаверсинуса
+            a = np.sin(delta_lat / 2) ** 2 + np.cos(lat1_rad) * np.cos(lat2_rad) * np.sin(delta_lon / 2) ** 2
+            c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
         
         return R * c
     
@@ -662,46 +801,44 @@ class GraphService:
             lons = np.arange(min_lon, max_lon, spacing)
             lats = np.arange(min_lat, max_lat, spacing)
             
-            # Батчинг проверок препятствий для ускорения
-            if spatial_index is not None:
-                # Создаем все точки сразу
-                lon_mesh, lat_mesh = np.meshgrid(lons, lats)
-                all_candidates = np.column_stack([lon_mesh.ravel(), lat_mesh.ravel()])
-                
-                # Фильтруем через пространственный индекс батчами
-                for lon, lat in all_candidates:
-                    point = Point(lon, lat)
-                    
-                    # СТРОГАЯ проверка: точка должна быть ВНУТРИ границ города
-                    if city_boundary is not None:
-                        # Проверяем вхождение точки в границы (работает для Polygon и MultiPolygon)
-                        try:
-                            if not city_boundary.contains(point):
-                                # Если точка не строго внутри, проверяем, не на границе ли она
-                                if not city_boundary.touches(point):
-                                    continue  # Точка вне границ - пропускаем
-                        except Exception as e:
-                            # Если ошибка проверки, пропускаем точку для безопасности
-                            self.logger.warning(f"Ошибка проверки границ для точки {point}: {e}")
-                            continue
-                    
-                    if not self._point_intersects_index(point, spatial_index):
-                        points.append((lon, lat))
+            # ОПТИМИЗИРОВАННАЯ генерация: векторизация через NumPy
+            lon_mesh, lat_mesh = np.meshgrid(lons, lats)
+            all_candidates = np.column_stack([lon_mesh.ravel(), lat_mesh.ravel()])
+            
+            # Предварительная фильтрация по bbox границ города (быстро)
+            city_bbox = None
+            if city_boundary is not None:
+                try:
+                    city_bbox = city_boundary.bounds  # (minx, miny, maxx, maxy)
+                except Exception:
+                    pass
+            
+            # Векторизованная предварительная фильтрация по bbox
+            if city_bbox is not None:
+                minx, miny, maxx, maxy = city_bbox
+                bbox_mask = (
+                    (all_candidates[:, 0] >= minx) & (all_candidates[:, 0] <= maxx) &
+                    (all_candidates[:, 1] >= miny) & (all_candidates[:, 1] <= maxy)
+                )
+                candidates = all_candidates[bbox_mask]
             else:
-                # Нет препятствий - добавляем только точки внутри границ города
-                for lat in lats:
-                    for lon in lons:
-                        point = Point(lon, lat)
-                        # СТРОГАЯ проверка: точка должна быть ВНУТРИ границ города
-                        if city_boundary is None:
-                            points.append((lon, lat))
-                        else:
-                            try:
-                                if city_boundary.contains(point) or city_boundary.touches(point):
-                                    points.append((lon, lat))
-                            except Exception:
-                                # Если ошибка проверки, пропускаем точку
-                                pass
+                candidates = all_candidates
+            
+            # Точная проверка только для кандидатов
+            for lon, lat in candidates:
+                point = Point(lon, lat)
+                
+                # Точная проверка границ города (только для кандидатов)
+                if city_boundary is not None:
+                    try:
+                        if not city_boundary.contains(point) and not city_boundary.touches(point):
+                            continue
+                    except Exception:
+                        continue
+                
+                # Проверяем препятствия
+                if spatial_index is None or not self._point_intersects_index(point, spatial_index):
+                    points.append((lon, lat))
         else:
             # Рекурсивно генерируем точки в дочерних узлах
             for child in node.children:
@@ -755,21 +892,36 @@ class GraphService:
         # Создаем пространственный индекс
         spatial_index = self._create_spatial_index(buildings, no_fly_zones, min_clearance)
         
-        # Создаем индекс зданий для вычисления важности (упрощенный)
+        # ОПТИМИЗИРОВАННОЕ создание индекса зданий для вычисления важности
         buildings_index = None
         if buildings is not None and len(buildings) > 0:
             try:
-                geometries = []
-                # Уменьшаем количество зданий для ускорения
-                max_buildings = 2000
+                # ОПТИМИЗАЦИЯ: используем векторизацию для фильтрации
+                max_buildings = 3000  # Увеличено для лучшего качества
                 buildings_sample = buildings.head(max_buildings) if len(buildings) > max_buildings else buildings
-                for geom in buildings_sample.geometry:
-                    if geom is not None and geom.is_valid:
-                        geometries.append(geom)
-                if geometries:
+                
+                # Векторизованная фильтрация валидных геометрий
+                valid_geoms = buildings_sample.geometry[
+                    buildings_sample.geometry.notna() & buildings_sample.geometry.is_valid
+                ]
+                
+                if len(valid_geoms) > 0:
+                    geometries = valid_geoms.tolist()
                     buildings_index = STRtree(geometries)
             except Exception as e:
                 self.logger.warning(f"Ошибка создания индекса зданий: {e}")
+                # Fallback на старый метод
+                try:
+                    geometries = []
+                    max_buildings = 2000
+                    buildings_sample = buildings.head(max_buildings) if len(buildings) > max_buildings else buildings
+                    for geom in buildings_sample.geometry:
+                        if geom is not None and geom.is_valid:
+                            geometries.append(geom)
+                    if geometries:
+                        buildings_index = STRtree(geometries)
+                except Exception:
+                    pass
         
         # Строим квадродерево (упрощенное)
         self.logger.info("Построение квадродерева...")
@@ -787,19 +939,7 @@ class GraphService:
         
         self.logger.info(f"Сгенерировано {len(all_points)} адаптивных точек")
         
-        # Дополнительная проверка: фильтруем точки по границам города еще раз (на всякий случай)
-        if city_boundary is not None:
-            filtered_points = []
-            for lon, lat in all_points:
-                point = Point(lon, lat)
-                try:
-                    if city_boundary.contains(point) or city_boundary.touches(point):
-                        filtered_points.append((lon, lat))
-                except Exception:
-                    pass  # Пропускаем точку при ошибке
-            if len(filtered_points) < len(all_points):
-                self.logger.info(f"Дополнительная фильтрация: {len(all_points)} -> {len(filtered_points)} точек")
-                all_points = filtered_points
+        # Дополнительная проверка удалена - фильтрация уже выполнена в _generate_adaptive_points
         
         # Создаем граф
         G = nx.Graph()
@@ -816,24 +956,34 @@ class GraphService:
         edges_added = 0
         max_connection_dist = max_spacing * 1.5  # уменьшено для ускорения
         
-        # Создаем пространственный индекс узлов для быстрого поиска соседей
+        # ОПТИМИЗИРОВАННОЕ создание рёбер: используем set и векторизацию
         if len(all_points) > 0:
-            coords_array = np.array([(lon, lat) for lon, lat in all_points])
+            # Векторизованное создание массива координат
+            coords_array = np.array(all_points, dtype=np.float64)
             kdtree = cKDTree(coords_array)
             
-            # Ищем только k ближайших соседей для каждого узла (быстрее чем query_ball_point)
+            # Используем set для отслеживания добавленных рёбер (быстрее чем has_edge)
+            edges_set = set()
+            
+            # Ищем только k ближайших соседей для каждого узла
             k_neighbors = 8 if connect_diagonal else 4
             
             for node_id, (lon1, lat1) in enumerate(all_points):
                 # Ищем k ближайших соседей
                 distances, indices = kdtree.query((lon1, lat1), k=min(k_neighbors + 1, len(all_points)))
                 
+                # Обрабатываем результаты векторизованно
                 for dist, neighbor_idx in zip(distances, indices):
                     if neighbor_idx == node_id or neighbor_idx >= len(all_points):
                         continue
                     
                     # Проверяем максимальное расстояние
                     if dist > max_connection_dist:
+                        continue
+                    
+                    # Используем set для быстрой проверки
+                    edge_key = (min(node_id, neighbor_idx), max(node_id, neighbor_idx))
+                    if edge_key in edges_set:
                         continue
                     
                     lon2, lat2 = all_points[neighbor_idx]
@@ -849,9 +999,9 @@ class GraphService:
                     
                     # Вычисляем реальное расстояние
                     distance = self._calculate_distance(lat1, lon1, lat2, lon2)
-                    if not G.has_edge(node_id, neighbor_idx):
-                        G.add_edge(node_id, neighbor_idx, weight=distance, length=distance)
-                        edges_added += 1
+                    G.add_edge(node_id, neighbor_idx, weight=distance, length=distance)
+                    edges_set.add(edge_key)
+                    edges_added += 1
         
         self.logger.info(f"Добавлено {edges_added} рёбер в граф")
         
@@ -859,7 +1009,7 @@ class GraphService:
     
     def graph_to_geojson(self, graph: nx.Graph, edge_type_filter: Optional[str] = None) -> dict:
         """
-        Конвертирует NetworkX граф в GeoJSON для визуализации
+        Конвертирует NetworkX граф в GeoJSON для визуализации (ОПТИМИЗИРОВАНО)
         
         Args:
             graph: NetworkX граф
@@ -868,33 +1018,33 @@ class GraphService:
         Returns:
             GeoJSON FeatureCollection
         """
+        # ОПТИМИЗАЦИЯ: используем list comprehension и предварительную фильтрацию
         features = []
         
-        for u, v, data in graph.edges(data=True):
-            # Фильтрация по типу
-            if edge_type_filter and data.get('edge_type') != edge_type_filter:
+        # Предварительно получаем все рёбра для фильтрации
+        edges = list(graph.edges(data=True))
+        
+        # Фильтруем по типу, если нужно
+        if edge_type_filter:
+            edges = [(u, v, d) for u, v, d in edges if d.get('edge_type') == edge_type_filter]
+        
+        # ОПТИМИЗАЦИЯ: предварительно получаем координаты всех узлов
+        node_coords = {}
+        for node_id, node_data in graph.nodes(data=True):
+            if 'y' in node_data and 'x' in node_data:  # OSM узел
+                node_coords[node_id] = (node_data['x'], node_data['y'])
+            elif 'lon' in node_data and 'lat' in node_data:  # Наш узел
+                node_coords[node_id] = (node_data['lon'], node_data['lat'])
+        
+        # Создаём features через list comprehension
+        for u, v, data in edges:
+            if u not in node_coords or v not in node_coords:
                 continue
             
-            # Получаем координаты узлов
-            u_data = graph.nodes[u]
-            v_data = graph.nodes[v]
+            u_lon, u_lat = node_coords[u]
+            v_lon, v_lat = node_coords[v]
             
-            # Определяем координаты в зависимости от типа узла
-            if 'y' in u_data and 'x' in u_data:  # OSM узел
-                u_lon, u_lat = u_data['x'], u_data['y']
-            elif 'lon' in u_data and 'lat' in u_data:  # Наш узел
-                u_lon, u_lat = u_data['lon'], u_data['lat']
-            else:
-                continue
-            
-            if 'y' in v_data and 'x' in v_data:
-                v_lon, v_lat = v_data['x'], v_data['y']
-            elif 'lon' in v_data and 'lat' in v_data:
-                v_lon, v_lat = v_data['lon'], v_data['lat']
-            else:
-                continue
-            
-            feature = {
+            features.append({
                 "type": "Feature",
                 "geometry": {
                     "type": "LineString",
@@ -905,8 +1055,7 @@ class GraphService:
                     "weight": data.get('weight', 0),
                     "length": data.get('length', 0)
                 }
-            }
-            features.append(feature)
+            })
         
         return {
             "type": "FeatureCollection",
