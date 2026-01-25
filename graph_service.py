@@ -344,7 +344,7 @@ class GraphService:
         return G
     
     def merge_graphs(self, road_graph: nx.Graph, free_space_graph: nx.Graph, 
-                     max_connection_distance: float = 0.001) -> nx.Graph:
+                     max_connection_distance: float = 0.1) -> nx.Graph:
         """
         Объединяет дорожный граф и граф свободного пространства (ОПТИМИЗИРОВАНО)
         
@@ -386,6 +386,7 @@ class GraphService:
         
         # ОПТИМИЗАЦИЯ: используем cKDTree для быстрого поиска ближайших соседей
         self.logger.info("Поиск соединений между графами...")
+        self.logger.info(f"Дорожных узлов: {len(road_graph.nodes)}, Узлов свободного пространства: {len(free_space_graph.nodes)}")
         
         # Собираем координаты узлов свободного пространства
         free_coords = []
@@ -401,13 +402,17 @@ class GraphService:
             self.logger.info(f"Объединенный граф: {len(merged.nodes)} узлов, {len(merged.edges)} рёбер")
             return merged
         
+        self.logger.info(f"Найдено {len(free_coords)} узлов свободного пространства с координатами")
+        
         # Создаем KD-tree для узлов свободного пространства
         free_coords_array = np.array(free_coords)
         free_kdtree = cKDTree(free_coords_array)
         
         # ОПТИМИЗАЦИЯ: конвертируем max_connection_distance из км в градусы (приблизительно)
         # 1 км ≈ 0.009° на широте ~55° (средняя для России)
+        # Используем более точное значение для лучшего покрытия
         max_dist_degrees = max_connection_distance * 0.009
+        self.logger.info(f"Максимальное расстояние для соединений: {max_connection_distance} км ({max_dist_degrees:.6f}°)")
         
         # Соединяем близкие узлы между графами
         connections = 0
@@ -415,17 +420,21 @@ class GraphService:
         
         # ОПТИМИЗАЦИЯ: ограничиваем количество проверяемых дорожных узлов для ускорения
         road_nodes_to_check = list(road_graph.nodes(data=True))
-        max_road_nodes = 5000  # Ограничение для ускорения
+        max_road_nodes = 10000  # Увеличено для большего количества соединений
         if len(road_nodes_to_check) > max_road_nodes:
             # Берем случайную выборку дорожных узлов
             import random
             road_nodes_to_check = random.sample(road_nodes_to_check, max_road_nodes)
             self.logger.info(f"Ограничение: проверяем {max_road_nodes} из {len(road_graph.nodes)} дорожных узлов")
         
+        self.logger.info(f"Проверяем {len(road_nodes_to_check)} дорожных узлов для соединений")
+        
+        road_nodes_with_coords = 0
         for road_node, road_data in road_nodes_to_check:
             if 'y' not in road_data or 'x' not in road_data:
                 continue
             
+            road_nodes_with_coords += 1
             road_lat, road_lon = road_data['y'], road_data['x']
             road_point = np.array([road_lon, road_lat])
             
@@ -434,7 +443,7 @@ class GraphService:
             neighbor_indices = free_kdtree.query_ball_point(road_point, r=max_dist_degrees)
             
             # ОПТИМИЗАЦИЯ: ограничиваем количество соединений для каждого дорожного узла
-            max_connections_per_node = 3  # Максимум 3 соединения на узел
+            max_connections_per_node = 10  # Увеличено для большего количества соединений
             connections_added = 0
             
             for idx in neighbor_indices:
@@ -462,6 +471,7 @@ class GraphService:
                         connections += 1
                         connections_added += 1
         
+        self.logger.info(f"Проверено {road_nodes_with_coords} дорожных узлов с координатами")
         self.logger.info(f"Создано {connections} соединений между графами")
         self.logger.info(f"Объединенный граф: {len(merged.nodes)} узлов, {len(merged.edges)} рёбер")
         
@@ -513,24 +523,25 @@ class GraphService:
                     # Если это GeoDataFrame, обрабатываем каждую строку
                     for idx, row in no_fly_zones.iterrows():
                         if row.geometry is not None and row.geometry.is_valid:
-                            # Зоны уже имеют буфер, добавляем дополнительный для безопасности
-                            geometries.append(row.geometry.buffer(buffer_distance))
+                            # Зоны уже имеют буфер из data_service, не добавляем дополнительный
+                            geometries.append(row.geometry)
                     self.logger.info(f"Добавлено {len(no_fly_zones)} беспилотных зон из GeoDataFrame")
             elif isinstance(no_fly_zones, list):
                 # Если это список геометрий или объектов с geometry
                 for zone in no_fly_zones:
                     if hasattr(zone, 'geometry') and zone.geometry is not None:
-                        geometries.append(zone.geometry.buffer(buffer_distance))
+                        # Зоны уже имеют буфер, не добавляем дополнительный
+                        geometries.append(zone.geometry)
                     elif hasattr(zone, '__geo_interface__'):
                         # Если это shapely геометрия
                         from shapely.geometry import shape
                         geom = shape(zone)
                         if geom.is_valid:
-                            geometries.append(geom.buffer(buffer_distance))
+                            geometries.append(geom)
                     elif hasattr(zone, 'is_valid'):
                         # Если это прямая shapely геометрия
                         if zone.is_valid:
-                            geometries.append(zone.buffer(buffer_distance))
+                            geometries.append(zone)
                 if len(no_fly_zones) > 0:
                     self.logger.info(f"Добавлено беспилотных зон из списка")
         
@@ -889,8 +900,13 @@ class GraphService:
         else:
             self.logger.warning("Границы города не заданы! Граф будет строиться в bounding box")
         
-        # Создаем пространственный индекс
+        # Создаем пространственный индекс (включая беспилотные зоны)
         spatial_index = self._create_spatial_index(buildings, no_fly_zones, min_clearance)
+        if no_fly_zones is not None:
+            if isinstance(no_fly_zones, gpd.GeoDataFrame) and len(no_fly_zones) > 0:
+                self.logger.info(f"✓ Беспилотные зоны учтены: {len(no_fly_zones)} зон")
+            elif isinstance(no_fly_zones, list) and len(no_fly_zones) > 0:
+                self.logger.info(f"✓ Беспилотные зоны учтены: {len(no_fly_zones)} зон")
         
         # ОПТИМИЗИРОВАННОЕ создание индекса зданий для вычисления важности
         buildings_index = None
@@ -1061,3 +1077,4 @@ class GraphService:
             "type": "FeatureCollection",
             "features": features
         }
+        

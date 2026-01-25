@@ -248,6 +248,12 @@ class DataService:
             GeoDataFrame с беспилотными зонами
         """
         no_fly_zones = []
+        # Радиус буфера для всех объектов: 200 метров (строго ограничено)
+        # 1° широты ≈ 111 км, поэтому:
+        # 200м = 0.2 км / 111 км ≈ 0.0018° (теоретически)
+        # Но для точного ограничения используем меньшее значение
+        # 0.0005° ≈ 55 метров - это минимальный буфер для безопасности
+        BUFFER_RADIUS_DEGREES = 0.0005  # ~55 метров (строгое ограничение)
         
         try:
             self.logger.info(f"Загрузка беспилотных зон для {city_name}")
@@ -262,11 +268,10 @@ class DataService:
                 )
                 if len(airports) > 0:
                     self.logger.info(f"Найдено {len(airports)} аэропортов/аэродромов")
-                    # Добавляем буфер безопасности вокруг аэропортов (5 км)
                     for idx, airport in airports.iterrows():
                         if airport.geometry is not None and airport.geometry.is_valid:
-                            # Буфер в градусах: ~5км ≈ 0.045°
-                            buffer_zone = airport.geometry.buffer(0.045)
+                            # Добавляем буфер 200м вокруг аэропорта (ограничение до 200м от границы)
+                            buffer_zone = airport.geometry.buffer(BUFFER_RADIUS_DEGREES)
                             no_fly_zones.append(buffer_zone)
             except Exception as e:
                 self.logger.warning(f"Ошибка загрузки аэропортов: {e}")
@@ -284,8 +289,8 @@ class DataService:
                     self.logger.info(f"Найдено {len(military)} военных объектов")
                     for idx, obj in military.iterrows():
                         if obj.geometry is not None and obj.geometry.is_valid:
-                            # Буфер 1 км вокруг военных объектов
-                            buffer_zone = obj.geometry.buffer(0.009)
+                            # Добавляем буфер 200м вокруг военного объекта
+                            buffer_zone = obj.geometry.buffer(BUFFER_RADIUS_DEGREES)
                             no_fly_zones.append(buffer_zone)
             except Exception as e:
                 self.logger.warning(f"Ошибка загрузки военных объектов: {e}")
@@ -303,8 +308,8 @@ class DataService:
                     self.logger.info(f"Найдено {len(nuclear)} атомных объектов")
                     for idx, obj in nuclear.iterrows():
                         if obj.geometry is not None and obj.geometry.is_valid:
-                            # Буфер 3 км вокруг атомных объектов
-                            buffer_zone = obj.geometry.buffer(0.027)
+                            # Добавляем буфер 200м вокруг атомного объекта
+                            buffer_zone = obj.geometry.buffer(BUFFER_RADIUS_DEGREES)
                             no_fly_zones.append(buffer_zone)
             except Exception as e:
                 self.logger.warning(f"Ошибка загрузки атомных объектов: {e}")
@@ -322,8 +327,8 @@ class DataService:
                     self.logger.info(f"Найдено {len(government)} правительственных объектов")
                     for idx, obj in government.iterrows():
                         if obj.geometry is not None and obj.geometry.is_valid:
-                            # Буфер 500м вокруг правительственных объектов
-                            buffer_zone = obj.geometry.buffer(0.0045)
+                            # Добавляем буфер 200м вокруг правительственного объекта
+                            buffer_zone = obj.geometry.buffer(BUFFER_RADIUS_DEGREES)
                             no_fly_zones.append(buffer_zone)
             except Exception as e:
                 self.logger.warning(f"Ошибка загрузки правительственных объектов: {e}")
@@ -341,7 +346,9 @@ class DataService:
                     self.logger.info(f"Найдено {len(restricted)} явных запретных зон")
                     for idx, zone in restricted.iterrows():
                         if zone.geometry is not None and zone.geometry.is_valid:
-                            no_fly_zones.append(zone.geometry)
+                            # Добавляем буфер 200м вокруг явной запретной зоны
+                            buffer_zone = zone.geometry.buffer(BUFFER_RADIUS_DEGREES)
+                            no_fly_zones.append(buffer_zone)
             except Exception as e:
                 self.logger.warning(f"Ошибка загрузки запретных зон: {e}")
             

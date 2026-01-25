@@ -156,6 +156,10 @@
             <div class="legend-line" style="background:#f59e0b"></div>
             <span>Соединения</span>
         </div>
+        <div class="legend-item" style="margin-top:8px">
+            <div style="width:24px; height:16px; background:#dc2626; opacity:0.3; border:2px dashed #dc2626; border-radius:2px"></div>
+            <span>🚫 Беспилотные зоны</span>
+        </div>
     </div>
     
     <div class="sidebar">
@@ -196,7 +200,7 @@
     </div>
 
     <script>
-        let map, edgesLayer, boundaryLayer;
+        let map, edgesLayer, boundaryLayer, noFlyZonesLayer;
         
         // Список популярных городов
         const CITIES = [
@@ -354,6 +358,26 @@
                 if (boundaryLayer) {
                     map.removeLayer(boundaryLayer);
                 }
+                if (noFlyZonesLayer) {
+                    map.removeLayer(noFlyZonesLayer);
+                }
+
+                // Добавляем беспилотные зоны (если есть) - ПЕРВЫМИ, чтобы они были под графом
+                if (graphData.no_fly_zones) {
+                    noFlyZonesLayer = L.geoJSON(graphData.no_fly_zones, {
+                        style: {
+                            color: '#dc2626',  // Красный цвет границы
+                            weight: 2,
+                            opacity: 0.9,
+                            fillColor: '#dc2626',  // Красная заливка
+                            fillOpacity: 0.3,  // Полупрозрачная заливка
+                            dashArray: '5, 5'  // Пунктирная линия
+                        },
+                        onEachFeature: function(feature, layer) {
+                            layer.bindPopup('🚫 Беспилотная зона<br>Полет запрещен');
+                        }
+                    }).addTo(map);
+                }
 
                 // Добавляем границы города (если есть)
                 if (graphData.city_boundary) {
@@ -408,9 +432,9 @@
                 }
                 statsEl.textContent = statsText;
                 
-                // Показываем легенду для объединенного графа
+                // Показываем легенду для объединенного графа и если есть беспилотные зоны
                 const legendEl = document.getElementById('legend');
-                if (graphType === 'merged') {
+                if (graphType === 'merged' || graphData.no_fly_zones) {
                     legendEl.style.display = 'block';
                 } else {
                     legendEl.style.display = 'none';
