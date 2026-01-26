@@ -236,82 +236,59 @@ class GraphService:
         city_boundary: Optional[Polygon] = None
     ) -> nx.Graph:
         """
-        Создает граф на основе триангуляции Делоне
+        Создает граф на основе триангуляции Делоне по центроидам зданий
         
         Args:
             bounds: (min_lon, min_lat, max_lon, max_lat)
-            num_points: количество случайных точек
-            buildings: GeoDataFrame со зданиями
+            num_points: игнорируется, используется количество зданий
+            buildings: GeoDataFrame со зданиями (используются центроиды)
             no_fly_zones: Список запретных зон
             min_clearance: минимальное расстояние от препятствий
+            city_boundary: границы города для фильтрации
             
         Returns:
             NetworkX граф
         """
         min_lon, min_lat, max_lon, max_lat = bounds
         
-        self.logger.info(f"Генерация Delaunay графа: {num_points} точек")
+        # Подготовка препятствий (без зданий, так как мы используем их центроиды)
+        obstacles = self._prepare_obstacles(None, no_fly_zones, min_clearance)
         
-        # Подготовка препятствий
-        obstacles = self._prepare_obstacles(buildings, no_fly_zones, min_clearance)
-        
-        # ОПТИМИЗИРОВАННАЯ генерация случайных точек: батчинг и предварительная фильтрация
+        # Используем центроиды зданий вместо случайных точек
         points = []
-        attempts = 0
-        max_attempts = num_points * 10
         
-        # Предварительная фильтрация по bbox границ города
-        city_bbox = None
-        if city_boundary is not None:
-            try:
-                city_bbox = city_boundary.bounds  # (minx, miny, maxx, maxy)
-            except Exception:
-                pass
-        
-        # Генерируем точки батчами для ускорения
-        batch_size = 100
-        while len(points) < num_points and attempts < max_attempts:
-            # Генерируем батч случайных точек
-            batch_lons = np.random.uniform(min_lon, max_lon, batch_size)
-            batch_lats = np.random.uniform(min_lat, max_lat, batch_size)
+        if buildings is not None and len(buildings) > 0:
+            self.logger.info(f"Генерация Delaunay графа по центроидам зданий: {len(buildings)} зданий")
             
-            # Предварительная фильтрация по bbox
-            if city_bbox is not None:
-                minx, miny, maxx, maxy = city_bbox
-                bbox_mask = (
-                    (batch_lons >= minx) & (batch_lons <= maxx) &
-                    (batch_lats >= miny) & (batch_lats <= maxy)
-                )
-                candidates = list(zip(batch_lons[bbox_mask], batch_lats[bbox_mask]))
-            else:
-                candidates = list(zip(batch_lons, batch_lats))
+            # Получаем центроиды всех зданий
+            for idx, building in buildings.iterrows():
+                try:
+                    if building.geometry is not None and building.geometry.is_valid:
+                        centroid = building.geometry.centroid
+                        lon, lat = centroid.x, centroid.y
+                        
+                        # Проверяем, что центроид в границах города (если указаны)
+                        if city_boundary is not None:
+                            try:
+                                if not city_boundary.contains(centroid) and not city_boundary.touches(centroid):
+                                    continue
+                            except Exception:
+                                continue
+                        
+                        # Проверяем, что центроид не в беспилотных зонах
+                        if not self._is_point_in_obstacles(centroid, obstacles):
+                            points.append([lon, lat])
+                except Exception as e:
+                    self.logger.warning(f"Ошибка обработки здания {idx}: {e}")
+                    continue
             
-            # Точная проверка только для кандидатов
-            for lon, lat in candidates:
-                if len(points) >= num_points:
-                    break
-                    
-                point = Point(lon, lat)
-                
-                # Точная проверка границ города
-                if city_boundary is not None:
-                    try:
-                        if not city_boundary.contains(point) and not city_boundary.touches(point):
-                            attempts += 1
-                            continue
-                    except Exception:
-                        attempts += 1
-                        continue
-                
-                if not self._is_point_in_obstacles(point, obstacles):
-                    points.append([lon, lat])
-                
-                attempts += 1
-            
-            attempts += len(candidates)
+            self.logger.info(f"Получено {len(points)} центроидов зданий для триангуляции")
+        else:
+            self.logger.warning("Нет зданий для создания Delaunay графа")
+            return nx.Graph()
         
         if len(points) < 3:
-            self.logger.warning("Недостаточно точек для триангуляции")
+            self.logger.warning("Недостаточно точек для триангуляции (нужно минимум 3)")
             return nx.Graph()
         
         points = np.array(points)

@@ -1,6 +1,8 @@
 import os
 import osmnx as ox
 import geopandas as gpd
+import pandas as pd
+import numpy as np
 import time
 import pickle
 import requests
@@ -58,11 +60,17 @@ class DataService:
                 blob = self._redis.get(redis_key)
                 if blob:
                     cached_data = pickle.loads(blob)
-                    # Проверяем, есть ли границы города в кэше
+                    # Проверяем, есть ли границы города и классифицированные здания в кэше
                     if 'city_boundary' not in cached_data:
                         self.logger.info("В Redis кэше нет границ города, перезагружаем данные")
                         # Удаляем из Redis и загружаем заново
                         self._redis.delete(redis_key)
+                    elif 'classified_buildings' not in cached_data and 'buildings' in cached_data:
+                        # Классифицируем здания если их еще нет
+                        self.logger.info("Классифицируем здания из кэша")
+                        cached_data['classified_buildings'] = self.classify_buildings(cached_data['buildings'])
+                        # Обновляем кэш
+                        self._redis.set(redis_key, pickle.dumps(cached_data))
                     else:
                         self._update_progress("cache", 100, "Загрузка из Redis")
                         return cached_data
@@ -78,6 +86,13 @@ class DataService:
                     self.logger.info("В кэше нет границ города, перезагружаем данные")
                     os.remove(cache_file)
                     return self._download_city_data(normalized_name, cache_file, redis_key, network_type=network_type, simplify=simplify)
+                # Классифицируем здания если их еще нет
+                if 'classified_buildings' not in cached_data and 'buildings' in cached_data:
+                    self.logger.info("Классифицируем здания из кэша")
+                    cached_data['classified_buildings'] = self.classify_buildings(cached_data['buildings'])
+                    # Сохраняем обновленный кэш
+                    with open(cache_file, 'wb') as f:
+                        pickle.dump(cached_data, f)
                 return cached_data
             except Exception as e:
                 self.logger.warning(f"Ошибка загрузки кэша: {e}, перезагружаем данные")
@@ -197,9 +212,13 @@ class DataService:
             self._update_progress("download", 80, "Загрузка запретных зон")
             no_fly_zones = self._get_no_fly_zones(city_name)
             
+            # Классифицируем здания по типам
+            classified_buildings = self.classify_buildings(buildings) if len(buildings) > 0 else buildings
+            
             data = {
                 'road_graph': road_graph,
                 'buildings': buildings,
+                'classified_buildings': classified_buildings,  # Добавляем классифицированные здания
                 'no_fly_zones': no_fly_zones,
                 'city_boundary': city_boundary,  # Добавляем границы города
                 'city_name': city_name,
@@ -382,6 +401,227 @@ class DataService:
             self.logger.warning(f"Ошибка загрузки беспилотных зон: {e}")
         
         return []
+    
+    def classify_buildings(self, buildings: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+        """
+        Классифицирует здания по типам на основе OSM тегов + геометрических признаков
+        
+        Категории:
+        - apartment: многоквартирные дома (building=apartments, residential + building:levels > 3)
+        - house: частные дома (building=house, residential + building:levels <= 3)
+        - industrial: промышленные здания (building=industrial, warehouse, factory)
+        - commercial: коммерческие здания (building=retail, commercial, shop)
+        - office: офисные здания (building=office)
+        - public: общественные здания (building=public, school, hospital, government)
+        - other: прочие здания
+        
+        Args:
+            buildings: GeoDataFrame со зданиями из OSM
+            
+        Returns:
+            GeoDataFrame с дополнительной колонкой 'building_type'
+        """
+        if buildings is None or len(buildings) == 0:
+            return buildings
+        
+        self.logger.info(f"Классификация {len(buildings)} зданий по типам (OSM теги + геометрия)")
+        
+        # Создаем копию для безопасной работы
+        classified = buildings.copy()
+        classified['building_type'] = 'other'  # По умолчанию
+        
+        # ШАГ 1: Вычисляем геометрические признаки для всех зданий
+        self.logger.info("Вычисление геометрических признаков...")
+        classified['geom_area'] = classified.geometry.area
+        classified['geom_perimeter'] = classified.geometry.length
+        
+        # Компактность (4π*area/perimeter²) - мера круглости (1.0 = круг, меньше = вытянутое)
+        classified['geom_compactness'] = (4 * np.pi * classified['geom_area']) / (classified['geom_perimeter'] ** 2 + 1e-10)
+        
+        # Соотношение сторон (bounding box)
+        def get_aspect_ratio(geom):
+            try:
+                bounds = geom.bounds
+                width = bounds[2] - bounds[0]  # lon
+                height = bounds[3] - bounds[1]  # lat
+                if height > 0:
+                    return max(width, height) / min(width, height)
+                return 1.0
+            except:
+                return 1.0
+        
+        classified['geom_aspect_ratio'] = classified.geometry.apply(get_aspect_ratio)
+        
+        # Прямоугольность (area / bounding_box_area)
+        def get_rectangularity(geom):
+            try:
+                bounds = geom.bounds
+                bbox_area = (bounds[2] - bounds[0]) * (bounds[3] - bounds[1])
+                if bbox_area > 0:
+                    return geom.area / bbox_area
+                return 0.0
+            except:
+                return 0.0
+        
+        classified['geom_rectangularity'] = classified.geometry.apply(get_rectangularity)
+        
+        # ШАГ 2: Пространственная кластеризация - плотность застройки
+        self.logger.info("Анализ плотности застройки...")
+        from scipy.spatial import cKDTree
+        
+        # Получаем центроиды всех зданий
+        centroids = classified.geometry.centroid
+        coords = np.array([[p.x, p.y] for p in centroids])
+        
+        # Строим KD-tree для быстрого поиска соседей
+        tree = cKDTree(coords)
+        
+        # Для каждого здания находим количество соседей в радиусе ~50 метров (0.00045 градусов)
+        search_radius = 0.00045  # ~50 метров
+        neighbor_counts = []
+        for i, coord in enumerate(coords):
+            neighbors = tree.query_ball_point(coord, search_radius)
+            neighbor_counts.append(len(neighbors) - 1)  # -1 чтобы исключить само здание
+        
+        classified['neighbor_density'] = neighbor_counts
+        
+        self.logger.info(f"Геометрические признаки вычислены: площадь, периметр, компактность, плотность")
+        
+        # Функция для безопасного получения значения тега
+        def get_tag(row, tag_name, default=None):
+            if tag_name in row:
+                value = row[tag_name]
+                if pd.notna(value) and value is not None:
+                    return str(value).lower()
+            return default
+        
+        # Функция для безопасного получения числового значения
+        def get_numeric_tag(row, tag_name, default=0):
+            if tag_name in row:
+                try:
+                    value = row[tag_name]
+                    if pd.notna(value) and value is not None:
+                        return float(value)
+                except (ValueError, TypeError):
+                    pass
+            return default
+        
+        for idx, row in classified.iterrows():
+            building_tag = get_tag(row, 'building', '')
+            building_use = get_tag(row, 'building:use', '')
+            amenity = get_tag(row, 'amenity', '')
+            shop = get_tag(row, 'shop', '')
+            office = get_tag(row, 'office', '')
+            landuse = get_tag(row, 'landuse', '')
+            building_levels = get_numeric_tag(row, 'building:levels', 0)
+            
+            # Используем вычисленные геометрические признаки
+            building_area = row.get('geom_area', 0)
+            compactness = row.get('geom_compactness', 0)
+            aspect_ratio = row.get('geom_aspect_ratio', 1.0)
+            rectangularity = row.get('geom_rectangularity', 0)
+            neighbor_density = row.get('neighbor_density', 0)
+            
+            # Пороговые значения для классификации по площади (АГРЕССИВНО увеличены)
+            # Очень большие здания (> 0.0002 кв.град ≈ 2400 кв.м) - возможно многоквартирные
+            # Большие здания (0.0001-0.0002 кв.град ≈ 1200-2400 кв.м) - нужно проверять по этажам
+            # Остальные - скорее частные дома
+            VERY_LARGE_BUILDING_AREA = 0.0002  # ~2400 кв.м (только для явно больших зданий)
+            LARGE_BUILDING_AREA = 0.0001  # ~1200 кв.м
+            MEDIUM_BUILDING_AREA = 0.00008  # ~900 кв.м (увеличено)
+            SMALL_BUILDING_AREA = 0.00005  # ~600 кв.м (увеличено)
+            
+            # Проверяем, не является ли здание явно нежилым
+            is_non_residential = (
+                building_tag in ['industrial', 'warehouse', 'factory', 'manufacturing', 'retail', 'commercial', 'supermarket', 'mall', 'office', 'public', 'school', 'university', 'hospital', 'clinic', 'government'] or
+                shop or office or
+                building_use in ['industrial', 'warehouse', 'factory', 'retail', 'commercial', 'public', 'government', 'education', 'healthcare'] or
+                amenity in ['school', 'university', 'hospital', 'clinic', 'library', 'theatre', 'cinema', 'museum'] or
+                landuse in ['industrial', 'commercial', 'retail']
+            )
+            
+            # Проверяем явные признаки многоквартирного дома (только очень явные)
+            is_clearly_apartment = (
+                building_tag == 'apartments' or
+                building_tag == 'block' or
+                (building_tag == 'residential' and building_levels > 5) or  # Только > 5 этажей
+                (building_tag == 'residential' and building_levels == 0 and building_area > VERY_LARGE_BUILDING_AREA) or  # Очень большие
+                (building_tag == 'multiplex' and building_levels > 3)
+            )
+            
+            # 1. Многоквартирные дома (только очень явные признаки)
+            if is_clearly_apartment:
+                classified.at[idx, 'building_type'] = 'apartment'
+            
+            # 2. Промышленные здания
+            elif building_tag in ['industrial', 'warehouse', 'factory', 'manufacturing'] or \
+                 building_use in ['industrial', 'warehouse', 'factory'] or \
+                 landuse == 'industrial':
+                classified.at[idx, 'building_type'] = 'industrial'
+            
+            # 3. Коммерческие здания
+            elif building_tag in ['retail', 'commercial', 'supermarket', 'mall'] or \
+                 shop or \
+                 building_use in ['retail', 'commercial']:
+                classified.at[idx, 'building_type'] = 'commercial'
+            
+            # 4. Офисные здания
+            elif building_tag == 'office' or office:
+                classified.at[idx, 'building_type'] = 'office'
+            
+            # 5. Общественные здания
+            elif building_tag in ['public', 'school', 'university', 'hospital', 'clinic', 'government'] or \
+                 amenity in ['school', 'university', 'hospital', 'clinic', 'library', 'theatre', 'cinema', 'museum'] or \
+                 building_use in ['public', 'government', 'education', 'healthcare']:
+                classified.at[idx, 'building_type'] = 'public'
+            
+            # 6. ВСЕ ОСТАЛЬНЫЕ здания - частные дома (по умолчанию)
+            # Если здание не является явно многоквартирным и не является явно нежилым,
+            # то оно автоматически считается частным домом
+            else:
+                classified.at[idx, 'building_type'] = 'house'
+        
+        # Подсчитываем статистику
+        type_counts = classified['building_type'].value_counts()
+        self.logger.info("=" * 60)
+        self.logger.info("КЛАССИФИКАЦИЯ ЗДАНИЙ ЗАВЕРШЕНА:")
+        self.logger.info(f"Всего зданий: {len(classified)}")
+        type_names = {
+            'apartment': 'Многоквартирные дома',
+            'house': 'Частные дома',
+            'industrial': 'Промышленные здания',
+            'commercial': 'Коммерческие здания',
+            'office': 'Офисные здания',
+            'public': 'Общественные здания',
+            'other': 'Прочие здания'
+        }
+        for btype, count in sorted(type_counts.items(), key=lambda x: x[1], reverse=True):
+            type_name = type_names.get(btype, btype)
+            percentage = (count / len(classified) * 100) if len(classified) > 0 else 0
+            self.logger.info(f"  {type_name:30} {count:6} ({percentage:5.1f}%)")
+        
+        # Дополнительная статистика для частных домов
+        if 'house' in type_counts:
+            house_buildings = classified[classified['building_type'] == 'house']
+            if len(house_buildings) > 0:
+                # Подсчитываем по тегам building
+                house_tags = house_buildings.get('building', pd.Series()).value_counts()
+                self.logger.info("")
+                self.logger.info("Распределение частных домов по тегам building:")
+                for tag, count in house_tags.head(10).items():
+                    self.logger.info(f"  building={tag}: {count}")
+                
+                # Статистика по геометрическим признакам частных домов
+                self.logger.info("")
+                self.logger.info("Геометрические признаки частных домов:")
+                self.logger.info(f"  Средняя площадь: {house_buildings['geom_area'].mean():.6f} кв.град (~{house_buildings['geom_area'].mean() * 111000 * 111000:.0f} кв.м)")
+                self.logger.info(f"  Средняя плотность соседей: {house_buildings['neighbor_density'].mean():.1f}")
+                self.logger.info(f"  Средняя компактность: {house_buildings['geom_compactness'].mean():.3f}")
+                self.logger.info(f"  Среднее соотношение сторон: {house_buildings['geom_aspect_ratio'].mean():.2f}")
+        
+        self.logger.info("=" * 60)
+        
+        return classified
     
     def address_to_coords(self, address, city_name=None):
         """Улучшенное геокодирование с поддержкой российских адресов"""

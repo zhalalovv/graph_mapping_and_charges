@@ -143,22 +143,41 @@
     <div id="map"></div>
     
     <div class="legend" id="legend" style="display:none">
-        <div style="font-weight:600; margin-bottom:8px">Типы рёбер:</div>
+        <div style="font-weight:600; margin-bottom:8px">Легенда:</div>
         <div class="legend-item">
             <div class="legend-line" style="background:#2563eb"></div>
             <span>Дороги</span>
         </div>
-        <div class="legend-item">
-            <div class="legend-line" style="background:#10b981"></div>
-            <span>Свободное пространство</span>
-        </div>
-        <div class="legend-item">
-            <div class="legend-line" style="background:#f59e0b"></div>
-            <span>Соединения</span>
-        </div>
         <div class="legend-item" style="margin-top:8px">
             <div style="width:24px; height:16px; background:#dc2626; opacity:0.3; border:2px dashed #dc2626; border-radius:2px"></div>
             <span>🚫 Беспилотные зоны</span>
+        </div>
+        <div style="margin-top:12px; padding-top:12px; border-top:1px solid #e5e7eb">
+            <div style="font-weight:600; margin-bottom:8px; font-size:12px">Типы зданий:</div>
+            <div class="legend-item" style="font-size:11px">
+                <div style="width:16px; height:16px; background:#ef4444; opacity:0.3; border:1px solid #ef4444"></div>
+                <span>Многоквартирные</span>
+            </div>
+            <div class="legend-item" style="font-size:11px">
+                <div style="width:16px; height:16px; background:#10b981; opacity:0.3; border:1px solid #10b981"></div>
+                <span>Частные дома</span>
+            </div>
+            <div class="legend-item" style="font-size:11px">
+                <div style="width:16px; height:16px; background:#f59e0b; opacity:0.3; border:1px solid #f59e0b"></div>
+                <span>Промышленные</span>
+            </div>
+            <div class="legend-item" style="font-size:11px">
+                <div style="width:16px; height:16px; background:#3b82f6; opacity:0.3; border:1px solid #3b82f6"></div>
+                <span>Коммерческие</span>
+            </div>
+            <div class="legend-item" style="font-size:11px">
+                <div style="width:16px; height:16px; background:#8b5cf6; opacity:0.3; border:1px solid #8b5cf6"></div>
+                <span>Офисные</span>
+            </div>
+            <div class="legend-item" style="font-size:11px">
+                <div style="width:16px; height:16px; background:#ec4899; opacity:0.3; border:1px solid #ec4899"></div>
+                <span>Общественные</span>
+            </div>
         </div>
     </div>
     
@@ -181,9 +200,7 @@
                 Тип графа
                 <select id="graphType" style="width:100%">
                     <option value="road">Дороги (OSM)</option>
-                    <option value="grid">Сеточный граф</option>
                     <option value="delaunay">Delaunay триангуляция</option>
-                    <option value="merged">Объединенный (дороги + сетка)</option>
                 </select>
             </label>
         </div>
@@ -200,7 +217,7 @@
     </div>
 
     <script>
-        let map, edgesLayer, boundaryLayer, noFlyZonesLayer;
+        let map, edgesLayer, boundaryLayer, noFlyZonesLayer, buildingsLayer;
         
         // Список популярных городов
         const CITIES = [
@@ -301,6 +318,141 @@
             }
         }
 
+        function getBuildingColor(buildingType) {
+            const colors = {
+                'apartment': '#ef4444',    // красный - многоквартирные
+                'house': '#10b981',        // зеленый - частные дома
+                'industrial': '#f59e0b',   // оранжевый - промышленные
+                'commercial': '#3b82f6',   // синий - коммерческие
+                'office': '#8b5cf6',       // фиолетовый - офисные
+                'public': '#ec4899',       // розовый - общественные
+                'other': '#6b7280'         // серый - прочие
+            };
+            return colors[buildingType] || colors['other'];
+        }
+
+        async function loadBuildingClusters(city, network, simplify) {
+            try {
+                console.log('Загрузка кластеров зданий...');
+                const clustersUrl = new URL('/api/buildings/clusters', window.location.origin);
+                clustersUrl.searchParams.set('city', city);
+                clustersUrl.searchParams.set('network_type', network);
+                clustersUrl.searchParams.set('simplify', simplify);
+                
+                // Загружаем без таймаута, чтобы все здания успели загрузиться
+                console.log('Отправка запроса:', clustersUrl.toString());
+                const clustersResp = await fetch(clustersUrl);
+                
+                if (!clustersResp.ok) {
+                    const errorText = await clustersResp.text();
+                    console.error('Ошибка HTTP:', clustersResp.status, errorText);
+                    throw new Error(`Ошибка загрузки зданий: ${clustersResp.status} ${errorText}`);
+                }
+                
+                console.log('Получен ответ, парсинг JSON...');
+                const clustersData = await clustersResp.json();
+                console.log('Данные распарсены, проверка структуры...');
+                
+                if (!clustersData) {
+                    console.error('Данные пусты');
+                    throw new Error('Данные зданий пусты');
+                }
+                
+                if (!clustersData.clusters || Object.keys(clustersData.clusters).length === 0) {
+                    console.log('Кластеры зданий не найдены или пусты');
+                    if (clustersData.message) {
+                        console.log('Сообщение:', clustersData.message);
+                    }
+                    return;
+                }
+                
+                console.log('Статистика зданий:', clustersData.statistics);
+                console.log(`Всего зданий: ${clustersData.total}`);
+                console.log(`Типов зданий: ${Object.keys(clustersData.clusters).length}`);
+                
+                // Создаем слой для каждого типа зданий
+                const buildingLayers = [];
+                
+                for (const [buildingType, geojson] of Object.entries(clustersData.clusters)) {
+                    try {
+                        if (!geojson) {
+                            console.warn(`Тип ${buildingType}: geojson пуст`);
+                            continue;
+                        }
+                        
+                        if (!geojson.features || geojson.features.length === 0) {
+                            console.log(`Пропущен тип ${buildingType}: нет features`);
+                            continue;
+                        }
+                        
+                        console.log(`Обработка типа ${buildingType}: ${geojson.features.length} точек`);
+                        
+                        // Отрисовываем точки (маркеры) вместо полигонов
+                        const color = getBuildingColor(buildingType);
+                        
+                        const layerOptions = {
+                            pointToLayer: function(feature, latlng) {
+                                // Создаем круглый маркер для каждой точки
+                                return L.circleMarker(latlng, {
+                                    radius: 4,  // Размер точки
+                                    fillColor: color,
+                                    color: color,
+                                    weight: 1,
+                                    opacity: 0.8,
+                                    fillOpacity: 0.6
+                                });
+                            },
+                            onEachFeature: function(feature, layer) {
+                                layer.bindPopup(`
+                                    <strong>Тип здания:</strong> ${getBuildingTypeName(buildingType)}<br>
+                                    <strong>Категория:</strong> ${buildingType}
+                                `);
+                            }
+                        };
+                        
+                        console.log(`Создание GeoJSON слоя для ${buildingType} (точки)...`);
+                        const layer = L.geoJSON(geojson, layerOptions);
+                        buildingLayers.push(layer);
+                        console.log(`✓ Добавлен слой для ${buildingType}: ${geojson.features.length} зданий`);
+                    } catch (typeError) {
+                        console.error(`Ошибка при обработке типа ${buildingType}:`, typeError);
+                        console.error('Stack:', typeError.stack);
+                        // Продолжаем обработку других типов
+                    }
+                }
+                
+                // Группируем все слои зданий
+                if (buildingLayers.length > 0) {
+                    console.log(`Создание layerGroup из ${buildingLayers.length} слоев...`);
+                    buildingsLayer = L.layerGroup(buildingLayers);
+                    console.log('Добавление buildingsLayer на карту...');
+                    buildingsLayer.addTo(map);
+                    console.log(`✓ Загружено ${buildingLayers.length} типов зданий, всего: ${clustersData.total}`);
+                } else {
+                    console.warn('Не создано ни одного слоя зданий');
+                }
+            } catch (error) {
+                console.error('КРИТИЧЕСКАЯ ОШИБКА загрузки кластеров зданий:', error);
+                console.error('Тип ошибки:', error.constructor.name);
+                console.error('Сообщение:', error.message);
+                console.error('Stack:', error.stack);
+                throw error;  // Пробрасываем ошибку, чтобы её можно было обработать выше
+            }
+        }
+
+        function getBuildingTypeName(buildingType) {
+            const names = {
+                'apartment': 'Многоквартирный дом',
+                'house': 'Частный дом',
+                'industrial': 'Промышленное здание',
+                'commercial': 'Коммерческое здание',
+                'office': 'Офисное здание',
+                'public': 'Общественное здание',
+                'other': 'Прочее'
+            };
+            return names[buildingType] || buildingType;
+        }
+
         async function buildGraph() {
             const city = getCityQuery();
             const graphType = document.getElementById('graphType').value;
@@ -308,8 +460,6 @@
             // Фиксированные параметры (оптимальные)
             const network = 'all';           // всегда все типы дорог
             const simplify = true;           // всегда упрощаем
-            const gridSpacing = 0.001;       // фиксированный размер ячейки ~100м
-            const connectDiagonal = true;    // всегда с диагоналями
             
             const statusEl = document.getElementById('status');
             const statsEl = document.getElementById('statsInfo');
@@ -340,12 +490,14 @@
                 graphUrl.searchParams.set('network_type', network);
                 graphUrl.searchParams.set('simplify', simplify);
                 graphUrl.searchParams.set('graph_type', graphType);
-                graphUrl.searchParams.set('grid_spacing', gridSpacing);
-                graphUrl.searchParams.set('connect_diagonal', connectDiagonal);
                 
                 const graphResp = await fetch(graphUrl);
+                if (!graphResp.ok) {
+                    const errorData = await graphResp.json().catch(() => ({ detail: 'Неизвестная ошибка' }));
+                    throw new Error(errorData.detail || 'Ошибка генерации графа');
+                }
+                
                 const graphData = await graphResp.json();
-                if (!graphResp.ok) throw new Error(graphData.detail || 'Ошибка генерации графа');
 
                 statusEl.textContent = 'Отрисовка...';
 
@@ -360,6 +512,9 @@
                 }
                 if (noFlyZonesLayer) {
                     map.removeLayer(noFlyZonesLayer);
+                }
+                if (buildingsLayer) {
+                    map.removeLayer(buildingsLayer);
                 }
 
                 // Добавляем беспилотные зоны (если есть) - ПЕРВЫМИ, чтобы они были под графом
@@ -393,26 +548,68 @@
                     }).addTo(map);
                 }
 
-                // Добавляем новый слой с учетом типов рёбер
-                edgesLayer = L.geoJSON(graphData.edges, {
-                    style: function(feature) {
-                        const edgeType = feature.properties?.edge_type || 'unknown';
-                        return {
-                            color: getEdgeColor(edgeType),
-                            weight: getEdgeWeight(edgeType),
-                            opacity: 0.7
-                        };
-                    },
-                    onEachFeature: function(feature, layer) {
-                        if (feature.properties) {
-                            const props = feature.properties;
-                            layer.bindPopup(`
-                                Тип: ${props.edge_type || 'unknown'}<br>
-                                Длина: ${(props.length || 0).toFixed(4)} км
-                            `);
+                // Загружаем и отображаем кластеризованные здания (ожидаем завершения)
+                try {
+                    console.log('Начало загрузки зданий...');
+                    await loadBuildingClusters(city, network, simplify);
+                    console.log('✓ Здания успешно загружены и отображены');
+                } catch (err) {
+                    console.error('ОШИБКА загрузки зданий:', err);
+                    console.error('Детали ошибки:', {
+                        name: err.name,
+                        message: err.message,
+                        stack: err.stack
+                    });
+                    statusEl.textContent = '✓ Готово (ошибка загрузки зданий: ' + err.message + ')';
+                }
+                
+                // Отрисовываем ВСЕ рёбра графа
+                const totalEdges = graphData.edges?.features?.length || 0;
+                console.log(`Отрисовка графа: ${totalEdges} рёбер`);
+                
+                try {
+                    // Используем canvas renderer для лучшей производительности при большом количестве рёбер
+                    const edgeLayerOptions = {
+                        style: function(feature) {
+                            const edgeType = feature.properties?.edge_type || 'unknown';
+                            return {
+                                color: getEdgeColor(edgeType),
+                                weight: getEdgeWeight(edgeType),
+                                opacity: 0.7
+                            };
+                        },
+                        onEachFeature: function(feature, layer) {
+                            if (feature.properties) {
+                                const props = feature.properties;
+                                layer.bindPopup(`
+                                    Тип: ${props.edge_type || 'unknown'}<br>
+                                    Длина: ${(props.length || 0).toFixed(4)} км
+                                `);
+                            }
                         }
+                    };
+                    
+                    // Пробуем использовать canvas renderer, если поддерживается
+                    try {
+                        if (L.Canvas && L.canvas) {
+                            edgeLayerOptions.renderer = L.canvas({ padding: 0.5 });
+                            console.log('Используется Canvas renderer для рёбер');
+                        }
+                    } catch (rendererError) {
+                        console.warn('Canvas renderer недоступен для рёбер, используется SVG:', rendererError);
                     }
-                }).addTo(map);
+                    
+                    // Добавляем новый слой с учетом типов рёбер
+                    console.log('Создание слоя рёбер графа...');
+                    edgesLayer = L.geoJSON(graphData.edges, edgeLayerOptions);
+                    console.log('Добавление слоя рёбер на карту...');
+                    edgesLayer.addTo(map);
+                    console.log('✓ Слой рёбер успешно добавлен');
+                } catch (edgeError) {
+                    console.error('ОШИБКА при создании слоя рёбер:', edgeError);
+                    console.error('Детали:', edgeError.message, edgeError.stack);
+                    throw edgeError;
+                }
                 
                 // Подгоняем карту под границы
                 const [minLon, minLat, maxLon, maxLat] = graphData.bbox;
@@ -432,9 +629,9 @@
                 }
                 statsEl.textContent = statsText;
                 
-                // Показываем легенду для объединенного графа и если есть беспилотные зоны
+                // Показываем легенду если есть беспилотные зоны или здания
                 const legendEl = document.getElementById('legend');
-                if (graphType === 'merged' || graphData.no_fly_zones) {
+                if (graphData.no_fly_zones || buildingsLayer) {
                     legendEl.style.display = 'block';
                 } else {
                     legendEl.style.display = 'none';
