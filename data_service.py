@@ -249,6 +249,8 @@ class DataService:
         5. Парки и зоны отдыха (leisure=park, landuse=recreation_ground)
         6. Школы, детсады, университеты, колледжи (по границам из OSM)
         7. Больницы (по границам из OSM)
+        8. Заправки (amenity=fuel)
+        9. Вокзалы (railway=station)
         
         Returns:
             GeoDataFrame или список беспилотных зон
@@ -413,6 +415,34 @@ class DataService:
                             no_fly_zones.append(zone_from_geometry(obj.geometry))
             except Exception as e:
                 self.logger.warning(f"Ошибка загрузки больниц: {e}")
+            
+            # 9. Заправки (АЗС)
+            try:
+                fuel = ox.features_from_place(
+                    city_name,
+                    tags={"amenity": "fuel"}
+                )
+                if len(fuel) > 0:
+                    self.logger.info(f"Найдено {len(fuel)} заправок (amenity=fuel)")
+                    for idx, obj in fuel.iterrows():
+                        if obj.geometry is not None and obj.geometry.is_valid:
+                            no_fly_zones.append(zone_from_geometry(obj.geometry))
+            except Exception as e:
+                self.logger.warning(f"Ошибка загрузки заправок: {e}")
+            
+            # 10. Вокзалы (железнодорожные станции)
+            try:
+                stations = ox.features_from_place(
+                    city_name,
+                    tags={"railway": "station"}
+                )
+                if len(stations) > 0:
+                    self.logger.info(f"Найдено {len(stations)} вокзалов/станций (railway=station)")
+                    for idx, obj in stations.iterrows():
+                        if obj.geometry is not None and obj.geometry.is_valid:
+                            no_fly_zones.append(zone_from_geometry(obj.geometry))
+            except Exception as e:
+                self.logger.warning(f"Ошибка загрузки вокзалов: {e}")
             
             if len(no_fly_zones) > 0:
                 # Объединяем все зоны в один GeoDataFrame
