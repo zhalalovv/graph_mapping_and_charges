@@ -53,7 +53,7 @@ def get_building_clusters(
     simplify: bool = Query(True, description="Упрощение графа"),
 ):
     """
-    Возвращает кластеризованные здания по типам
+    Возвращает точки на зданиях (центроиды). Без кластеризации по типам — один слой точек.
     """
     import logging
     logger = logging.getLogger(__name__)
@@ -61,142 +61,64 @@ def get_building_clusters(
     try:
         # Загружаем данные города
         data = data_service.get_city_data(city, network_type=network_type, simplify=simplify)
-        classified_buildings = data.get("classified_buildings")
-        
-        # Если классифицированных зданий нет, но есть обычные здания - классифицируем их
-        if classified_buildings is None or len(classified_buildings) == 0:
-            buildings = data.get("buildings")
-            if buildings is not None and len(buildings) > 0:
-                logger.info("Классифицируем здания на лету")
-                classified_buildings = data_service.classify_buildings(buildings)
-            else:
-                logger.warning("Нет зданий для кластеризации")
-                return JSONResponse({
-                    "clusters": {},
-                    "total": 0,
-                    "message": "Нет зданий для кластеризации"
-                })
-        
-        if len(classified_buildings) == 0:
-            logger.warning("Классифицированные здания пусты")
+        buildings = data.get("buildings")
+        if buildings is None or len(buildings) == 0:
+            logger.warning("Нет зданий")
             return JSONResponse({
-                "clusters": {},
+                "buildings": {"type": "FeatureCollection", "features": []},
                 "total": 0,
-                "message": "Нет зданий для кластеризации"
+                "message": "Нет зданий"
             })
         
-        total_buildings = len(classified_buildings)
-        logger.info(f"Всего зданий для кластеризации: {total_buildings}")
+        total_buildings = len(buildings)
+        logger.info(f"Всего зданий: {total_buildings}")
         
-        # ФИЛЬТРАЦИЯ: отфильтровываем здания только в границах города
+        # Центроиды в проекции (EPSG:3857), затем в WGS84 — без предупреждений GeoPandas
+        if buildings.crs is None:
+            buildings = buildings.set_crs("EPSG:4326")
+        buildings_proj = buildings.to_crs("EPSG:3857")
+        buildings_proj = buildings_proj.set_geometry(buildings_proj.geometry.centroid)
+        points_gdf = buildings_proj.to_crs("EPSG:4326")
+        
+        # ФИЛЬТРАЦИЯ: только здания в границах города
         city_boundary = data.get("city_boundary")
         if city_boundary is not None:
             try:
                 logger.info("Фильтрация зданий по границам города...")
-                # Проверяем, находятся ли центроиды зданий внутри границ города
-                buildings_centroids = classified_buildings.geometry.centroid
-                mask = buildings_centroids.within(city_boundary)
-                classified_buildings = classified_buildings[mask]
-                filtered_count = len(classified_buildings)
-                logger.info(f"Отфильтровано зданий: {total_buildings} -> {filtered_count} (в границах города)")
+                mask = points_gdf.geometry.within(city_boundary)
+                points_gdf = points_gdf[mask]
+                logger.info(f"Отфильтровано зданий: {total_buildings} -> {len(points_gdf)} (в границах города)")
             except Exception as e:
                 logger.warning(f"Ошибка фильтрации зданий по границам города: {e}")
-                # Продолжаем без фильтрации, если произошла ошибка
         
-        if len(classified_buildings) == 0:
-            logger.warning("После фильтрации зданий не осталось")
+        if len(points_gdf) == 0:
             return JSONResponse({
-                "clusters": {},
+                "buildings": {"type": "FeatureCollection", "features": []},
                 "total": 0,
                 "message": "Нет зданий в границах города"
             })
         
-        # Группируем здания по типам и конвертируем в точки (центроиды)
-        # ОПТИМИЗАЦИЯ: используем точки вместо полигонов для минимального размера данных
-        clusters = {}
-        for building_type in classified_buildings['building_type'].unique():
-            type_buildings = classified_buildings[classified_buildings['building_type'] == building_type]
-            
-            if len(type_buildings) > 0:
-                try:
-                    logger.info(f"Конвертация типа {building_type}: {len(type_buildings)} зданий в точки...")
-                    
-                    # Создаем точки из центроидов зданий
-                    from shapely.geometry import Point
-                    points_gdf = type_buildings.copy()
-                    points_gdf['geometry'] = type_buildings.geometry.centroid
-                    
-                    # Конвертируем в GeoJSON
-                    geojson_str = points_gdf.to_json(na='null', show_bbox=False)
-                    geojson_data = json.loads(geojson_str)
-                    
-                    # Округляем координаты до 6 знаков после запятой
-                    def round_coords(obj, precision=6):
-                        if isinstance(obj, dict):
-                            return {k: round_coords(v, precision) for k, v in obj.items()}
-                        elif isinstance(obj, list):
-                            return [round_coords(item, precision) for item in obj]
-                        elif isinstance(obj, float):
-                            return round(obj, precision)
-                        return obj
-                    
-                    geojson_data = round_coords(geojson_data, precision=6)
-                    
-                    geojson_size_mb = len(json.dumps(geojson_data)) / (1024 * 1024)
-                    logger.info(f"  Размер GeoJSON (точки): {geojson_size_mb:.2f} MB")
-                    
-                    clusters[building_type] = geojson_data
-                    logger.info(f"✓ Тип {building_type}: {len(type_buildings)} точек успешно создано")
-                    
-                except Exception as e:
-                    logger.error(f"Критическая ошибка для {building_type}: {e}")
-                    import traceback
-                    logger.error(traceback.format_exc())
-                    # Пропускаем этот тип, но продолжаем обработку остальных
+        # Расстановка точек на зданиях — центроиды уже в points_gdf (WGS84)
+        geojson_str = points_gdf.to_json(na='null', show_bbox=False)
+        geojson_data = json.loads(geojson_str)
         
-        # Подсчитываем статистику
-        type_counts = classified_buildings['building_type'].value_counts().to_dict()
+        def round_coords(obj, precision=6):
+            if isinstance(obj, dict):
+                return {k: round_coords(v, precision) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [round_coords(item, precision) for item in obj]
+            elif isinstance(obj, float):
+                return round(obj, precision)
+            return obj
         
-        # Логируем статистику в терминал
-        logger.info("=" * 60)
-        logger.info("СТАТИСТИКА ЗДАНИЙ ПО ТИПАМ:")
-        logger.info(f"Всего зданий: {len(classified_buildings)}")
-        for btype, count in sorted(type_counts.items(), key=lambda x: x[1], reverse=True):
-            type_names = {
-                'apartment': 'Многоквартирные дома',
-                'house': 'Частные дома',
-                'industrial': 'Промышленные здания',
-                'commercial': 'Коммерческие здания',
-                'office': 'Офисные здания',
-                'public': 'Общественные здания',
-                'other': 'Прочие здания'
-            }
-            type_name = type_names.get(btype, btype)
-            percentage = (count / len(classified_buildings) * 100) if len(classified_buildings) > 0 else 0
-            logger.info(f"  {type_name:30} {count:6} ({percentage:5.1f}%)")
-        logger.info("=" * 60)
+        geojson_data = round_coords(geojson_data, precision=6)
+        n_features = len(geojson_data.get('features', []))
+        logger.info(f"Точек на зданиях: {n_features}")
         
-        # Подсчитываем общий размер данных
-        total_clusters = len(clusters)
-        total_features = sum(len(cluster.get('features', [])) for cluster in clusters.values())
-        logger.info(f"Итого: {total_clusters} типов зданий, {total_features} features в кластерах")
-        
-        response_data = {
-            "clusters": clusters,
-            "statistics": type_counts,
-            "total": len(classified_buildings),
-            "types": list(clusters.keys())
-        }
-        
-        # Логируем размер ответа
-        try:
-            import sys
-            response_size = sys.getsizeof(str(response_data)) / (1024 * 1024)
-            logger.info(f"Приблизительный размер ответа: {response_size:.2f} MB")
-        except:
-            pass
-        
-        return JSONResponse(response_data)
+        return JSONResponse({
+            "buildings": geojson_data,
+            "total": n_features
+        })
     except Exception as e:
         import traceback
         traceback.print_exc()

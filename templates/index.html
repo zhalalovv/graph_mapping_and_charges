@@ -108,78 +108,11 @@
             overflow: auto;
         }
         
-        .legend {
-            position: fixed;
-            bottom: 16px;
-            right: 16px;
-            z-index: 1200;
-            background: #fff;
-            border-radius: 8px;
-            box-shadow: 0 4px 16px rgba(0, 0, 0, .25);
-            padding: 12px;
-            font-size: 13px;
-        }
-        
-        .legend-item {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            margin-bottom: 6px;
-        }
-        
-        .legend-item:last-child {
-            margin-bottom: 0;
-        }
-        
-        .legend-line {
-            width: 24px;
-            height: 3px;
-            border-radius: 2px;
-        }
     </style>
 </head>
 
 <body>
     <div id="map"></div>
-    
-    <div class="legend" id="legend" style="display:none">
-        <div style="font-weight:600; margin-bottom:8px">Легенда:</div>
-        <div class="legend-item">
-            <div class="legend-line" style="background:#2563eb"></div>
-            <span>Дороги</span>
-        </div>
-        <div class="legend-item" style="margin-top:8px">
-            <div style="width:24px; height:16px; background:#dc2626; opacity:0.3; border:2px dashed #dc2626; border-radius:2px"></div>
-            <span>🚫 Беспилотные зоны</span>
-        </div>
-        <div style="margin-top:12px; padding-top:12px; border-top:1px solid #e5e7eb">
-            <div style="font-weight:600; margin-bottom:8px; font-size:12px">Типы зданий:</div>
-            <div class="legend-item" style="font-size:11px">
-                <div style="width:16px; height:16px; background:#ef4444; opacity:0.3; border:1px solid #ef4444"></div>
-                <span>Многоквартирные</span>
-            </div>
-            <div class="legend-item" style="font-size:11px">
-                <div style="width:16px; height:16px; background:#10b981; opacity:0.3; border:1px solid #10b981"></div>
-                <span>Частные дома</span>
-            </div>
-            <div class="legend-item" style="font-size:11px">
-                <div style="width:16px; height:16px; background:#f59e0b; opacity:0.3; border:1px solid #f59e0b"></div>
-                <span>Промышленные</span>
-            </div>
-            <div class="legend-item" style="font-size:11px">
-                <div style="width:16px; height:16px; background:#3b82f6; opacity:0.3; border:1px solid #3b82f6"></div>
-                <span>Коммерческие</span>
-            </div>
-            <div class="legend-item" style="font-size:11px">
-                <div style="width:16px; height:16px; background:#8b5cf6; opacity:0.3; border:1px solid #8b5cf6"></div>
-                <span>Офисные</span>
-            </div>
-            <div class="legend-item" style="font-size:11px">
-                <div style="width:16px; height:16px; background:#ec4899; opacity:0.3; border:1px solid #ec4899"></div>
-                <span>Общественные</span>
-            </div>
-        </div>
-    </div>
     
     <div class="sidebar">
         <h2 style="margin:0 0 12px">Параметры графа</h2>
@@ -628,14 +561,6 @@
                     statsText += `\nДороги: ${stats.road_nodes}, Свободные: ${stats.free_nodes}`;
                 }
                 statsEl.textContent = statsText;
-                
-                // Показываем легенду если есть беспилотные зоны или здания
-                const legendEl = document.getElementById('legend');
-                if (graphData.no_fly_zones || buildingsLayer) {
-                    legendEl.style.display = 'block';
-                } else {
-                    legendEl.style.display = 'none';
-                }
                 
             } catch (e) {
                 console.error(e);
