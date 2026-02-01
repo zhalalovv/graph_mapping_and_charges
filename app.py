@@ -126,6 +126,61 @@ def get_building_clusters(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/buildings/export")
+def export_buildings_with_heights(
+    city: str = Query(..., description="Название города, как в /api/city"),
+    network_type: str = Query('drive', description="Тип сети OSM"),
+    simplify: bool = Query(True, description="Упрощение"),
+):
+    """
+    Выгрузка зданий с высотами и эшелонами полётов.
+    GeoJSON с полигонами зданий и properties: height_m, flight_level (рекомендуемый эшелон).
+    """
+    try:
+        data = data_service.get_city_data(city, network_type=network_type, simplify=simplify)
+        buildings = data.get("buildings")
+        flight_levels = data.get("flight_levels", [])
+        if buildings is None or len(buildings) == 0:
+            return JSONResponse({
+                "type": "FeatureCollection",
+                "features": [],
+                "flight_levels": flight_levels,
+                "building_height_stats": data.get("building_height_stats", {}),
+            })
+        if "height_m" not in buildings.columns:
+            buildings = data_service._compute_building_heights(buildings)
+        # GeoJSON: полигоны зданий + height_m, рекомендованный flight_level
+        levels_m = [f["altitude_m"] for f in flight_levels] if flight_levels else [40, 65, 90, 115]
+        features = []
+        for idx, row in buildings.iterrows():
+            geom = row.geometry
+            if geom is None or not getattr(geom, "is_valid", True):
+                continue
+            h = float(row.get("height_m", 10))
+            # Рекомендуемый эшелон: первый, где altitude > h + 10м
+            rec_level = 1
+            for i, alt in enumerate(levels_m):
+                if alt >= h + 10:
+                    rec_level = i + 1
+                    break
+            feat = {
+                "type": "Feature",
+                "geometry": json.loads(gpd.GeoSeries([geom]).to_json())["features"][0]["geometry"],
+                "properties": {"height_m": round(h, 1), "flight_level": rec_level},
+            }
+            features.append(feat)
+        return JSONResponse({
+            "type": "FeatureCollection",
+            "features": features,
+            "flight_levels": flight_levels,
+            "building_height_stats": data.get("building_height_stats", {}),
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/city")
 def get_city(
     city: str = Query(..., description="Название города, например 'Volgograd, Russia'"),
@@ -151,6 +206,8 @@ def get_city(
             "city_name": data.get("city_name"),
             "stats": stats,
             "params": data.get("params", {}),
+            "flight_levels": data.get("flight_levels", []),
+            "building_height_stats": data.get("building_height_stats", {}),
             "progress": progress_events,
         }
         return JSONResponse(result)
@@ -271,18 +328,15 @@ def graph_geojson(
             stats = data.get("stats", {})
             
         elif graph_type == 'delaunay':
-            # Проверяем кэш
             if cached_graph_data is not None:
                 edges_geojson = cached_graph_data.get('edges_geojson')
                 stats = cached_graph_data.get('stats')
                 logger.info("✓ Использован кэшированный delaunay граф")
             else:
-                # Точки высадки (у дороги / у подъездов) — по ним строим граф
                 delivery_gdf = data_service.get_delivery_points(buildings, road_graph, city_boundary)
                 delivery_points = []
                 if len(delivery_gdf) > 0:
                     delivery_points = [(float(row["delivery_lon"]), float(row["delivery_lat"])) for _, row in delivery_gdf.iterrows()]
-                
                 delaunay_graph = graph_service.create_delaunay_graph(
                     bounds=bounds,
                     num_points=0,
@@ -297,8 +351,6 @@ def graph_geojson(
                     "edges": len(delaunay_graph.edges),
                     "type": "delaunay"
                 }
-                
-                # Сохраняем в Redis
                 if redis_client is not None:
                     try:
                         cache_data = {
@@ -306,10 +358,20 @@ def graph_geojson(
                             'stats': stats,
                             'graph_type': graph_type
                         }
-                        redis_client.set(cache_key, pickle.dumps(cache_data), ex=86400 * 7)  # 7 дней
+                        redis_client.set(cache_key, pickle.dumps(cache_data), ex=86400 * 7)
                         logger.info(f"✓ Delaunay граф сохранен в Redis: {cache_key}")
                     except Exception as e:
                         logger.warning(f"Ошибка сохранения delaunay графа в Redis: {e}")
+            # Аннотируем рёбра допустимыми эшелонами (выполняется всегда)
+            flight_levels = data.get("flight_levels", [])
+            buildings_with_heights = data.get("buildings")
+            if buildings_with_heights is not None and "height_m" not in buildings_with_heights.columns:
+                buildings_with_heights = data_service._compute_building_heights(buildings_with_heights)
+            edges_geojson = graph_service.assign_flight_levels_to_edges(
+                edges_geojson,
+                buildings_with_heights if buildings_with_heights is not None and len(buildings_with_heights) > 0 else gpd.GeoDataFrame(),
+                flight_levels
+            )
         else:
             raise HTTPException(status_code=400, detail=f"Неизвестный тип графа: {graph_type}")
 
@@ -359,6 +421,8 @@ def graph_geojson(
             "graph_type": graph_type,
             "city_boundary": city_boundary_geojson,  # Границы города для визуализации
             "no_fly_zones": no_fly_zones_geojson,  # Беспилотные зоны для визуализации
+            "flight_levels": data.get("flight_levels", []),  # Эшелоны полётов
+            "building_height_stats": data.get("building_height_stats", {}),
         })
     except HTTPException:
         raise

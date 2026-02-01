@@ -4,6 +4,7 @@ from shapely.geometry import Point, LineString, Polygon
 from shapely.ops import unary_union
 import geopandas as gpd
 from scipy.spatial import Delaunay
+from shapely.strtree import STRtree
 import logging
 from typing import Tuple, List, Optional, Union
 
@@ -253,4 +254,89 @@ class GraphService:
             "type": "FeatureCollection",
             "features": features
         }
-        
+
+    # Запас над зданием для разрешения полёта. Строгий: эшелон 1 (40м) не летает над оранжевыми (30+м)
+    FLIGHT_LEVEL_SAFETY_MARGIN = 15.0
+
+    def assign_flight_levels_to_edges(
+        self,
+        edges_geojson: dict,
+        buildings: gpd.GeoDataFrame,
+        flight_levels: list,
+        margin_m: float | None = None,
+        corridor_buffer_deg: float = 0.00003,
+    ) -> dict:
+        """
+        Добавляет к каждому ребру allowed_flight_levels — список эшелонов,
+        на которых можно пролететь по этому ребру (не пролегает над слишком высокими зданиями).
+
+        Ребро блокируется на эшелоне L, если линия ребра пересекает здание,
+        высота которого >= (altitude_L - margin_m). Используется строгий запас 15 м:
+        эшелон 1 (40 м) разрешает только здания до 25 м (зелёные, жёлтые),
+        оранжевые (30–50 м) и красные запрещены.
+
+        Args:
+            edges_geojson: GeoJSON FeatureCollection рёбер
+            buildings: GeoDataFrame с колонками geometry, height_m
+            flight_levels: [{"level": 1, "altitude_m": 40}, ...]
+            margin_m: запас над зданием (м), по умолчанию FLIGHT_LEVEL_SAFETY_MARGIN=15
+            corridor_buffer_deg: буфер линии ребра в градусах (~3 м)
+
+        Returns:
+            Тот же edges_geojson с properties.allowed_flight_levels в каждом feature
+        """
+        margin_m = margin_m if margin_m is not None else self.FLIGHT_LEVEL_SAFETY_MARGIN
+        if buildings is None or len(buildings) == 0 or 'height_m' not in buildings.columns:
+            for f in edges_geojson.get("features", []):
+                f.setdefault("properties", {})["allowed_flight_levels"] = [
+                    fl["level"] for fl in (flight_levels or [])
+                ]
+            return edges_geojson
+
+        if not flight_levels:
+            return edges_geojson
+
+        building_geoms = list(buildings.geometry)
+        building_heights = list(buildings["height_m"])
+        tree = STRtree(building_geoms)
+
+        levels_alt = [(fl["level"], fl["altitude_m"]) for fl in flight_levels]
+
+        for feature in edges_geojson.get("features", []):
+            geom = feature.get("geometry")
+            if not geom or geom.get("type") != "LineString":
+                feature.setdefault("properties", {})["allowed_flight_levels"] = [
+                    fl[0] for fl in levels_alt
+                ]
+                continue
+            coords = geom.get("coordinates", [])
+            if len(coords) < 2:
+                feature.setdefault("properties", {})["allowed_flight_levels"] = [
+                    fl[0] for fl in levels_alt
+                ]
+                continue
+
+            line = LineString(coords)
+            corridor = line.buffer(corridor_buffer_deg)
+            candidates = tree.query(corridor)
+
+            max_height_under = 0.0
+            for idx in candidates:
+                idx = int(idx)
+                if idx < len(building_geoms):
+                    try:
+                        if building_geoms[idx].intersects(corridor):
+                            h = float(building_heights[idx])
+                            max_height_under = max(max_height_under, h)
+                    except Exception:
+                        pass
+
+            allowed = []
+            for level, altitude in levels_alt:
+                # Строгое условие: здание должно быть заметно ниже эшелона (margin_m)
+                if max_height_under < altitude - margin_m:
+                    allowed.append(level)
+
+            feature.setdefault("properties", {})["allowed_flight_levels"] = allowed
+
+        return edges_geojson
