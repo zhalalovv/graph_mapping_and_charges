@@ -155,7 +155,7 @@
         // Список популярных городов
         const CITIES = [
             { name: 'Волгоград', query: 'Volgograd, Russia' },
-            { name: 'Бала', query: 'Krasnodar, Russia' },
+            { name: 'Балаково', query: 'Balakovo, Russia' },
         ];
 
         function ensureMap(center = [55.751244, 37.618423]) {
@@ -308,12 +308,10 @@
                                 });
                             },
                             onEachFeature: function(feature, layer) {
-                                const props = feature.properties || {};
-                                const dl = props.delivery_lat != null && props.delivery_lon != null;
-                                const deliveryText = dl
-                                    ? `<strong>Точка высадки у дороги:</strong> ${props.delivery_lat.toFixed(5)}, ${props.delivery_lon.toFixed(5)}`
-                                    : '—';
-                                layer.bindPopup(`<strong>Высадка:</strong> ${deliveryText}`);
+                                layer.bindPopup(`
+                                    <strong>Тип здания:</strong> ${getBuildingTypeName(buildingType)}<br>
+                                    <strong>Категория:</strong> ${buildingType}
+                                `);
                             }
                         };
                         
