@@ -53,15 +53,16 @@ def get_building_clusters(
     simplify: bool = Query(True, description="Упрощение графа"),
 ):
     """
-    Возвращает точки на зданиях (центроиды). Без кластеризации по типам — один слой точек.
+    Возвращает точки на зданиях (центроиды) и точку высадки у дороги для каждого здания.
     """
     import logging
     logger = logging.getLogger(__name__)
     
     try:
-        # Загружаем данные города
         data = data_service.get_city_data(city, network_type=network_type, simplify=simplify)
         buildings = data.get("buildings")
+        road_graph = data.get("road_graph")
+        city_boundary = data.get("city_boundary")
         if buildings is None or len(buildings) == 0:
             logger.warning("Нет зданий")
             return JSONResponse({
@@ -69,38 +70,32 @@ def get_building_clusters(
                 "total": 0,
                 "message": "Нет зданий"
             })
+        if road_graph is None or len(road_graph.nodes) == 0:
+            logger.warning("Нет дорожного графа для расчёта точек высадки")
         
-        total_buildings = len(buildings)
-        logger.info(f"Всего зданий: {total_buildings}")
-        
-        # Центроиды в проекции (EPSG:3857), затем в WGS84 — без предупреждений GeoPandas
-        if buildings.crs is None:
-            buildings = buildings.set_crs("EPSG:4326")
-        buildings_proj = buildings.to_crs("EPSG:3857")
-        buildings_proj = buildings_proj.set_geometry(buildings_proj.geometry.centroid)
-        points_gdf = buildings_proj.to_crs("EPSG:4326")
-        
-        # ФИЛЬТРАЦИЯ: только здания в границах города
-        city_boundary = data.get("city_boundary")
-        if city_boundary is not None:
-            try:
-                logger.info("Фильтрация зданий по границам города...")
-                mask = points_gdf.geometry.within(city_boundary)
-                points_gdf = points_gdf[mask]
-                logger.info(f"Отфильтровано зданий: {total_buildings} -> {len(points_gdf)} (в границах города)")
-            except Exception as e:
-                logger.warning(f"Ошибка фильтрации зданий по границам города: {e}")
-        
-        if len(points_gdf) == 0:
+        # Точки высадки — рядом с домами на дороге
+        delivery_gdf = data_service.get_delivery_points(buildings, road_graph, city_boundary)
+        if len(delivery_gdf) == 0:
             return JSONResponse({
                 "buildings": {"type": "FeatureCollection", "features": []},
                 "total": 0,
                 "message": "Нет зданий в границах города"
             })
         
-        # Расстановка точек на зданиях — центроиды уже в points_gdf (WGS84)
-        geojson_str = points_gdf.to_json(na='null', show_bbox=False)
-        geojson_data = json.loads(geojson_str)
+        # GeoJSON: geometry = точка у дороги (высадка), не центроид здания
+        features = []
+        for idx, row in delivery_gdf.iterrows():
+            lon_d = row["delivery_lon"]
+            lat_d = row["delivery_lat"]
+            feat = {
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [lon_d, lat_d]},
+                "properties": {
+                    "delivery_lon": round(lon_d, 6),
+                    "delivery_lat": round(lat_d, 6),
+                },
+            }
+            features.append(feat)
         
         def round_coords(obj, precision=6):
             if isinstance(obj, dict):
@@ -111,12 +106,18 @@ def get_building_clusters(
                 return round(obj, precision)
             return obj
         
-        geojson_data = round_coords(geojson_data, precision=6)
-        n_features = len(geojson_data.get('features', []))
-        logger.info(f"Точек на зданиях: {n_features}")
+        geojson_data = round_coords({
+            "type": "FeatureCollection",
+            "features": features,
+        }, precision=6)
+        n_features = len(features)
+        # Один слой для фронта (clusters ожидается кодом карты)
+        clusters = {"buildings": geojson_data}
+        logger.info(f"Точек на зданиях (высадка у дороги): {n_features}")
         
         return JSONResponse({
             "buildings": geojson_data,
+            "clusters": clusters,
             "total": n_features
         })
     except Exception as e:
@@ -276,16 +277,19 @@ def graph_geojson(
                 stats = cached_graph_data.get('stats')
                 logger.info("✓ Использован кэшированный delaunay граф")
             else:
-                # Delaunay триангуляция
-                num_points = int((xmax - xmin) * (ymax - ymin) / (grid_spacing ** 2))
-                num_points = min(max(num_points, 100), 1000)  # ограничиваем 100-1000
+                # Точки высадки (у дороги / у подъездов) — по ним строим граф
+                delivery_gdf = data_service.get_delivery_points(buildings, road_graph, city_boundary)
+                delivery_points = []
+                if len(delivery_gdf) > 0:
+                    delivery_points = [(float(row["delivery_lon"]), float(row["delivery_lat"])) for _, row in delivery_gdf.iterrows()]
                 
                 delaunay_graph = graph_service.create_delaunay_graph(
                     bounds=bounds,
-                    num_points=num_points,
-                    buildings=buildings,
+                    num_points=0,
+                    buildings=buildings if len(delivery_points) < 3 else None,
                     no_fly_zones=no_fly_zones,
-                    city_boundary=city_boundary
+                    city_boundary=city_boundary,
+                    points=delivery_points if len(delivery_points) >= 3 else None,
                 )
                 edges_geojson = graph_service.graph_to_geojson(delaunay_graph)
                 stats = {

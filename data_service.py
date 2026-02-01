@@ -11,8 +11,9 @@ from geopy.extra.rate_limiter import RateLimiter
 import logging
 import json
 from redis import Redis
-from shapely.geometry import box, MultiPoint
+from shapely.geometry import box, MultiPoint, Point, LineString
 from shapely.ops import unary_union
+from shapely.strtree import STRtree
 
 class DataService:
     def __init__(self, cache_dir="cache_data"):
@@ -474,6 +475,188 @@ class DataService:
             self.logger.warning(f"Ошибка загрузки беспилотных зон: {e}")
         
         return []
+    
+    @staticmethod
+    def _is_apartment(row) -> bool:
+        """Многоквартирный дом по OSM-тегу building."""
+        tag = row.get('building') if hasattr(row, 'get') else None
+        if tag is None or (isinstance(tag, float) and pd.isna(tag)):
+            return False
+        tag = str(tag).lower().strip()
+        return tag in ('apartments', 'apartment', 'residential', 'apartment_block', 'multistory', 'block', 'flats', 'semidetached_house')
+    
+    # Смещение точки высадки от линии дороги в сторону здания (~5 м), но не заходя на здание
+    OFFSET_FROM_ROAD_DEGREES = 0.00005
+    MIN_SHIFT_DEGREES = 0.000005  # ~0.5 м — минимум, ниже не смещаем
+
+    def _point_to_road(self, pt, edge_tree, edge_geoms):
+        """Проецирует точку на ближайшее ребро дороги. Возвращает (lon, lat) на дороге."""
+        if not edge_tree or not edge_geoms:
+            return pt.x, pt.y
+        nearest_idx = edge_tree.query_nearest(pt, return_distance=False)
+        if not (hasattr(nearest_idx, '__len__') and len(nearest_idx) > 0):
+            return pt.x, pt.y
+        i = int(nearest_idx.flat[0]) if hasattr(nearest_idx, 'flat') else int(nearest_idx[0])
+        line = edge_geoms[i]
+        try:
+            projected = line.interpolate(line.project(pt))
+            return projected.x, projected.y
+        except Exception:
+            return pt.x, pt.y
+
+    def _point_inside_any_building(self, pt, building_tree, building_geoms):
+        """True, если точка внутри хотя бы одного полигона здания."""
+        if not building_tree or not building_geoms:
+            return False
+        try:
+            candidates = building_tree.query(pt)
+            for c in (candidates if hasattr(candidates, '__iter__') and not isinstance(candidates, (int, float)) else [candidates]):
+                idx = int(c)
+                if idx < len(building_geoms) and building_geoms[idx].contains(pt):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _shift_near_road_no_building(self, rx, ry, pt, building_tree, building_geoms):
+        """Смещает точку (rx,ry) с дороги в сторону pt, но не заходя на здания. Возвращает (lon, lat)."""
+        dx = pt.x - rx
+        dy = pt.y - ry
+        d = (dx * dx + dy * dy) ** 0.5
+        if d < 1e-9:
+            return rx, ry
+        shift = self.OFFSET_FROM_ROAD_DEGREES
+        while shift >= self.MIN_SHIFT_DEGREES:
+            lon_d = rx + shift * dx / d
+            lat_d = ry + shift * dy / d
+            delivery_pt = Point(lon_d, lat_d)
+            if not self._point_inside_any_building(delivery_pt, building_tree, building_geoms):
+                return lon_d, lat_d
+            shift *= 0.5
+        return rx, ry
+    
+    def _load_entrances_bbox(self, bbox):
+        """Загружает точки подъездов (entrance=*) из OSM по bbox. (north, south, east, west)."""
+        try:
+            entrances = ox.features_from_bbox(bbox[0], bbox[1], bbox[2], bbox[3], tags={"entrance": True})
+            if entrances is not None and len(entrances) > 0:
+                if entrances.crs is None:
+                    entrances = entrances.set_crs("EPSG:4326")
+                def to_point(g):
+                    if g is None: return None
+                    if g.geom_type == 'Point': return g
+                    if g.geom_type == 'MultiPoint' and len(g.geoms) > 0: return g.geoms[0]
+                    return g.centroid
+                entrances = entrances.copy()
+                entrances['geometry'] = entrances.geometry.apply(to_point)
+                return entrances
+        except Exception as e:
+            self.logger.warning(f"Не удалось загрузить подъезды из OSM: {e}")
+        return gpd.GeoDataFrame()
+    
+    def get_delivery_points(
+        self,
+        buildings: gpd.GeoDataFrame,
+        road_graph,
+        city_boundary=None,
+    ) -> gpd.GeoDataFrame:
+        """
+        Точки высадки: у многоквартирных — у каждого подъезда (по OSM entrance=*), у остальных — одна точка у дороги.
+        """
+        if buildings is None or len(buildings) == 0:
+            return gpd.GeoDataFrame()
+        if buildings.crs is None:
+            buildings = buildings.set_crs("EPSG:4326")
+        buildings = buildings.to_crs("EPSG:4326")
+        if city_boundary is not None:
+            try:
+                mask = buildings.geometry.centroid.within(city_boundary)
+                buildings = buildings[mask]
+            except Exception as e:
+                self.logger.warning(f"Фильтрация зданий по границе: {e}")
+        if len(buildings) == 0:
+            return gpd.GeoDataFrame()
+        
+        if road_graph is None or len(road_graph.nodes) == 0:
+            edge_geoms = []
+        else:
+            _, gdf_edges = ox.graph_to_gdfs(road_graph)
+            if gdf_edges.crs is not None and gdf_edges.crs != buildings.crs:
+                gdf_edges = gdf_edges.to_crs(buildings.crs)
+            edge_geoms = list(gdf_edges.geometry) if len(gdf_edges) > 0 else []
+        edge_tree = STRtree(edge_geoms) if edge_geoms else None
+        
+        building_geoms = list(buildings.geometry)
+        building_tree = STRtree(building_geoms) if building_geoms else None
+        is_apartment = [self._is_apartment(buildings.iloc[i]) for i in range(len(buildings))]
+        
+        # Подъезды из OSM: bbox (north, south, east, west)
+        xmin, ymin, xmax, ymax = buildings.total_bounds
+        entrances_gdf = self._load_entrances_bbox((ymax, ymin, xmax, xmin))
+        building_entrances = {}  # индекс здания -> список точек подъездов
+        if len(entrances_gdf) > 0 and building_tree is not None:
+            for _, ent in entrances_gdf.iterrows():
+                g = ent.geometry
+                if g is None or not getattr(g, 'is_valid', True):
+                    continue
+                if g.geom_type == 'Point':
+                    pt = g
+                elif g.geom_type == 'MultiPoint' and len(g.geoms) > 0:
+                    pt = g.geoms[0]
+                else:
+                    pt = g.centroid
+                try:
+                    candidates = building_tree.query(pt)
+                except Exception:
+                    continue
+                if hasattr(candidates, '__iter__') and not isinstance(candidates, (int, float)):
+                    for c in candidates:
+                        idx = int(c)
+                        if idx >= len(building_geoms):
+                            continue
+                        poly = building_geoms[idx]
+                        try:
+                            if poly.buffer(0.00005).contains(pt) and is_apartment[idx]:
+                                building_entrances.setdefault(idx, []).append(pt)
+                                break
+                        except Exception:
+                            pass
+        
+        rows = []
+        for i in range(len(buildings)):
+            try:
+                b = buildings.iloc[i]
+                geom = b.geometry
+                if geom is None or not geom.is_valid:
+                    continue
+                centroid = geom.centroid
+                lon_c, lat_c = centroid.x, centroid.y
+                if is_apartment[i] and i in building_entrances and len(building_entrances[i]) > 0:
+                    for entrance_pt in building_entrances[i]:
+                        rx, ry = self._point_to_road(entrance_pt, edge_tree, edge_geoms)
+                        lon_d, lat_d = self._shift_near_road_no_building(rx, ry, entrance_pt, building_tree, building_geoms)
+                        rows.append({
+                            'geometry': Point(lon_d, lat_d),
+                            'delivery_lon': lon_d,
+                            'delivery_lat': lat_d,
+                        })
+                else:
+                    rx, ry = self._point_to_road(centroid, edge_tree, edge_geoms)
+                    lon_d, lat_d = self._shift_near_road_no_building(rx, ry, centroid, building_tree, building_geoms)
+                    rows.append({
+                        'geometry': Point(lon_d, lat_d),
+                        'delivery_lon': lon_d,
+                        'delivery_lat': lat_d,
+                    })
+            except Exception as e:
+                self.logger.debug(f"Здание {i}: {e}")
+                continue
+        
+        if not rows:
+            return gpd.GeoDataFrame()
+        gdf = gpd.GeoDataFrame(rows, crs=buildings.crs)
+        self.logger.info(f"Точки высадки: {len(gdf)} (многоквартирные — по подъездам)")
+        return gdf
     
     def address_to_coords(self, address, city_name=None):
         """Улучшенное геокодирование с поддержкой российских адресов"""

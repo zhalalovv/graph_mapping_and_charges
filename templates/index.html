@@ -154,36 +154,8 @@
         
         // Список популярных городов
         const CITIES = [
-            { name: 'Москва', query: 'Moscow, Russia' },
-            { name: 'Санкт-Петербург', query: 'Saint Petersburg, Russia' },
-            { name: 'Новосибирск', query: 'Novosibirsk, Russia' },
-            { name: 'Екатеринбург', query: 'Yekaterinburg, Russia' },
-            { name: 'Казань', query: 'Kazan, Russia' },
-            { name: 'Нижний Новгород', query: 'Nizhny Novgorod, Russia' },
-            { name: 'Челябинск', query: 'Chelyabinsk, Russia' },
-            { name: 'Самара', query: 'Samara, Russia' },
-            { name: 'Омск', query: 'Omsk, Russia' },
-            { name: 'Ростов-на-Дону', query: 'Rostov-on-Don, Russia' },
-            { name: 'Уфа', query: 'Ufa, Russia' },
-            { name: 'Красноярск', query: 'Krasnoyarsk, Russia' },
-            { name: 'Воронеж', query: 'Voronezh, Russia' },
-            { name: 'Пермь', query: 'Perm, Russia' },
             { name: 'Волгоград', query: 'Volgograd, Russia' },
-            { name: 'Краснодар', query: 'Krasnodar, Russia' },
-            { name: 'Саратов', query: 'Saratov, Russia' },
-            { name: 'Тюмень', query: 'Tyumen, Russia' },
-            { name: 'Тольятти', query: 'Tolyatti, Russia' },
-            { name: 'Ижевск', query: 'Izhevsk, Russia' },
-            { name: 'Барнаул', query: 'Barnaul, Russia' },
-            { name: 'Ульяновск', query: 'Ulyanovsk, Russia' },
-            { name: 'Иркутск', query: 'Irkutsk, Russia' },
-            { name: 'Хабаровск', query: 'Khabarovsk, Russia' },
-            { name: 'Владивосток', query: 'Vladivostok, Russia' },
-            { name: 'Ярославль', query: 'Yaroslavl, Russia' },
-            { name: 'Махачкала', query: 'Makhachkala, Russia' },
-            { name: 'Томск', query: 'Tomsk, Russia' },
-            { name: 'Оренбург', query: 'Orenburg, Russia' },
-            { name: 'Кемерово', query: 'Kemerovo, Russia' },
+            { name: 'Бала', query: 'Krasnodar, Russia' },
         ];
 
         function ensureMap(center = [55.751244, 37.618423]) {
@@ -336,10 +308,12 @@
                                 });
                             },
                             onEachFeature: function(feature, layer) {
-                                layer.bindPopup(`
-                                    <strong>Тип здания:</strong> ${getBuildingTypeName(buildingType)}<br>
-                                    <strong>Категория:</strong> ${buildingType}
-                                `);
+                                const props = feature.properties || {};
+                                const dl = props.delivery_lat != null && props.delivery_lon != null;
+                                const deliveryText = dl
+                                    ? `<strong>Точка высадки у дороги:</strong> ${props.delivery_lat.toFixed(5)}, ${props.delivery_lon.toFixed(5)}`
+                                    : '—';
+                                layer.bindPopup(`<strong>Высадка:</strong> ${deliveryText}`);
                             }
                         };
                         

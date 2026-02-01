@@ -233,74 +233,77 @@ class GraphService:
         buildings: Optional[gpd.GeoDataFrame] = None,
         no_fly_zones: Optional[Union[gpd.GeoDataFrame, List]] = None,
         min_clearance: float = 0.0001,
-        city_boundary: Optional[Polygon] = None
+        city_boundary: Optional[Polygon] = None,
+        points: Optional[List[Tuple[float, float]]] = None,
     ) -> nx.Graph:
         """
-        Создает граф на основе триангуляции Делоне по центроидам зданий
+        Создает граф на основе триангуляции Делоне по точкам высадки или центроидам зданий.
         
         Args:
             bounds: (min_lon, min_lat, max_lon, max_lat)
-            num_points: игнорируется, используется количество зданий
-            buildings: GeoDataFrame со зданиями (используются центроиды)
+            num_points: игнорируется при наличии buildings или points
+            buildings: GeoDataFrame со зданиями (используются только если points=None)
             no_fly_zones: Список запретных зон
             min_clearance: минимальное расстояние от препятствий
             city_boundary: границы города для фильтрации
+            points: если задан — узлы графа строятся по этим точкам (lon, lat), иначе по центроидам зданий
             
         Returns:
             NetworkX граф
         """
         min_lon, min_lat, max_lon, max_lat = bounds
         
-        # Подготовка препятствий (без зданий, так как мы используем их центроиды)
         obstacles = self._prepare_obstacles(None, no_fly_zones, min_clearance)
         
-        # Используем центроиды зданий вместо случайных точек
-        points = []
-        
-        if buildings is not None and len(buildings) > 0:
+        # Приоритет: переданные точки (высадки), иначе центроиды зданий
+        point_list = []
+        if points is not None and len(points) > 0:
+            self.logger.info(f"Генерация Delaunay графа по точкам высадки: {len(points)} точек")
+            for lon, lat in points:
+                pt = Point(lon, lat)
+                if city_boundary is not None:
+                    try:
+                        if not city_boundary.contains(pt) and not city_boundary.touches(pt):
+                            continue
+                    except Exception:
+                        continue
+                if not self._is_point_in_obstacles(pt, obstacles):
+                    point_list.append([lon, lat])
+            self.logger.info(f"Получено {len(point_list)} точек для триангуляции")
+        elif buildings is not None and len(buildings) > 0:
             self.logger.info(f"Генерация Delaunay графа по центроидам зданий: {len(buildings)} зданий")
-            
-            # Получаем центроиды всех зданий
             for idx, building in buildings.iterrows():
                 try:
                     if building.geometry is not None and building.geometry.is_valid:
                         centroid = building.geometry.centroid
                         lon, lat = centroid.x, centroid.y
-                        
-                        # Проверяем, что центроид в границах города (если указаны)
                         if city_boundary is not None:
                             try:
                                 if not city_boundary.contains(centroid) and not city_boundary.touches(centroid):
                                     continue
                             except Exception:
                                 continue
-                        
-                        # Проверяем, что центроид не в беспилотных зонах
                         if not self._is_point_in_obstacles(centroid, obstacles):
-                            points.append([lon, lat])
+                            point_list.append([lon, lat])
                 except Exception as e:
                     self.logger.warning(f"Ошибка обработки здания {idx}: {e}")
                     continue
-            
-            self.logger.info(f"Получено {len(points)} центроидов зданий для триангуляции")
-        else:
-            self.logger.warning("Нет зданий для создания Delaunay графа")
-            return nx.Graph()
+            self.logger.info(f"Получено {len(point_list)} центроидов зданий для триангуляции")
         
-        if len(points) < 3:
+        if len(point_list) < 3:
             self.logger.warning("Недостаточно точек для триангуляции (нужно минимум 3)")
             return nx.Graph()
         
-        points = np.array(points)
+        points_arr = np.array(point_list)
         
         # Строим триангуляцию Делоне
-        tri = Delaunay(points)
+        tri = Delaunay(points_arr)
         
         # Создаем граф из триангуляции
         G = nx.Graph()
         
         # Добавляем узлы
-        for i, (lon, lat) in enumerate(points):
+        for i, (lon, lat) in enumerate(points_arr):
             G.add_node(i, lat=lat, lon=lon, pos=(lon, lat))
         
         # Добавляем рёбра из треугольников
@@ -308,7 +311,7 @@ class GraphService:
             for i in range(3):
                 n1, n2 = simplex[i], simplex[(i + 1) % 3]
                 if not G.has_edge(n1, n2):
-                    p1, p2 = points[n1], points[n2]
+                    p1, p2 = points_arr[n1], points_arr[n2]
                     line = LineString([p1, p2])
                     
                     # Проверяем, что ребро не пересекает препятствия
