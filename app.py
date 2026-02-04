@@ -53,15 +53,16 @@ def get_building_clusters(
     simplify: bool = Query(True, description="Упрощение графа"),
 ):
     """
-    Возвращает точки на зданиях (центроиды). Без кластеризации по типам — один слой точек.
+    Возвращает точки на зданиях (центроиды) и точку высадки у дороги для каждого здания.
     """
     import logging
     logger = logging.getLogger(__name__)
     
     try:
-        # Загружаем данные города
         data = data_service.get_city_data(city, network_type=network_type, simplify=simplify)
         buildings = data.get("buildings")
+        road_graph = data.get("road_graph")
+        city_boundary = data.get("city_boundary")
         if buildings is None or len(buildings) == 0:
             logger.warning("Нет зданий")
             return JSONResponse({
@@ -69,38 +70,32 @@ def get_building_clusters(
                 "total": 0,
                 "message": "Нет зданий"
             })
+        if road_graph is None or len(road_graph.nodes) == 0:
+            logger.warning("Нет дорожного графа для расчёта точек высадки")
         
-        total_buildings = len(buildings)
-        logger.info(f"Всего зданий: {total_buildings}")
-        
-        # Центроиды в проекции (EPSG:3857), затем в WGS84 — без предупреждений GeoPandas
-        if buildings.crs is None:
-            buildings = buildings.set_crs("EPSG:4326")
-        buildings_proj = buildings.to_crs("EPSG:3857")
-        buildings_proj = buildings_proj.set_geometry(buildings_proj.geometry.centroid)
-        points_gdf = buildings_proj.to_crs("EPSG:4326")
-        
-        # ФИЛЬТРАЦИЯ: только здания в границах города
-        city_boundary = data.get("city_boundary")
-        if city_boundary is not None:
-            try:
-                logger.info("Фильтрация зданий по границам города...")
-                mask = points_gdf.geometry.within(city_boundary)
-                points_gdf = points_gdf[mask]
-                logger.info(f"Отфильтровано зданий: {total_buildings} -> {len(points_gdf)} (в границах города)")
-            except Exception as e:
-                logger.warning(f"Ошибка фильтрации зданий по границам города: {e}")
-        
-        if len(points_gdf) == 0:
+        # Точки высадки — рядом с домами на дороге
+        delivery_gdf = data_service.get_delivery_points(buildings, road_graph, city_boundary)
+        if len(delivery_gdf) == 0:
             return JSONResponse({
                 "buildings": {"type": "FeatureCollection", "features": []},
                 "total": 0,
                 "message": "Нет зданий в границах города"
             })
         
-        # Расстановка точек на зданиях — центроиды уже в points_gdf (WGS84)
-        geojson_str = points_gdf.to_json(na='null', show_bbox=False)
-        geojson_data = json.loads(geojson_str)
+        # GeoJSON: geometry = точка у дороги (высадка), не центроид здания
+        features = []
+        for idx, row in delivery_gdf.iterrows():
+            lon_d = row["delivery_lon"]
+            lat_d = row["delivery_lat"]
+            feat = {
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [lon_d, lat_d]},
+                "properties": {
+                    "delivery_lon": round(lon_d, 6),
+                    "delivery_lat": round(lat_d, 6),
+                },
+            }
+            features.append(feat)
         
         def round_coords(obj, precision=6):
             if isinstance(obj, dict):
@@ -111,13 +106,74 @@ def get_building_clusters(
                 return round(obj, precision)
             return obj
         
-        geojson_data = round_coords(geojson_data, precision=6)
-        n_features = len(geojson_data.get('features', []))
-        logger.info(f"Точек на зданиях: {n_features}")
+        geojson_data = round_coords({
+            "type": "FeatureCollection",
+            "features": features,
+        }, precision=6)
+        n_features = len(features)
+        # Один слой для фронта (clusters ожидается кодом карты)
+        clusters = {"buildings": geojson_data}
+        logger.info(f"Точек на зданиях (высадка у дороги): {n_features}")
         
         return JSONResponse({
             "buildings": geojson_data,
+            "clusters": clusters,
             "total": n_features
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/buildings/export")
+def export_buildings_with_heights(
+    city: str = Query(..., description="Название города, как в /api/city"),
+    network_type: str = Query('drive', description="Тип сети OSM"),
+    simplify: bool = Query(True, description="Упрощение"),
+):
+    """
+    Выгрузка зданий с высотами и эшелонами полётов.
+    GeoJSON с полигонами зданий и properties: height_m, flight_level (рекомендуемый эшелон).
+    """
+    try:
+        data = data_service.get_city_data(city, network_type=network_type, simplify=simplify)
+        buildings = data.get("buildings")
+        flight_levels = data.get("flight_levels", [])
+        if buildings is None or len(buildings) == 0:
+            return JSONResponse({
+                "type": "FeatureCollection",
+                "features": [],
+                "flight_levels": flight_levels,
+                "building_height_stats": data.get("building_height_stats", {}),
+            })
+        if "height_m" not in buildings.columns:
+            buildings = data_service._compute_building_heights(buildings)
+        # GeoJSON: полигоны зданий + height_m, рекомендованный flight_level
+        levels_m = [f["altitude_m"] for f in flight_levels] if flight_levels else [40, 65, 90, 115]
+        features = []
+        for idx, row in buildings.iterrows():
+            geom = row.geometry
+            if geom is None or not getattr(geom, "is_valid", True):
+                continue
+            h = float(row.get("height_m", 10))
+            # Рекомендуемый эшелон: первый, где altitude > h + 10м
+            rec_level = 1
+            for i, alt in enumerate(levels_m):
+                if alt >= h + 10:
+                    rec_level = i + 1
+                    break
+            feat = {
+                "type": "Feature",
+                "geometry": json.loads(gpd.GeoSeries([geom]).to_json())["features"][0]["geometry"],
+                "properties": {"height_m": round(h, 1), "flight_level": rec_level},
+            }
+            features.append(feat)
+        return JSONResponse({
+            "type": "FeatureCollection",
+            "features": features,
+            "flight_levels": flight_levels,
+            "building_height_stats": data.get("building_height_stats", {}),
         })
     except Exception as e:
         import traceback
@@ -150,6 +206,8 @@ def get_city(
             "city_name": data.get("city_name"),
             "stats": stats,
             "params": data.get("params", {}),
+            "flight_levels": data.get("flight_levels", []),
+            "building_height_stats": data.get("building_height_stats", {}),
             "progress": progress_events,
         }
         return JSONResponse(result)
@@ -270,22 +328,22 @@ def graph_geojson(
             stats = data.get("stats", {})
             
         elif graph_type == 'delaunay':
-            # Проверяем кэш
             if cached_graph_data is not None:
                 edges_geojson = cached_graph_data.get('edges_geojson')
                 stats = cached_graph_data.get('stats')
                 logger.info("✓ Использован кэшированный delaunay граф")
             else:
-                # Delaunay триангуляция
-                num_points = int((xmax - xmin) * (ymax - ymin) / (grid_spacing ** 2))
-                num_points = min(max(num_points, 100), 1000)  # ограничиваем 100-1000
-                
+                delivery_gdf = data_service.get_delivery_points(buildings, road_graph, city_boundary)
+                delivery_points = []
+                if len(delivery_gdf) > 0:
+                    delivery_points = [(float(row["delivery_lon"]), float(row["delivery_lat"])) for _, row in delivery_gdf.iterrows()]
                 delaunay_graph = graph_service.create_delaunay_graph(
                     bounds=bounds,
-                    num_points=num_points,
-                    buildings=buildings,
+                    num_points=0,
+                    buildings=buildings if len(delivery_points) < 3 else None,
                     no_fly_zones=no_fly_zones,
-                    city_boundary=city_boundary
+                    city_boundary=city_boundary,
+                    points=delivery_points if len(delivery_points) >= 3 else None,
                 )
                 edges_geojson = graph_service.graph_to_geojson(delaunay_graph)
                 stats = {
@@ -293,8 +351,6 @@ def graph_geojson(
                     "edges": len(delaunay_graph.edges),
                     "type": "delaunay"
                 }
-                
-                # Сохраняем в Redis
                 if redis_client is not None:
                     try:
                         cache_data = {
@@ -302,10 +358,20 @@ def graph_geojson(
                             'stats': stats,
                             'graph_type': graph_type
                         }
-                        redis_client.set(cache_key, pickle.dumps(cache_data), ex=86400 * 7)  # 7 дней
+                        redis_client.set(cache_key, pickle.dumps(cache_data), ex=86400 * 7)
                         logger.info(f"✓ Delaunay граф сохранен в Redis: {cache_key}")
                     except Exception as e:
                         logger.warning(f"Ошибка сохранения delaunay графа в Redis: {e}")
+            # Аннотируем рёбра допустимыми эшелонами (выполняется всегда)
+            flight_levels = data.get("flight_levels", [])
+            buildings_with_heights = data.get("buildings")
+            if buildings_with_heights is not None and "height_m" not in buildings_with_heights.columns:
+                buildings_with_heights = data_service._compute_building_heights(buildings_with_heights)
+            edges_geojson = graph_service.assign_flight_levels_to_edges(
+                edges_geojson,
+                buildings_with_heights if buildings_with_heights is not None and len(buildings_with_heights) > 0 else gpd.GeoDataFrame(),
+                flight_levels
+            )
         else:
             raise HTTPException(status_code=400, detail=f"Неизвестный тип графа: {graph_type}")
 
@@ -355,6 +421,8 @@ def graph_geojson(
             "graph_type": graph_type,
             "city_boundary": city_boundary_geojson,  # Границы города для визуализации
             "no_fly_zones": no_fly_zones_geojson,  # Беспилотные зоны для визуализации
+            "flight_levels": data.get("flight_levels", []),  # Эшелоны полётов
+            "building_height_stats": data.get("building_height_stats", {}),
         })
     except HTTPException:
         raise

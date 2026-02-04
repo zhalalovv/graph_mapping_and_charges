@@ -49,6 +49,7 @@ env/
 .env.*.local
 
 # Cache directories
+.cache/
 cache/
 cache_data/
 *.pkl

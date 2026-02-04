@@ -1,4 +1,6 @@
 import os
+import warnings
+
 import osmnx as ox
 import geopandas as gpd
 import pandas as pd
@@ -11,8 +13,13 @@ from geopy.extra.rate_limiter import RateLimiter
 import logging
 import json
 from redis import Redis
-from shapely.geometry import box, MultiPoint
+from shapely.geometry import box, MultiPoint, Point, LineString
 from shapely.ops import unary_union
+from shapely.strtree import STRtree
+
+# Подавляем DeprecationWarning из OSMnx (unary_union и др. — внутренние вызовы библиотеки)
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="osmnx")
+
 
 class DataService:
     def __init__(self, cache_dir="cache_data"):
@@ -67,7 +74,7 @@ class DataService:
                         self._redis.delete(redis_key)
                     else:
                         self._update_progress("cache", 100, "Загрузка из Redis")
-                        return cached_data
+                        return self.ensure_flight_levels(cached_data)
             except Exception as e:
                 self.logger.warning(f"Ошибка чтения из Redis: {e}")
 
@@ -80,7 +87,7 @@ class DataService:
                     self.logger.info("В кэше нет границ города, перезагружаем данные")
                     os.remove(cache_file)
                     return self._download_city_data(normalized_name, cache_file, redis_key, network_type=network_type, simplify=simplify)
-                return cached_data
+                return self.ensure_flight_levels(cached_data)
             except Exception as e:
                 self.logger.warning(f"Ошибка загрузки кэша: {e}, перезагружаем данные")
                 os.remove(cache_file)
@@ -181,10 +188,10 @@ class DataService:
                 # ОПТИМИЗАЦИЯ: ограничиваем загрузку зданий по bbox для ускорения
                 if city_boundary is not None:
                     try:
-                        bbox = city_boundary.bounds
-                        # north, south, east, west (bbox: minx, miny, maxx, maxy)
+                        b = city_boundary.bounds  # minx, miny, maxx, maxy
+                        # OSMnx v2: bbox=(north, south, east, west)
                         buildings = ox.features_from_bbox(
-                            bbox[3], bbox[1], bbox[2], bbox[0],  # north=maxy, south=miny, east=maxx, west=minx
+                            bbox=(b[3], b[1], b[2], b[0]),
                             tags={"building": True}
                         )
                         self.logger.info(f"Загружено {len(buildings)} зданий по bbox границ города")
@@ -217,6 +224,9 @@ class DataService:
                 }
             }
             
+            self._update_progress("download", 85, "Расчёт эшелонов полётов")
+            data = self.ensure_flight_levels(data)
+
             self._update_progress("download", 90, "Сохранение в кэш")
             with open(cache_file, 'wb') as f:
                 pickle.dump(data, f)
@@ -475,6 +485,192 @@ class DataService:
         
         return []
     
+    @staticmethod
+    def _is_apartment(row) -> bool:
+        """Многоквартирный дом по OSM-тегу building."""
+        tag = row.get('building') if hasattr(row, 'get') else None
+        if tag is None or (isinstance(tag, float) and pd.isna(tag)):
+            return False
+        tag = str(tag).lower().strip()
+        return tag in ('apartments', 'apartment', 'residential', 'apartment_block', 'multistory', 'block', 'flats', 'semidetached_house')
+    
+    # Смещение точки высадки от линии дороги в сторону здания (~5 м), но не заходя на здание
+    OFFSET_FROM_ROAD_DEGREES = 0.00005
+    MIN_SHIFT_DEGREES = 0.000005  # ~0.5 м — минимум, ниже не смещаем
+
+    def _point_to_road(self, pt, edge_tree, edge_geoms):
+        """Проецирует точку на ближайшее ребро дороги. Возвращает (lon, lat) на дороге."""
+        if not edge_tree or not edge_geoms:
+            return pt.x, pt.y
+        nearest_idx = edge_tree.query_nearest(pt, return_distance=False)
+        if not (hasattr(nearest_idx, '__len__') and len(nearest_idx) > 0):
+            return pt.x, pt.y
+        i = int(nearest_idx.flat[0]) if hasattr(nearest_idx, 'flat') else int(nearest_idx[0])
+        line = edge_geoms[i]
+        try:
+            projected = line.interpolate(line.project(pt))
+            return projected.x, projected.y
+        except Exception:
+            return pt.x, pt.y
+
+    def _point_inside_any_building(self, pt, building_tree, building_geoms):
+        """True, если точка внутри хотя бы одного полигона здания."""
+        if not building_tree or not building_geoms:
+            return False
+        try:
+            candidates = building_tree.query(pt)
+            for c in (candidates if hasattr(candidates, '__iter__') and not isinstance(candidates, (int, float)) else [candidates]):
+                idx = int(c)
+                if idx < len(building_geoms) and building_geoms[idx].contains(pt):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _shift_near_road_no_building(self, rx, ry, pt, building_tree, building_geoms):
+        """Смещает точку (rx,ry) с дороги в сторону pt, но не заходя на здания. Возвращает (lon, lat)."""
+        dx = pt.x - rx
+        dy = pt.y - ry
+        d = (dx * dx + dy * dy) ** 0.5
+        if d < 1e-9:
+            return rx, ry
+        shift = self.OFFSET_FROM_ROAD_DEGREES
+        while shift >= self.MIN_SHIFT_DEGREES:
+            lon_d = rx + shift * dx / d
+            lat_d = ry + shift * dy / d
+            delivery_pt = Point(lon_d, lat_d)
+            if not self._point_inside_any_building(delivery_pt, building_tree, building_geoms):
+                return lon_d, lat_d
+            shift *= 0.5
+        return rx, ry
+    
+    def _load_entrances_bbox(self, bbox):
+        """Загружает точки подъездов (entrance=*) из OSM по bbox. (north, south, east, west)."""
+        try:
+            entrances = ox.features_from_bbox(bbox=bbox, tags={"entrance": True})
+            if entrances is not None and len(entrances) > 0:
+                if entrances.crs is None:
+                    entrances = entrances.set_crs("EPSG:4326")
+                def to_point(g):
+                    if g is None: return None
+                    if g.geom_type == 'Point': return g
+                    if g.geom_type == 'MultiPoint' and len(g.geoms) > 0: return g.geoms[0]
+                    return g.centroid
+                entrances = entrances.copy()
+                entrances['geometry'] = entrances.geometry.apply(to_point)
+                return entrances
+        except Exception as e:
+            self.logger.warning(f"Не удалось загрузить подъезды из OSM: {e}")
+        return gpd.GeoDataFrame()
+    
+    def get_delivery_points(
+        self,
+        buildings: gpd.GeoDataFrame,
+        road_graph,
+        city_boundary=None,
+    ) -> gpd.GeoDataFrame:
+        """
+        Точки высадки: у многоквартирных — у каждого подъезда (по OSM entrance=*), у остальных — одна точка у дороги.
+        """
+        if buildings is None or len(buildings) == 0:
+            return gpd.GeoDataFrame()
+        if buildings.crs is None:
+            buildings = buildings.set_crs("EPSG:4326")
+        buildings = buildings.to_crs("EPSG:4326")
+        if city_boundary is not None:
+            try:
+                # Проекция в метры для корректного centroid/within (избегаем UserWarning о geographic CRS)
+                crs_utm = buildings.estimate_utm_crs()
+                buildings_proj = buildings.to_crs(crs_utm)
+                boundary_proj = gpd.GeoSeries([city_boundary], crs=buildings.crs).to_crs(crs_utm).iloc[0]
+                mask = buildings_proj.geometry.centroid.within(boundary_proj)
+                buildings = buildings[mask]
+            except Exception as e:
+                self.logger.warning(f"Фильтрация зданий по границе: {e}")
+        if len(buildings) == 0:
+            return gpd.GeoDataFrame()
+        
+        if road_graph is None or len(road_graph.nodes) == 0:
+            edge_geoms = []
+        else:
+            _, gdf_edges = ox.graph_to_gdfs(road_graph)
+            if gdf_edges.crs is not None and gdf_edges.crs != buildings.crs:
+                gdf_edges = gdf_edges.to_crs(buildings.crs)
+            edge_geoms = list(gdf_edges.geometry) if len(gdf_edges) > 0 else []
+        edge_tree = STRtree(edge_geoms) if edge_geoms else None
+        
+        building_geoms = list(buildings.geometry)
+        building_tree = STRtree(building_geoms) if building_geoms else None
+        is_apartment = [self._is_apartment(buildings.iloc[i]) for i in range(len(buildings))]
+        
+        # Подъезды из OSM: bbox (north, south, east, west)
+        xmin, ymin, xmax, ymax = buildings.total_bounds
+        entrances_gdf = self._load_entrances_bbox((ymax, ymin, xmax, xmin))
+        building_entrances = {}  # индекс здания -> список точек подъездов
+        if len(entrances_gdf) > 0 and building_tree is not None:
+            for _, ent in entrances_gdf.iterrows():
+                g = ent.geometry
+                if g is None or not getattr(g, 'is_valid', True):
+                    continue
+                if g.geom_type == 'Point':
+                    pt = g
+                elif g.geom_type == 'MultiPoint' and len(g.geoms) > 0:
+                    pt = g.geoms[0]
+                else:
+                    pt = g.centroid
+                try:
+                    candidates = building_tree.query(pt)
+                except Exception:
+                    continue
+                if hasattr(candidates, '__iter__') and not isinstance(candidates, (int, float)):
+                    for c in candidates:
+                        idx = int(c)
+                        if idx >= len(building_geoms):
+                            continue
+                        poly = building_geoms[idx]
+                        try:
+                            if poly.buffer(0.00005).contains(pt) and is_apartment[idx]:
+                                building_entrances.setdefault(idx, []).append(pt)
+                                break
+                        except Exception:
+                            pass
+        
+        rows = []
+        for i in range(len(buildings)):
+            try:
+                b = buildings.iloc[i]
+                geom = b.geometry
+                if geom is None or not geom.is_valid:
+                    continue
+                centroid = geom.centroid
+                lon_c, lat_c = centroid.x, centroid.y
+                if is_apartment[i] and i in building_entrances and len(building_entrances[i]) > 0:
+                    for entrance_pt in building_entrances[i]:
+                        rx, ry = self._point_to_road(entrance_pt, edge_tree, edge_geoms)
+                        lon_d, lat_d = self._shift_near_road_no_building(rx, ry, entrance_pt, building_tree, building_geoms)
+                        rows.append({
+                            'geometry': Point(lon_d, lat_d),
+                            'delivery_lon': lon_d,
+                            'delivery_lat': lat_d,
+                        })
+                else:
+                    rx, ry = self._point_to_road(centroid, edge_tree, edge_geoms)
+                    lon_d, lat_d = self._shift_near_road_no_building(rx, ry, centroid, building_tree, building_geoms)
+                    rows.append({
+                        'geometry': Point(lon_d, lat_d),
+                        'delivery_lon': lon_d,
+                        'delivery_lat': lat_d,
+                    })
+            except Exception as e:
+                self.logger.debug(f"Здание {i}: {e}")
+                continue
+        
+        if not rows:
+            return gpd.GeoDataFrame()
+        gdf = gpd.GeoDataFrame(rows, crs=buildings.crs)
+        self.logger.info(f"Точки высадки: {len(gdf)} (многоквартирные — по подъездам)")
+        return gdf
+    
     def address_to_coords(self, address, city_name=None):
         """Улучшенное геокодирование с поддержкой российских адресов"""
         if not address or not address.strip():
@@ -594,6 +790,151 @@ class DataService:
         import re
         name = re.sub(r'[^\w\s-]', '', name)
         return re.sub(r'[-\s]+', '_', name).strip('_')[:100]
+
+    # --- Высоты зданий и эшелоны полётов ---
+    METERS_PER_FLOOR = 3.0  # типичная высота этажа
+    DEFAULT_BUILDING_HEIGHT = 10.0  # м, если нет данных (типичный 3-этажный дом)
+    MAX_DRONE_ALTITUDE = 120.0  # м, лимит для БВП в РФ
+    MIN_FLIGHT_LEVEL = 40.0  # м, минимальный эшелон (выше типичной застройки)
+    FLIGHT_LEVEL_MARGIN = 10.0  # м, запас над высочайшими зданиями
+
+    @staticmethod
+    def _parse_osm_height(value) -> float | None:
+        """Парсит тег height из OSM: '15m', '15', '50 ft', '15.5' и т.п."""
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return None
+        s = str(value).strip().lower()
+        if not s:
+            return None
+        # Убираем пробелы, извлекаем число
+        import re
+        match = re.match(r'^([\d.]+)\s*(m|м|meters?|метров?|ft|feet)?$', s)
+        if match:
+            num = float(match.group(1))
+            unit = (match.group(2) or 'm').lower()
+            if unit in ('ft', 'feet'):
+                return num * 0.3048
+            return num
+        return None
+
+    def _compute_building_heights(self, buildings: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+        """
+        Добавляет колонку height_m к зданиям на основе OSM-тегов.
+        Приоритет: height -> building:levels * 3м -> DEFAULT_BUILDING_HEIGHT.
+        """
+        if buildings is None or len(buildings) == 0:
+            return buildings
+        heights = []
+        for idx, row in buildings.iterrows():
+            h = None
+            # height: тег OSM или колонка
+            for key in ('height', 'height_m'):
+                if key in buildings.columns:
+                    h = self._parse_osm_height(row.get(key))
+                    if h is not None:
+                        break
+            # building:levels или building_levels
+            if h is None:
+                for key in ('building:levels', 'building_levels', 'levels'):
+                    if key in buildings.columns:
+                        try:
+                            levels = row.get(key)
+                            if levels is not None and not (isinstance(levels, float) and pd.isna(levels)):
+                                levels = int(float(str(levels).split('.')[0]))
+                                if levels > 0:
+                                    h = levels * self.METERS_PER_FLOOR
+                                    break
+                        except (ValueError, TypeError):
+                            pass
+            if h is None:
+                h = self.DEFAULT_BUILDING_HEIGHT
+            heights.append(max(3.0, min(h, 500.0)))  # clamp 3–500 м
+        buildings = buildings.copy()
+        buildings['height_m'] = heights
+        return buildings
+
+    def _compute_flight_levels(
+        self,
+        buildings: gpd.GeoDataFrame,
+        num_levels: int = 4,
+        max_altitude: float | None = None,
+        min_altitude: float | None = None,
+    ) -> list[dict]:
+        """
+        Вычисляет эшелоны полётов на основе высот зданий.
+
+        Args:
+            buildings: GeoDataFrame с колонкой height_m
+            num_levels: количество эшелонов (по умолчанию 4)
+            max_altitude: максимальная высота (м), по умолчанию MAX_DRONE_ALTITUDE
+            min_altitude: минимальная высота первого эшелона (м)
+
+        Returns:
+            Список dict: [{"level": 1, "altitude_m": 45, "label": "Эшелон 1"}, ...]
+        """
+        max_alt = max_altitude or self.MAX_DRONE_ALTITUDE
+        min_alt = min_altitude
+
+        if buildings is not None and len(buildings) > 0 and 'height_m' in buildings.columns:
+            p95 = float(np.percentile(buildings['height_m'], 95))
+            base_alt = max(
+                p95 + self.FLIGHT_LEVEL_MARGIN,
+                self.MIN_FLIGHT_LEVEL,
+            )
+            if min_alt is not None:
+                base_alt = max(base_alt, min_alt)
+            self.logger.info(
+                f"Высоты зданий: p95={p95:.1f}м, базовый эшелон={base_alt:.1f}м"
+            )
+        else:
+            base_alt = self.MIN_FLIGHT_LEVEL
+            if min_alt is not None:
+                base_alt = max(base_alt, min_alt)
+
+        # Равномерно распределяем эшелоны от base_alt до max_alt
+        step = (max_alt - base_alt) / max(1, num_levels - 1) if num_levels > 1 else 0
+        levels = []
+        for i in range(num_levels):
+            alt = round(base_alt + i * step, 1)
+            levels.append({
+                "level": i + 1,
+                "altitude_m": alt,
+                "label": f"Эшелон {i + 1} ({alt:.0f} м)",
+            })
+        self.logger.info(f"Эшелоны полётов: {[l['altitude_m'] for l in levels]}")
+        return levels
+
+    def ensure_flight_levels(self, data: dict, num_levels: int = 4) -> dict:
+        """
+        Добавляет в data поля buildings (с height_m), building_height_stats, flight_levels.
+        Вызывать после загрузки/кэша для совместимости со старым кэшем.
+        """
+        buildings = data.get('buildings')
+        if buildings is None or len(buildings) == 0:
+            data['flight_levels'] = []
+            data['building_height_stats'] = {}
+            return data
+
+        if 'height_m' not in buildings.columns:
+            buildings = self._compute_building_heights(buildings)
+            data['buildings'] = buildings
+
+        stats = {}
+        if 'height_m' in buildings.columns:
+            h = buildings['height_m']
+            stats = {
+                "min_m": float(h.min()),
+                "max_m": float(h.max()),
+                "mean_m": float(h.mean()),
+                "median_m": float(h.median()),
+                "p95_m": float(np.percentile(h, 95)),
+                "count": len(buildings),
+            }
+        data['building_height_stats'] = stats
+        data['flight_levels'] = self._compute_flight_levels(
+            buildings, num_levels=num_levels
+        )
+        return data
     
     def get_redis_client(self):
         """Возвращает Redis клиент для использования в других сервисах"""
