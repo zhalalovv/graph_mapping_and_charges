@@ -1,5 +1,6 @@
 import os
 import warnings
+from typing import Optional
 
 import osmnx as ox
 import geopandas as gpd
@@ -19,6 +20,7 @@ from shapely.strtree import STRtree
 
 # Подавляем DeprecationWarning из OSMnx (unary_union и др. — внутренние вызовы библиотеки)
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="osmnx")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"osmnx\.features")
 
 
 class DataService:
@@ -204,7 +206,7 @@ class DataService:
                 self.logger.warning(f"Не удалось загрузить здания: {e}")
             
             self._update_progress("download", 80, "Загрузка запретных зон")
-            no_fly_zones = self._get_no_fly_zones(city_name)
+            no_fly_zones = self._get_no_fly_zones(city_name, buildings)
             
             data = {
                 'road_graph': road_graph,
@@ -245,10 +247,11 @@ class DataService:
             self.logger.error(f"Ошибка загрузки данных для {city_name}: {e}")
             raise
     
-    def _get_no_fly_zones(self, city_name):
+    def _get_no_fly_zones(self, city_name, buildings: Optional[gpd.GeoDataFrame] = None):
         """
         Загружает беспилотные зоны из OpenStreetMap.
-        Только чувствительные объекты: аэропорты, военные, парки, школы, детсады, универы, больницы и т.п.
+        Только чувствительные объекты: аэропорты, военные, парки, школы, детсады, универы,
+        колледжи, техникумы, поликлиники, больницы и т.п.
         Обычные жилые дома в no_fly не попадают.
         
         Признаки:
@@ -257,23 +260,60 @@ class DataService:
         3. Атомные и правительственные объекты
         4. Явные запретные зоны (restriction:drone=no)
         5. Парки и зоны отдыха (leisure=park, landuse=recreation_ground)
-        6. Школы, детсады, университеты, колледжи (по границам из OSM)
+        6. Школы, детсады, университеты, колледжи, техникумы (amenity + building из OSM)
         7. Больницы (по границам из OSM)
-        8. Заправки (amenity=fuel)
-        9. Вокзалы (railway=station)
+        8. Поликлиники и клиники (amenity=clinic, healthcare=clinic)
+        9. Заправки (amenity=fuel)
+        10. Вокзалы (railway=station)
         
         Returns:
             GeoDataFrame или список беспилотных зон
         """
         no_fly_zones = []
-        # Радиус буфера для точек (когда в OSM нет контура, только точка)
+        # Радиус буфера для точек (когда в OSM нет контура и не найден nearby building)
         BUFFER_RADIUS_DEGREES = 0.0005  # ~55 метров
+        # Радиус поиска здания рядом с точкой (~80 м)
+        POINT_SEARCH_BUFFER_DEG = 0.0008
         
-        def zone_from_geometry(geom):
-            """Полигоны берём по границам из OSM (как жёлтые зоны); точки — с буфером ~55 м."""
+        def zone_from_geometry(geom, use_building_perimeter: bool = True):
+            """
+            Полигоны берём по границам из OSM. Для точек — ищем здание поблизости
+            и используем его периметр; если не найдено — круг ~55 м.
+            """
             if geom.geom_type in ("Polygon", "MultiPolygon"):
-                return geom  # граница как есть
-            return geom.buffer(BUFFER_RADIUS_DEGREES)  # точка → круг ~55 м
+                return geom
+            if geom.geom_type != "Point":
+                return geom.buffer(BUFFER_RADIUS_DEGREES)
+            # Точка: пытаемся найти здание по периметру
+            if use_building_perimeter and buildings is not None and len(buildings) > 0:
+                try:
+                    if buildings.crs is None:
+                        buildings_4326 = buildings.set_crs("EPSG:4326", allow_override=True)
+                    else:
+                        buildings_4326 = buildings.to_crs("EPSG:4326")
+                    search_area = geom.buffer(POINT_SEARCH_BUFFER_DEG)
+                    # Здания, пересекающие область поиска
+                    mask = buildings_4326.geometry.intersects(search_area)
+                    candidates = buildings_4326[mask]
+                    if len(candidates) > 0:
+                        # Берём здание, центр которого ближе всего к точке (или самое большое в зоне)
+                        best = None
+                        best_dist = float("inf")
+                        for _, row in candidates.iterrows():
+                            g = row.geometry
+                            if g is None or not getattr(g, "is_valid", True):
+                                continue
+                            if g.geom_type in ("Polygon", "MultiPolygon"):
+                                cent = g.centroid
+                                d = geom.distance(cent)
+                                if d < best_dist:
+                                    best_dist = d
+                                    best = g
+                        if best is not None:
+                            return best
+                except Exception as e:
+                    self.logger.debug(f"Поиск здания для точки: {e}")
+            return geom.buffer(BUFFER_RADIUS_DEGREES)
         
         try:
             self.logger.info(f"Загрузка беспилотных зон для {city_name}")
@@ -398,19 +438,32 @@ class DataService:
             except Exception as e:
                 self.logger.warning(f"Ошибка загрузки зон отдыха: {e}")
             
-            # 7. Школы, детсады, университеты, колледжи
+            # 7. Школы, детсады, университеты, колледжи, техникумы
             try:
                 education = ox.features_from_place(
                     city_name,
                     tags={"amenity": ["school", "kindergarten", "university", "college"]}
                 )
                 if len(education) > 0:
-                    self.logger.info(f"Найдено {len(education)} объектов образования (школы, детсады, универы)")
+                    self.logger.info(f"Найдено {len(education)} объектов образования (школы, детсады, универы, колледжи)")
                     for idx, obj in education.iterrows():
                         if obj.geometry is not None and obj.geometry.is_valid:
                             no_fly_zones.append(zone_from_geometry(obj.geometry))
             except Exception as e:
                 self.logger.warning(f"Ошибка загрузки объектов образования: {e}")
+            # 7b. Здания колледжей/школ по тегу building (техникумы, училища и т.д.)
+            try:
+                edu_buildings = ox.features_from_place(
+                    city_name,
+                    tags={"building": ["college", "school"]}
+                )
+                if len(edu_buildings) > 0:
+                    self.logger.info(f"Найдено {len(edu_buildings)} зданий образования (building=college/school)")
+                    for idx, obj in edu_buildings.iterrows():
+                        if obj.geometry is not None and obj.geometry.is_valid:
+                            no_fly_zones.append(zone_from_geometry(obj.geometry))
+            except Exception as e:
+                self.logger.warning(f"Ошибка загрузки зданий образования: {e}")
             
             # 8. Больницы
             try:
@@ -425,6 +478,22 @@ class DataService:
                             no_fly_zones.append(zone_from_geometry(obj.geometry))
             except Exception as e:
                 self.logger.warning(f"Ошибка загрузки больниц: {e}")
+            
+            # 8b. Поликлиники и клиники (включая детские)
+            for tag_dict, label in [
+                ({"amenity": "clinic"}, "amenity=clinic"),
+                ({"healthcare": "clinic"}, "healthcare=clinic"),
+            ]:
+                try:
+                    clinics = ox.features_from_place(city_name, tags=tag_dict)
+                    if len(clinics) > 0:
+                        self.logger.info(f"Найдено {len(clinics)} поликлиник/клиник ({label})")
+                        for idx, obj in clinics.iterrows():
+                            if obj.geometry is not None and obj.geometry.is_valid:
+                                no_fly_zones.append(zone_from_geometry(obj.geometry))
+                except Exception as e:
+                    if "No data elements" not in str(e):
+                        self.logger.warning(f"Ошибка загрузки {label}: {e}")
             
             # 9. Заправки (АЗС)
             try:
