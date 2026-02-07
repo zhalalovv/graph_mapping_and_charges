@@ -177,6 +177,7 @@
                 <select id="graphType" style="width:100%">
                     <option value="road">Дороги (OSM)</option>
                     <option value="delaunay">Delaunay триангуляция</option>
+                    <option value="merged">Объединённый (дороги + Delaunay)</option>
                 </select>
             </label>
             
@@ -210,6 +211,14 @@
                 <span><span class="swatch" style="background:#eab308"></span> 15–30 м</span>
                 <span><span class="swatch" style="background:#f97316"></span> 30–50 м</span>
                 <span><span class="swatch" style="background:#ef4444"></span> &gt;50 м</span>
+            </div>
+        </div>
+        <div id="edgeLegend" class="flight-levels-panel" style="display:none; margin-top:8px">
+            <h3 style="margin:0 0 8px">Типы рёбер</h3>
+            <div style="display:flex; flex-direction:column; gap:4px; font-size:12px">
+                <span><span class="swatch" style="background:#2563eb; display:inline-block; width:12px; height:4px; vertical-align:middle"></span> Дороги (OSM)</span>
+                <span><span class="swatch" style="background:#10b981; display:inline-block; width:12px; height:4px; vertical-align:middle"></span> Delaunay</span>
+                <span><span class="swatch" style="background:#f59e0b; display:inline-block; width:12px; height:4px; vertical-align:middle"></span> Соединения дорога–Delaunay</span>
             </div>
         </div>
     </div>
@@ -320,10 +329,14 @@
 
         function getFilteredEdges(graphData, flightLevelFilter) {
             const features = graphData?.edges?.features || [];
-            if (!flightLevelFilter || graphData?.graph_type !== 'delaunay') return features;
+            const type = graphData?.graph_type;
+            if (!flightLevelFilter || (type !== 'delaunay' && type !== 'merged')) return features;
             const level = parseInt(flightLevelFilter, 10);
             if (isNaN(level)) return features;
             return features.filter(f => {
+                const edgeType = f.properties?.edge_type;
+                // Соединения (дорога–Delaunay) всегда показываем, чтобы было видно, где графы стыкуются
+                if (type === 'merged' && edgeType === 'connection') return true;
                 const allowed = f.properties?.allowed_flight_levels;
                 return Array.isArray(allowed) && allowed.includes(level);
             });
@@ -338,12 +351,12 @@
             edgesLayer = createEdgesLayer(lastGraphData, features);
             edgesLayer.addTo(map);
             const statsEl = document.getElementById('statsInfo');
-            if (statsEl && lastGraphData.graph_type === 'delaunay') {
-                const total = lastGraphData.edges?.features?.length || 0;
-                const shown = features.length;
-                const base = `Узлов: ${lastGraphData.stats?.nodes || 0}, Рёбер: ${lastGraphData.stats?.edges || 0}`;
-                statsEl.textContent = filter ? `${base} (показано: ${shown} для эшелона ${filter})` : base;
-            }
+                if (statsEl && (lastGraphData.graph_type === 'delaunay' || lastGraphData.graph_type === 'merged')) {
+                    const total = lastGraphData.edges?.features?.length || 0;
+                    const shown = features.length;
+                    const base = `Узлов: ${lastGraphData.stats?.nodes || 0}, Рёбер: ${lastGraphData.stats?.edges || 0}`;
+                    statsEl.textContent = filter ? `${base} (показано: ${shown} для эшелона ${filter})` : base;
+                }
         }
 
         function createEdgesLayer(graphData, features) {
@@ -351,11 +364,17 @@
             return L.geoJSON(geojson, {
                 style: function(feature) {
                     const edgeType = feature.properties?.edge_type || 'unknown';
-                    return {
+                    const base = {
                         color: getEdgeColor(edgeType),
                         weight: getEdgeWeight(edgeType),
                         opacity: 0.7
                     };
+                    if (edgeType === 'connection') {
+                        base.weight = 2.5;
+                        base.dashArray = '6, 4';
+                        base.opacity = 0.9;
+                    }
+                    return base;
                 },
                 onEachFeature: function(feature, layer) {
                     if (feature.properties) {
@@ -506,7 +525,7 @@
 
                 const flLabel = document.getElementById('flightLevelFilterLabel');
                 const flSel = document.getElementById('flightLevelFilter');
-                if (graphType === 'delaunay' && graphData.flight_levels?.length) {
+                if ((graphType === 'delaunay' || graphType === 'merged') && graphData.flight_levels?.length) {
                     if (flLabel) flLabel.style.display = 'flex';
                     if (flSel) {
                         flSel.innerHTML = '<option value="">Все</option>' + graphData.flight_levels.map(fl =>
@@ -517,6 +536,8 @@
                 } else {
                     if (flLabel) flLabel.style.display = 'none';
                 }
+                const edgeLegendEl = document.getElementById('edgeLegend');
+                if (edgeLegendEl) edgeLegendEl.style.display = graphType === 'merged' ? 'block' : 'none';
 
                 ensureMap([graphData.center.lat, graphData.center.lon]);
                 
@@ -602,11 +623,12 @@
                 statusEl.textContent = '✓ Готово';
                 const stats = graphData.stats || {};
                 let statsText = `Узлов: ${stats.nodes || 0}, Рёбер: ${stats.edges || 0}`;
-                if (graphType === 'delaunay' && flightFilter && graphData.edges?.features) {
+                if ((graphType === 'delaunay' || graphType === 'merged') && flightFilter && graphData.edges?.features) {
                     statsText += ` (показано: ${featuresToShow.length} для эшелона ${flightFilter})`;
                 }
-                if (stats.road_nodes) {
+                if (stats.road_nodes !== undefined) {
                     statsText += `\nДороги: ${stats.road_nodes}, Свободные: ${stats.free_nodes}`;
+                    if (stats.connection_edges !== undefined) statsText += `, Соединений: ${stats.connection_edges}`;
                 }
                 statsEl.textContent = statsText;
                 

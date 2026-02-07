@@ -200,6 +200,97 @@ class GraphService:
         
         return R * c
     
+    def merge_road_and_delaunay(
+        self,
+        road_graph: nx.Graph,
+        delaunay_graph: nx.Graph,
+        max_connection_distance_deg: float = 0.0003,
+    ) -> nx.Graph:
+        """
+        Объединяет дорожный граф (OSM) и граф Delaunay в один граф, добавляя рёбра-соединения
+        между узлами Delaunay и ближайшими узлами дорог в пределах max_connection_distance_deg.
+        
+        У узлов дорог сохраняются атрибуты x, y (lon, lat); у узлов Delaunay — lon, lat.
+        Рёбра помечаются edge_type: 'road', 'free', 'connection'.
+        
+        Args:
+            road_graph: граф дорог (OSM), узлы с x, y
+            delaunay_graph: граф Delaunay, узлы с lon, lat
+            max_connection_distance_deg: макс. расстояние в градусах для соединения узла Delaunay с дорогой
+            
+        Returns:
+            Объединённый неориентированный NetworkX граф
+        """
+        G = nx.Graph()
+        
+        # 1. Добавляем все узлы и рёбра дорожного графа
+        for n, data in road_graph.nodes(data=True):
+            G.add_node(n, **data)
+        seen_road_edges = set()
+        for u, v, data in road_graph.edges(data=True):
+            key = (min(u, v), max(u, v))
+            if key in seen_road_edges:
+                continue
+            seen_road_edges.add(key)
+            length = data.get("length") or data.get("weight") or 0
+            length = float(length) if length else 0.0
+            G.add_edge(u, v, weight=length, length=length, edge_type="road")
+        
+        # 2. Собираем координаты дорожных узлов для поиска ближайших
+        road_coords = []
+        road_node_ids = []
+        for n, data in road_graph.nodes(data=True):
+            if "x" in data and "y" in data:
+                road_coords.append((data["x"], data["y"]))
+                road_node_ids.append(n)
+            elif "lon" in data and "lat" in data:
+                road_coords.append((data["lon"], data["lat"]))
+                road_node_ids.append(n)
+        if not road_coords:
+            self.logger.warning("В дорожном графе нет узлов с координатами")
+            return G
+        
+        road_coords_arr = np.array(road_coords)
+        
+        # 3. Добавляем узлы Delaunay с префиксом id (избегаем пересечения с OSM id)
+        d_prefix = "d_"
+        delaunay_id_to_merged = {}
+        for i, data in delaunay_graph.nodes(data=True):
+            merged_id = f"{d_prefix}{i}"
+            delaunay_id_to_merged[i] = merged_id
+            lon = data.get("lon", data.get("pos", (0, 0))[0])
+            lat = data.get("lat", data.get("pos", (0, 0))[1])
+            G.add_node(merged_id, lon=lon, lat=lat)
+        
+        # 4. Добавляем рёбра Delaunay
+        for u, v, data in delaunay_graph.edges(data=True):
+            mu, mv = delaunay_id_to_merged.get(u, f"{d_prefix}{u}"), delaunay_id_to_merged.get(v, f"{d_prefix}{v}")
+            w = data.get("weight") or data.get("length") or 0
+            w = float(w) if w else 0.0
+            G.add_edge(mu, mv, weight=w, length=w, edge_type="free")
+        
+        # 5. Соединяем каждый узел Delaunay с ближайшим узлом дороги, если в пределах порога
+        for merged_id, data in list(G.nodes(data=True)):
+            if not str(merged_id).startswith(d_prefix):
+                continue
+            lon = data.get("lon")
+            lat = data.get("lat")
+            if lon is None or lat is None:
+                continue
+            # Расстояние в градусах (приближённо)
+            dist_deg = np.sqrt((road_coords_arr[:, 0] - lon) ** 2 + (road_coords_arr[:, 1] - lat) ** 2)
+            idx_min = int(np.argmin(dist_deg))
+            if dist_deg[idx_min] <= max_connection_distance_deg:
+                road_node = road_node_ids[idx_min]
+                dist_km = self._calculate_distance(lat, lon, road_coords_arr[idx_min, 1], road_coords_arr[idx_min, 0])
+                G.add_edge(merged_id, road_node, weight=dist_km, length=dist_km, edge_type="connection")
+        
+        n_road = sum(1 for n in G.nodes() if not str(n).startswith(d_prefix))
+        n_free = G.number_of_nodes() - n_road
+        n_conn = sum(1 for _u, _v, d in G.edges(data=True) if d.get("edge_type") == "connection")
+        self.logger.info(f"Объединённый граф: дорог узлов {n_road}, Delaunay узлов {n_free}, рёбер-соединений {n_conn}")
+        return G
+    
     def graph_to_geojson(self, graph: nx.Graph, edge_type_filter: Optional[str] = None) -> dict:
         """
         Конвертирует NetworkX граф в GeoJSON для визуализации (ОПТИМИЗИРОВАНО)

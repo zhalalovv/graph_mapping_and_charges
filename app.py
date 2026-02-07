@@ -372,6 +372,97 @@ def graph_geojson(
                 buildings_with_heights if buildings_with_heights is not None and len(buildings_with_heights) > 0 else gpd.GeoDataFrame(),
                 flight_levels
             )
+        elif graph_type == 'merged':
+            # Дорожный граф: фильтруем по беспилотным зонам так же, как для road
+            gdf_edges_for_road = gdf_edges
+            if no_fly_zones is not None:
+                try:
+                    if isinstance(no_fly_zones, gpd.GeoDataFrame) and len(no_fly_zones) > 0:
+                        no_fly_union = no_fly_zones.geometry.unary_union
+                    elif isinstance(no_fly_zones, list) and len(no_fly_zones) > 0:
+                        from shapely.ops import unary_union
+                        no_fly_union = unary_union(no_fly_zones)
+                    else:
+                        no_fly_union = None
+                    if no_fly_union is not None:
+                        mask = ~gdf_edges.geometry.intersects(no_fly_union)
+                        gdf_edges_for_road = gdf_edges[mask]
+                except Exception as e:
+                    logger.warning(f"Ошибка фильтрации дорог по беспилотным зонам: {e}")
+            # Собираем граф дорог из gdf (для совместимости с merge: узлы с x, y)
+            G_road = nx.Graph()
+            for n, row in gdf_nodes.iterrows():
+                try:
+                    G_road.add_node(n, x=float(row.geometry.x), y=float(row.geometry.y))
+                except Exception:
+                    continue
+            seen_road = set()
+            for idx, row in gdf_edges_for_road.iterrows():
+                u, v = (idx[0], idx[1]) if isinstance(idx, tuple) else (row.get('u'), row.get('v'))
+                if u is None or v is None:
+                    continue
+                key = (min(u, v), max(u, v))
+                if key in seen_road:
+                    continue
+                seen_road.add(key)
+                length = float(row.get('length') or row.get('weight') or 0)
+                G_road.add_edge(u, v, length=length, weight=length)
+            # Delaunay граф (как для graph_type == 'delaunay')
+            delivery_gdf = data_service.get_delivery_points(buildings, road_graph, city_boundary)
+            delivery_points = []
+            if len(delivery_gdf) > 0:
+                delivery_points = [(float(row["delivery_lon"]), float(row["delivery_lat"])) for _, row in delivery_gdf.iterrows()]
+            delaunay_graph = graph_service.create_delaunay_graph(
+                bounds=bounds,
+                num_points=0,
+                buildings=buildings if len(delivery_points) < 3 else None,
+                no_fly_zones=no_fly_zones,
+                city_boundary=city_boundary,
+                points=delivery_points if len(delivery_points) >= 3 else None,
+            )
+            merged_graph = graph_service.merge_road_and_delaunay(G_road, delaunay_graph)
+            # Дороги рисуем по полной геометрии из OSM (gdf_edges), а не по отрезкам между узлами
+            road_geojson = json.loads(gdf_edges_for_road.to_json())
+            road_features = []
+            for f in road_geojson.get("features", []):
+                if f.get("geometry", {}).get("type") not in ("LineString", "MultiLineString"):
+                    continue
+                props = f.get("properties") or {}
+                length_m = props.get("length")
+                length_km = float(length_m) / 1000.0 if length_m is not None else 0.0
+                f["properties"] = {
+                    "edge_type": "road",
+                    "weight": length_km,
+                    "length": length_km,
+                    **{k: v for k, v in props.items() if k not in ("edge_type", "weight", "length")},
+                }
+                road_features.append(f)
+            free_fc = graph_service.graph_to_geojson(merged_graph, edge_type_filter="free")
+            conn_fc = graph_service.graph_to_geojson(merged_graph, edge_type_filter="connection")
+            edges_geojson = {
+                "type": "FeatureCollection",
+                "features": road_features + free_fc["features"] + conn_fc["features"],
+            }
+            n_road = sum(1 for n in merged_graph.nodes() if not str(n).startswith("d_"))
+            n_free = merged_graph.number_of_nodes() - n_road
+            n_conn = sum(1 for _u, _v, d in merged_graph.edges(data=True) if d.get("edge_type") == "connection")
+            stats = {
+                "nodes": merged_graph.number_of_nodes(),
+                "edges": merged_graph.number_of_edges(),
+                "type": "merged",
+                "road_nodes": n_road,
+                "free_nodes": n_free,
+                "connection_edges": n_conn,
+            }
+            flight_levels = data.get("flight_levels", [])
+            buildings_with_heights = data.get("buildings")
+            if buildings_with_heights is not None and "height_m" not in buildings_with_heights.columns:
+                buildings_with_heights = data_service._compute_building_heights(buildings_with_heights)
+            edges_geojson = graph_service.assign_flight_levels_to_edges(
+                edges_geojson,
+                buildings_with_heights if buildings_with_heights is not None and len(buildings_with_heights) > 0 else gpd.GeoDataFrame(),
+                flight_levels
+            )
         else:
             raise HTTPException(status_code=400, detail=f"Неизвестный тип графа: {graph_type}")
 
