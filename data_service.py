@@ -15,8 +15,9 @@ import logging
 import json
 from redis import Redis
 from shapely.geometry import box, MultiPoint, Point, LineString
-from shapely.ops import unary_union
+from shapely.ops import unary_union, polygonize
 from shapely.strtree import STRtree
+from shapely.prepared import prep
 
 # Подавляем DeprecationWarning из OSMnx (unary_union и др. — внутренние вызовы библиотеки)
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="osmnx")
@@ -562,6 +563,58 @@ class DataService:
             return False
         tag = str(tag).lower().strip()
         return tag in ('apartments', 'apartment', 'residential', 'apartment_block', 'multistory', 'block', 'flats', 'semidetached_house')
+
+    # Теги OSM building, типичные для частного сектора (в т.ч. в РФ часто yes или без тега)
+    _PRIVATE_BUILDING_TAGS = frozenset((
+        'house', 'detached', 'hut', 'cabin', 'bungalow', 'terrace',
+        'yes', 'true', '1',  # в OSM частные дома часто без уточнения
+        'garage', 'shed', 'garages',  # хозпостройки в частном секторе
+    ))
+
+    # Публичные типы зданий (amenity/shop): не считать частным сектором
+    _PUBLIC_AMENITY_VALUES = frozenset((
+        'school', 'university', 'college', 'kindergarten', 'hospital', 'clinic', 'police',
+        'townhall', 'community_centre', 'library', 'sports_centre', 'fire_station',
+    ))
+
+    # Теги building, при которых квартал считаем «не частным» (многоквартирные, общественные, коммерция)
+    _NON_PRIVATE_BLOCK_BUILDING_TAGS = frozenset((
+        'apartments', 'apartment', 'residential', 'apartment_block', 'multistory', 'block', 'flats', 'semidetached_house',
+        'commercial', 'office', 'retail', 'industrial', 'school', 'university', 'college', 'hospital', 'kindergarten',
+        'civic', 'government', 'public', 'train_station', 'supermarket', 'hotel', 'dormitory', 'service',
+    ))
+
+    @classmethod
+    def _building_makes_block_non_private(cls, row) -> bool:
+        """Здание «делает квартал не частным»: многоквартирное, общественное (amenity/shop), коммерческое."""
+        if cls._is_apartment(row):
+            return True
+        for key in ('amenity', 'shop'):
+            val = row.get(key) if hasattr(row, 'get') else None
+            if val is not None and str(val).strip():
+                if str(val).lower().strip() in cls._PUBLIC_AMENITY_VALUES:
+                    return True
+        tag = row.get('building') if hasattr(row, 'get') else None
+        if tag is not None and str(tag).strip() and not (isinstance(tag, float) and pd.isna(tag)):
+            if str(tag).lower().strip() in cls._NON_PRIVATE_BLOCK_BUILDING_TAGS:
+                return True
+        return False
+
+    @classmethod
+    def _is_private_house(cls, row, is_apartment: bool = False) -> bool:
+        """Частный дом только по явному тегу building (внутри квартала решение по кварталу)."""
+        if is_apartment:
+            return False
+        for key in ('amenity', 'shop'):
+            val = row.get(key) if hasattr(row, 'get') else None
+            if val is not None and str(val).strip():
+                if str(val).lower().strip() in cls._PUBLIC_AMENITY_VALUES:
+                    return False
+        tag = row.get('building') if hasattr(row, 'get') else None
+        if tag is None or (isinstance(tag, float) and pd.isna(tag)) or str(tag).strip() == '':
+            return False  # без тега не считаем частным — тип определит квартал
+        tag = str(tag).lower().strip()
+        return tag in cls._PRIVATE_BUILDING_TAGS
     
     # Смещение точки высадки от линии дороги в сторону здания (~5 м), но не заходя на здание
     OFFSET_FROM_ROAD_DEGREES = 0.00005
@@ -612,7 +665,123 @@ class DataService:
                 return lon_d, lat_d
             shift *= 0.5
         return rx, ry
-    
+
+    # Кварталы из дорог: допустимая площадь в м² (в UTM)
+    BLOCK_MIN_AREA_M2 = 200.0
+    BLOCK_MAX_AREA_M2 = 2.0e6
+
+    def _get_blocks_from_roads(self, edge_geoms, city_boundary, crs_4326):
+        """
+        Строит полигоны кварталов из линий дорог (polygonize). Возвращает список полигонов в crs_4326,
+        отфильтрованных по площади и границе города.
+        """
+        if not edge_geoms:
+            return []
+        try:
+            polygons = list(polygonize(edge_geoms))
+        except Exception as e:
+            self.logger.warning(f"Ошибка polygonize дорог: {e}")
+            return []
+        if not polygons:
+            return []
+        try:
+            crs_utm = gpd.GeoSeries([polygons[0].centroid], crs=crs_4326).estimate_utm_crs()
+        except Exception:
+            crs_utm = "EPSG:32637"
+        result = []
+        boundary_geom = city_boundary if city_boundary is not None else None
+        for poly in polygons:
+            if not poly.is_valid or poly.is_empty:
+                continue
+            try:
+                poly_utm = gpd.GeoSeries([poly], crs=crs_4326).to_crs(crs_utm).iloc[0]
+                area_m2 = poly_utm.area
+            except Exception:
+                continue
+            if area_m2 < self.BLOCK_MIN_AREA_M2 or area_m2 > self.BLOCK_MAX_AREA_M2:
+                continue
+            if boundary_geom is not None:
+                try:
+                    if not poly.within(boundary_geom) and not poly.intersects(boundary_geom):
+                        continue
+                    # Оставляем только кварталы, центр которых внутри границы
+                    if not boundary_geom.contains(poly.centroid):
+                        continue
+                except Exception:
+                    continue
+            result.append(poly)
+        return result
+
+    # Если из дорог получилось мало кварталов — делим город сеткой
+    MIN_ROAD_BLOCKS_TO_USE = 8
+    GRID_CELL_SIZE_M = 350.0
+    GRID_MAX_CELLS = 500
+
+    def _get_grid_blocks_fallback(self, buildings, city_boundary, building_centroids, crs_4326):
+        """
+        Запасной вариант: сетка ячеек по городу. Ограничено GRID_MAX_CELLS для скорости.
+        """
+        if not building_centroids or not buildings.crs:
+            return []
+        b = buildings.total_bounds
+        try:
+            crs_utm = gpd.GeoSeries([Point((b[0] + b[2]) / 2, (b[1] + b[3]) / 2)], crs=crs_4326).estimate_utm_crs()
+        except Exception:
+            return []
+        try:
+            bounds_geom = city_boundary if city_boundary is not None else box(b[0], b[1], b[2], b[3])
+            bounds_gdf = gpd.GeoDataFrame(geometry=[bounds_geom], crs=crs_4326).to_crs(crs_utm)
+            minx, miny, maxx, maxy = bounds_gdf.total_bounds
+        except Exception:
+            return []
+        cell = self.GRID_CELL_SIZE_M
+        cells = []
+        x = minx
+        while x < maxx and len(cells) < self.GRID_MAX_CELLS:
+            y = miny
+            while y < maxy and len(cells) < self.GRID_MAX_CELLS:
+                poly_utm = box(x, y, x + cell, y + cell)
+                poly_4326 = gpd.GeoSeries([poly_utm], crs=crs_utm).to_crs(crs_4326).iloc[0]
+                for pt in building_centroids:
+                    if pt is None:
+                        continue
+                    try:
+                        if poly_4326.contains(pt) or poly_4326.intersects(pt):
+                            cells.append(poly_4326)
+                            break
+                    except Exception:
+                        pass
+                y += cell
+            x += cell
+        return cells
+
+    def _block_is_private_sector(self, block_poly, building_centroids, makes_non_private_list):
+        """Квартал — частный сектор, если в нём есть здания и ни одно не «делает квартал не частным» (нет МКД, школ, офисов и т.д.)."""
+        has_building = False
+        has_non_private = False
+        for pt, makes_np in zip(building_centroids, makes_non_private_list):
+            if pt is None:
+                continue
+            try:
+                if block_poly.contains(pt) or block_poly.intersects(pt):
+                    has_building = True
+                    if makes_np:
+                        has_non_private = True
+                        break
+            except Exception:
+                continue
+        return has_building and not has_non_private
+
+    def _four_corners_of_block(self, block_poly):
+        """Четыре точки на углах квартала (углы ограничивающего прямоугольника). (lon, lat)."""
+        minx, miny, maxx, maxy = block_poly.bounds
+        return [
+            (minx, miny),
+            (maxx, miny),
+            (maxx, maxy),
+            (minx, maxy),
+        ]
+
     def _load_entrances_bbox(self, bbox):
         """Загружает точки подъездов (entrance=*) из OSM по bbox. (north, south, east, west)."""
         try:
@@ -631,7 +800,69 @@ class DataService:
         except Exception as e:
             self.logger.warning(f"Не удалось загрузить подъезды из OSM: {e}")
         return gpd.GeoDataFrame()
-    
+
+    def _load_landuse_residential_areas(self, bbox, city_boundary, crs_4326):
+        """
+        Загружает полигоны для частного сектора: landuse=residential/allotments и place=neighbourhood/suburb (полигоны).
+        """
+        north, south, east, west = bbox
+        polygons = []
+        for tags in (
+            {"landuse": ["residential", "allotments"]},
+            {"place": ["neighbourhood", "suburb"]},
+        ):
+            try:
+                gdf = ox.features_from_bbox(bbox=(north, south, east, west), tags=tags)
+                if gdf is None or len(gdf) == 0:
+                    continue
+                if gdf.crs is not None and gdf.crs != crs_4326:
+                    gdf = gdf.to_crs(crs_4326)
+                for _, row in gdf.iterrows():
+                    g = row.geometry
+                    if g is None or not getattr(g, "is_valid", True):
+                        continue
+                    if g.geom_type == "Polygon":
+                        polygons.append(g)
+                    elif g.geom_type == "MultiPolygon":
+                        for poly in g.geoms:
+                            if poly.is_valid and not poly.is_empty:
+                                polygons.append(poly)
+            except Exception as e:
+                self.logger.debug(f"Загрузка {tags}: {e}")
+        if polygons:
+            self.logger.info(f"Загружено полигонов landuse/place (частный сектор): {len(polygons)}")
+        if not polygons or city_boundary is None:
+            return polygons
+        filtered = []
+        for poly in polygons:
+            try:
+                if not poly.intersects(city_boundary):
+                    continue
+                if not city_boundary.contains(poly.centroid) and not poly.centroid.within(city_boundary):
+                    continue
+                filtered.append(poly)
+            except Exception:
+                continue
+        return filtered if filtered else polygons
+
+    def _landuse_area_is_private_sector(self, poly, building_centroids, makes_non_private_list):
+        """
+        Классификация: частный сектор, если в полигоне landuse нет высотных/не-частных зданий.
+        """
+        try:
+            prep_poly = prep(poly)
+        except Exception:
+            prep_poly = None
+        for pt, makes_np in zip(building_centroids, makes_non_private_list):
+            if pt is None or not makes_np:
+                continue
+            try:
+                if (prep_poly if prep_poly is not None else poly).contains(pt):
+                    return False
+            except Exception:
+                continue
+        return True
+
     def get_delivery_points(
         self,
         buildings: gpd.GeoDataFrame,
@@ -639,7 +870,10 @@ class DataService:
         city_boundary=None,
     ) -> gpd.GeoDataFrame:
         """
-        Точки высадки: у многоквартирных — у каждого подъезда (по OSM entrance=*), у остальных — одна точка у дороги.
+        Точки высадки. Частные сектора выделяются по землепользованию (landuse=residential, allotments,
+        place=neighbourhood, suburb) с проверкой: низкая плотность дорог и отсутствие высотных/общественных
+        зданий. В таких полигонах — только 4 точки на углах; иначе — по кварталам (дороги/сетка). У зданий
+        в не-частных зонах — точки по подъездам (МКД) или по одному.
         """
         if buildings is None or len(buildings) == 0:
             return gpd.GeoDataFrame()
@@ -672,10 +906,12 @@ class DataService:
         building_tree = STRtree(building_geoms) if building_geoms else None
         is_apartment = [self._is_apartment(buildings.iloc[i]) for i in range(len(buildings))]
         
-        # Подъезды из OSM: bbox (north, south, east, west)
+        # Подъезды из OSM (ограничиваем объём для больших городов)
         xmin, ymin, xmax, ymax = buildings.total_bounds
         entrances_gdf = self._load_entrances_bbox((ymax, ymin, xmax, xmin))
-        building_entrances = {}  # индекс здания -> список точек подъездов
+        if len(entrances_gdf) > 3000:
+            entrances_gdf = entrances_gdf.iloc[:3000]
+        building_entrances = {}
         if len(entrances_gdf) > 0 and building_tree is not None:
             for _, ent in entrances_gdf.iterrows():
                 g = ent.geometry
@@ -704,12 +940,72 @@ class DataService:
                         except Exception:
                             pass
         
+        makes_non_private = [self._building_makes_block_non_private(buildings.iloc[i]) for i in range(len(buildings))]
+        is_private = [self._is_private_house(buildings.iloc[i], is_apartment[i]) for i in range(len(buildings))]
+        building_centroids = []
+        for i in range(len(buildings)):
+            geom = buildings.iloc[i].geometry
+            if geom is not None and geom.is_valid:
+                building_centroids.append(geom.centroid)
+            else:
+                building_centroids.append(None)
+
+        # Вариант 1 (приоритет): частный сектор по landuse — residential, allotments, neighbourhood, suburb
+        bbox_osm = (ymax, ymin, xmax, xmin)  # north, south, east, west
+        landuse_polygons = self._load_landuse_residential_areas(bbox_osm, city_boundary, buildings.crs)
+        # Ограничиваем число полигонов для классификации (чтобы охватить все частные кварталы)
+        max_landuse_to_classify = 150
+        if len(landuse_polygons) > max_landuse_to_classify:
+            landuse_polygons = sorted(landuse_polygons, key=lambda p: p.area, reverse=True)[:max_landuse_to_classify]
+        private_sector_landuse = [
+            p for p in landuse_polygons
+            if self._landuse_area_is_private_sector(p, building_centroids, makes_non_private)
+        ]
+        if private_sector_landuse:
+            self.logger.info(f"Частный сектор по landuse: {len(private_sector_landuse)} полигонов")
+
+        # Кварталы по дорогам/сетке — используем вместе с landuse, чтобы очистить все частные кварталы
+        all_blocks = []
+        max_edges_for_polygonize = 6000
+        if edge_geoms and len(edge_geoms) <= max_edges_for_polygonize:
+            road_blocks = self._get_blocks_from_roads(edge_geoms, city_boundary, buildings.crs)
+            if len(road_blocks) >= self.MIN_ROAD_BLOCKS_TO_USE:
+                all_blocks = road_blocks
+        if not all_blocks and building_centroids:
+            all_blocks = self._get_grid_blocks_fallback(buildings, city_boundary, building_centroids, buildings.crs)
+        private_sector_blocks = [
+            bp for bp in all_blocks
+            if self._block_is_private_sector(bp, building_centroids, makes_non_private)
+        ]
+
+        def _centroid_in_private_sector(centroid):
+            if centroid is None:
+                return False
+            for poly in private_sector_landuse:
+                try:
+                    if poly.contains(centroid) or poly.intersects(centroid):
+                        return True
+                except Exception:
+                    continue
+            for block_poly in private_sector_blocks:
+                try:
+                    if block_poly.contains(centroid) or block_poly.intersects(centroid):
+                        return True
+                except Exception:
+                    continue
+            return False
+
         rows = []
         for i in range(len(buildings)):
             try:
                 b = buildings.iloc[i]
                 geom = b.geometry
                 if geom is None or not geom.is_valid:
+                    continue
+                if is_private[i]:
+                    continue
+                # В частном секторе (landuse/квартал) не ставим точки у зданий — только 4 на углах
+                if _centroid_in_private_sector(building_centroids[i]):
                     continue
                 centroid = geom.centroid
                 lon_c, lat_c = centroid.x, centroid.y
@@ -726,18 +1022,39 @@ class DataService:
                     rx, ry = self._point_to_road(centroid, edge_tree, edge_geoms)
                     lon_d, lat_d = self._shift_near_road_no_building(rx, ry, centroid, building_tree, building_geoms)
                     rows.append({
-                        'geometry': Point(lon_d, lat_d),
-                        'delivery_lon': lon_d,
-                        'delivery_lat': lat_d,
+                            'geometry': Point(lon_d, lat_d),
+                            'delivery_lon': lon_d,
+                            'delivery_lat': lat_d,
                     })
             except Exception as e:
                 self.logger.debug(f"Здание {i}: {e}")
                 continue
-        
+
+        # Частный сектор: 4 точки на углах каждого полигона (landuse или кварталы)
+        if edge_geoms and building_centroids:
+            seen = set()
+            for block_poly in private_sector_landuse + private_sector_blocks:
+                for lon_a, lat_a in self._four_corners_of_block(block_poly):
+                    pt = Point(lon_a, lat_a)
+                    rx, ry = self._point_to_road(pt, edge_tree, edge_geoms)
+                    lon_d, lat_d = self._shift_near_road_no_building(rx, ry, pt, building_tree, building_geoms)
+                    key = (round(lon_d, 6), round(lat_d, 6))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    rows.append({
+                        'geometry': Point(lon_d, lat_d),
+                        'delivery_lon': lon_d,
+                        'delivery_lat': lat_d,
+                    })
+            n_areas = len(private_sector_landuse) + len(private_sector_blocks)
+            if n_areas:
+                self.logger.info(f"Частный сектор: landuse {len(private_sector_landuse)}, кварталов {len(private_sector_blocks)}, точек по углам: {len(seen)}")
+
         if not rows:
             return gpd.GeoDataFrame()
         gdf = gpd.GeoDataFrame(rows, crs=buildings.crs)
-        self.logger.info(f"Точки высадки: {len(gdf)} (многоквартирные — по подъездам)")
+        self.logger.info(f"Точки высадки: {len(gdf)} (многоквартирные — по подъездам; частный сектор — 4 точки на квартал)")
         return gdf
     
     def address_to_coords(self, address, city_name=None):
