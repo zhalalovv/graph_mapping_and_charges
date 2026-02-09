@@ -102,17 +102,53 @@ class DataService:
         
         try:
             self._update_progress("download", 20, "Загрузка дорожной сети")
-            # Универсальная загрузка для любого города/страны
             road_graph = None
-            for query_variant in [city_name]:
-                try:
-                    road_graph = ox.graph_from_place(query_variant, network_type=network_type, simplify=simplify)
-                    if len(road_graph.nodes) > 0:
-                        self.logger.info(f"Успешно загружена дорожная сеть для: {query_variant}")
-                        break
-                except Exception as e:
-                    self.logger.warning(f"Не удалось загрузить для '{query_variant}': {e}")
+            query_variants = [
+                city_name,
+                city_name.replace(", ", ","),
+                city_name.split(",")[0].strip() if "," in city_name else None,
+            ]
+            for q in query_variants:
+                if not q:
                     continue
+                for which in [1, 2, 3]:
+                    try:
+                        road_graph = ox.graph_from_place(q, network_type=network_type, simplify=simplify, which_result=which)
+                        if road_graph is not None and len(road_graph.nodes) > 0:
+                            self.logger.info(f"Успешно загружена дорожная сеть для: {q} (which_result={which})")
+                            break
+                    except Exception as e:
+                        self.logger.warning(f"Не удалось загрузить для '{q}' which_result={which}: {e}")
+                        continue
+                if road_graph is not None and len(road_graph.nodes) > 0:
+                    break
+            
+            # Fallback 1: геокодируем и загружаем по bbox
+            if road_graph is None or len(road_graph.nodes) == 0:
+                try:
+                    gdf_place = ox.geocode_to_gdf(city_name)
+                    if len(gdf_place) > 0 and gdf_place.geometry.iloc[0] is not None:
+                        geom = gdf_place.geometry.iloc[0]
+                        bbox = geom.bounds
+                        if len(bbox) >= 4:
+                            north, south = bbox[3], bbox[1]
+                            east, west = bbox[2], bbox[0]
+                            road_graph = ox.graph_from_bbox(north, south, east, west, network_type=network_type, simplify=simplify)
+                            if road_graph is not None and len(road_graph.nodes) > 0:
+                                self.logger.info(f"Успешно загружена дорожная сеть по bbox геокодинга: {city_name}")
+                except Exception as e:
+                    self.logger.warning(f"Fallback geocode+bbox не сработал: {e}")
+            
+            # Fallback 2: геокодируем точку и загружаем по радиусу (~10 км)
+            if road_graph is None or len(road_graph.nodes) == 0:
+                try:
+                    loc = self.geolocators['nominatim'].geocode(city_name)
+                    if loc and loc.latitude and loc.longitude:
+                        road_graph = ox.graph_from_point((loc.latitude, loc.longitude), dist=10000, network_type=network_type, simplify=simplify)
+                        if road_graph is not None and len(road_graph.nodes) > 0:
+                            self.logger.info(f"Успешно загружена дорожная сеть по точке+радиусу: {city_name}")
+                except Exception as e:
+                    self.logger.warning(f"Fallback geocode+point не сработал: {e}")
             
             if road_graph is None or len(road_graph.nodes) == 0:
                 raise Exception(f"Не удалось загрузить дорожную сеть для города: {city_name}")
@@ -577,18 +613,16 @@ class DataService:
         'townhall', 'community_centre', 'library', 'sports_centre', 'fire_station',
     ))
 
-    # Теги building, при которых квартал считаем «не частным» (многоквартирные, общественные, коммерция)
+    # Теги building, при которых квартал считаем «не частным». Без 'residential' — в РФ им часто помечают частные дома.
     _NON_PRIVATE_BLOCK_BUILDING_TAGS = frozenset((
-        'apartments', 'apartment', 'residential', 'apartment_block', 'multistory', 'block', 'flats', 'semidetached_house',
+        'apartments', 'apartment', 'apartment_block', 'multistory', 'block', 'flats', 'semidetached_house',
         'commercial', 'office', 'retail', 'industrial', 'school', 'university', 'college', 'hospital', 'kindergarten',
         'civic', 'government', 'public', 'train_station', 'supermarket', 'hotel', 'dormitory', 'service',
     ))
 
     @classmethod
     def _building_makes_block_non_private(cls, row) -> bool:
-        """Здание «делает квартал не частным»: многоквартирное, общественное (amenity/shop), коммерческое."""
-        if cls._is_apartment(row):
-            return True
+        """Здание «делает квартал не частным»: явно многоквартирное (не residential), общественное, коммерческое."""
         for key in ('amenity', 'shop'):
             val = row.get(key) if hasattr(row, 'get') else None
             if val is not None and str(val).strip():
@@ -953,7 +987,7 @@ class DataService:
         # Вариант 1 (приоритет): частный сектор по landuse — residential, allotments, neighbourhood, suburb
         bbox_osm = (ymax, ymin, xmax, xmin)  # north, south, east, west
         landuse_polygons = self._load_landuse_residential_areas(bbox_osm, city_boundary, buildings.crs)
-        # Ограничиваем число полигонов для классификации (чтобы охватить все частные кварталы)
+        # Частный сектор по landuse только там, где внутри нет многоквартирных/школ/офисов
         max_landuse_to_classify = 150
         if len(landuse_polygons) > max_landuse_to_classify:
             landuse_polygons = sorted(landuse_polygons, key=lambda p: p.area, reverse=True)[:max_landuse_to_classify]
@@ -978,16 +1012,25 @@ class DataService:
             if self._block_is_private_sector(bp, building_centroids, makes_non_private)
         ]
 
+        # Небольшой буфер (~20 м), чтобы здания на границе частного полигона тоже очищались
+        _buffer_deg = 0.0002
+        try:
+            landuse_for_check = [p.buffer(_buffer_deg) if p.is_valid else p for p in private_sector_landuse]
+            blocks_for_check = [p.buffer(_buffer_deg) if p.is_valid else p for p in private_sector_blocks]
+        except Exception:
+            landuse_for_check = private_sector_landuse
+            blocks_for_check = private_sector_blocks
+
         def _centroid_in_private_sector(centroid):
             if centroid is None:
                 return False
-            for poly in private_sector_landuse:
+            for poly in landuse_for_check:
                 try:
                     if poly.contains(centroid) or poly.intersects(centroid):
                         return True
                 except Exception:
                     continue
-            for block_poly in private_sector_blocks:
+            for block_poly in blocks_for_check:
                 try:
                     if block_poly.contains(centroid) or block_poly.intersects(centroid):
                         return True
@@ -1004,8 +1047,8 @@ class DataService:
                     continue
                 if is_private[i]:
                     continue
-                # В частном секторе (landuse/квартал) не ставим точки у зданий — только 4 на углах
-                if _centroid_in_private_sector(building_centroids[i]):
+                # В частном секторе не ставим точки только у частных зданий; многоквартирные (в т.ч. residential)/школы/офисы — всегда точки
+                if not (is_apartment[i] or makes_non_private[i]) and _centroid_in_private_sector(building_centroids[i]):
                     continue
                 centroid = geom.centroid
                 lon_c, lat_c = centroid.x, centroid.y

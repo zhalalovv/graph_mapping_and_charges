@@ -328,7 +328,11 @@ def graph_geojson(
             stats = data.get("stats", {})
             
         elif graph_type == 'delaunay':
-            if cached_graph_data is not None:
+            has_no_fly = no_fly_zones is not None and (
+                (isinstance(no_fly_zones, gpd.GeoDataFrame) and len(no_fly_zones) > 0) or
+                (isinstance(no_fly_zones, list) and len(no_fly_zones) > 0)
+            )
+            if cached_graph_data is not None and not has_no_fly:
                 edges_geojson = cached_graph_data.get('edges_geojson')
                 stats = cached_graph_data.get('stats')
                 logger.info("✓ Использован кэшированный delaunay граф")
@@ -345,13 +349,16 @@ def graph_geojson(
                     city_boundary=city_boundary,
                     points=delivery_points if len(delivery_points) >= 3 else None,
                 )
-                edges_geojson = graph_service.graph_to_geojson(delaunay_graph)
+                obstacles = graph_service._prepare_obstacles(None, no_fly_zones, 0.0001)
+                edges_geojson = graph_service.graph_to_geojson(
+                    delaunay_graph, obstacles=obstacles
+                )
                 stats = {
                     "nodes": len(delaunay_graph.nodes),
                     "edges": len(delaunay_graph.edges),
                     "type": "delaunay"
                 }
-                if redis_client is not None:
+                if redis_client is not None and not has_no_fly:
                     try:
                         cache_data = {
                             'edges_geojson': edges_geojson,
@@ -420,7 +427,10 @@ def graph_geojson(
                 city_boundary=city_boundary,
                 points=delivery_points if len(delivery_points) >= 3 else None,
             )
-            merged_graph = graph_service.merge_road_and_delaunay(G_road, delaunay_graph)
+            obstacles = graph_service._prepare_obstacles(None, no_fly_zones, 0.0001)
+            merged_graph = graph_service.merge_road_and_delaunay(
+                G_road, delaunay_graph, obstacles=obstacles
+            )
             # Дороги рисуем по полной геометрии из OSM (gdf_edges), а не по отрезкам между узлами
             road_geojson = json.loads(gdf_edges_for_road.to_json())
             road_features = []
@@ -437,8 +447,12 @@ def graph_geojson(
                     **{k: v for k, v in props.items() if k not in ("edge_type", "weight", "length")},
                 }
                 road_features.append(f)
-            free_fc = graph_service.graph_to_geojson(merged_graph, edge_type_filter="free")
-            conn_fc = graph_service.graph_to_geojson(merged_graph, edge_type_filter="connection")
+            free_fc = graph_service.graph_to_geojson(
+                merged_graph, edge_type_filter="free", obstacles=obstacles
+            )
+            conn_fc = graph_service.graph_to_geojson(
+                merged_graph, edge_type_filter="connection", obstacles=obstacles
+            )
             edges_geojson = {
                 "type": "FeatureCollection",
                 "features": road_features + free_fc["features"] + conn_fc["features"],
