@@ -293,6 +293,8 @@ class GraphService:
         """
         Добавляет рёбра от каждой вершины треугольника в центр (середину) противолежащего ребра.
         Для треугольника ABC: A->mid(BC), B->mid(AC), C->mid(AB).
+        Пропускает треугольники, близкие к равносторонним: их медианы уходят в пустую область
+        (ранее no_fly_zone), такие рёбра не добавляем.
         """
         def get_node_coords(n):
             if n < len(points_arr):
@@ -320,12 +322,37 @@ class GraphService:
                     return (a, b)
             return None
         
+        # Пропуск треугольников, близких к равносторонним: медианы уходят в пустоту (бывшая no_fly_zone)
+        EQUILATERAL_SIDE_RATIO = 1.25  # max(side)/min(side) < this => считаем равносторонним
+
         edge_to_midpoint_id = {}
         next_node_id = max(G.nodes(), default=-1) + 1
         added = 0
         mid_pt = Point(0, 0)  # placeholder
-        
+
         for simplex in tri.simplices:
+            a, b, c = simplex[0], simplex[1], simplex[2]
+            pa, pb, pc = points_arr[a], points_arr[b], points_arr[c]
+
+            # Не добавляем медианы, если внутри треугольника есть запретная зона —
+            # иначе рёбра из углов уходят в воду/в зону (лишние зелёные линии на карте)
+            if obstacles is not None:
+                try:
+                    tri_poly = Polygon([pa, pb, pc])
+                    if tri_poly.is_valid and not tri_poly.is_empty and obstacles.intersects(tri_poly):
+                        continue
+                except Exception:
+                    pass
+
+            # Пропуск треугольников, близких к равносторонним: медианы уходят в пустоту
+            len_bc = self._calculate_distance(pb[1], pb[0], pc[1], pc[0])
+            len_ac = self._calculate_distance(pa[1], pa[0], pc[1], pc[0])
+            len_ab = self._calculate_distance(pa[1], pa[0], pb[1], pb[0])
+            sides = [len_ab, len_bc, len_ac]
+            min_side, max_side = min(sides), max(sides)
+            if min_side > 1e-9 and max_side / min_side < EQUILATERAL_SIDE_RATIO:
+                continue  # равносторонний — не добавляем рёбра вершина->середина
+
             for i in range(3):
                 v = simplex[i]
                 u, w = simplex[(i + 1) % 3], simplex[(i + 2) % 3]
