@@ -598,11 +598,12 @@ class DataService:
         if tag is None or (isinstance(tag, float) and pd.isna(tag)):
             return False
         tag = str(tag).lower().strip()
-        return tag in ('apartments', 'apartment', 'residential', 'apartment_block', 'multistory', 'block', 'flats', 'semidetached_house')
+        return tag in ('apartments', 'apartment', 'apartment_block', 'multistory', 'block', 'flats', 'semidetached_house')
 
     # Теги OSM building, типичные для частного сектора (в т.ч. в РФ часто yes или без тега)
     _PRIVATE_BUILDING_TAGS = frozenset((
         'house', 'detached', 'hut', 'cabin', 'bungalow', 'terrace',
+        'residential',  # в РФ часто помечают частные дома
         'yes', 'true', '1',  # в OSM частные дома часто без уточнения
         'garage', 'shed', 'garages',  # хозпостройки в частном секторе
     ))
@@ -904,10 +905,9 @@ class DataService:
         city_boundary=None,
     ) -> gpd.GeoDataFrame:
         """
-        Точки высадки. Частные сектора выделяются по землепользованию (landuse=residential, allotments,
-        place=neighbourhood, suburb) с проверкой: низкая плотность дорог и отсутствие высотных/общественных
-        зданий. В таких полигонах — только 4 точки на углах; иначе — по кварталам (дороги/сетка). У зданий
-        в не-частных зонах — точки по подъездам (МКД) или по одному.
+        Точки высадки. Частный дом определяется автоматически: по тегу OSM (building=house, yes, detached и т.д.)
+        либо по попаданию в зону частного сектора (landuse=residential/allotments, кварталы без МКД/школ/офисов).
+        В частном секторе — только 4 точки на углах квартала; на остальные здания — по подъездам (МКД) или по одному.
         """
         if buildings is None or len(buildings) == 0:
             return gpd.GeoDataFrame()
@@ -1012,14 +1012,49 @@ class DataService:
             if self._block_is_private_sector(bp, building_centroids, makes_non_private)
         ]
 
+        # Кварталы внутри частного сектора (landuse): считаем их тоже частным сектором,
+        # чтобы делить зону на блоки, а не одну большую зону с 4 точками
+        blocks_inside_private_landuse = []
+        if private_sector_landuse and all_blocks:
+            try:
+                prep_landuse = [prep(p) if p.is_valid else None for p in private_sector_landuse]
+                for block_poly in all_blocks:
+                    if not block_poly.is_valid or block_poly.is_empty:
+                        continue
+                    try:
+                        c = block_poly.centroid
+                        for i, poly in enumerate(private_sector_landuse):
+                            if (prep_landuse[i] if prep_landuse[i] is not None else poly).contains(c):
+                                blocks_inside_private_landuse.append(block_poly)
+                                break
+                    except Exception:
+                        continue
+            except Exception as e:
+                self.logger.debug(f"Блоки внутри landuse: {e}")
+
+        # Объединяем: кварталы по зданиям + кварталы внутри landuse (без дубликатов по центру)
+        seen_centroids = set()
+        effective_private_blocks = []
+        for bp in private_sector_blocks + blocks_inside_private_landuse:
+            try:
+                key = (round(bp.centroid.x, 6), round(bp.centroid.y, 6))
+                if key in seen_centroids:
+                    continue
+                seen_centroids.add(key)
+                effective_private_blocks.append(bp)
+            except Exception:
+                effective_private_blocks.append(bp)
+        if blocks_inside_private_landuse:
+            self.logger.info(f"Кварталов внутри частного сектора (landuse): {len(blocks_inside_private_landuse)}, всего частных кварталов: {len(effective_private_blocks)}")
+
         # Небольшой буфер (~20 м), чтобы здания на границе частного полигона тоже очищались
         _buffer_deg = 0.0002
         try:
             landuse_for_check = [p.buffer(_buffer_deg) if p.is_valid else p for p in private_sector_landuse]
-            blocks_for_check = [p.buffer(_buffer_deg) if p.is_valid else p for p in private_sector_blocks]
+            blocks_for_check = [p.buffer(_buffer_deg) if p.is_valid else p for p in effective_private_blocks]
         except Exception:
             landuse_for_check = private_sector_landuse
-            blocks_for_check = private_sector_blocks
+            blocks_for_check = effective_private_blocks
 
         def _centroid_in_private_sector(centroid):
             if centroid is None:
@@ -1038,6 +1073,15 @@ class DataService:
                     continue
             return False
 
+        # Частный дом: по тегу OSM ИЛИ по попаданию в зону частного сектора (landuse/кварталы)
+        for i in range(len(buildings)):
+            if building_centroids[i] is None:
+                continue
+            if is_private[i]:
+                continue  # уже частный по тегу
+            if not (is_apartment[i] or makes_non_private[i]) and _centroid_in_private_sector(building_centroids[i]):
+                is_private[i] = True  # частный по расположению в частном секторе
+
         rows = []
         for i in range(len(buildings)):
             try:
@@ -1045,10 +1089,8 @@ class DataService:
                 geom = b.geometry
                 if geom is None or not geom.is_valid:
                     continue
+                # Не ставим точку на здание, если оно частное (по тегу OSM или по зоне)
                 if is_private[i]:
-                    continue
-                # В частном секторе не ставим точки только у частных зданий; многоквартирные (в т.ч. residential)/школы/офисы — всегда точки
-                if not (is_apartment[i] or makes_non_private[i]) and _centroid_in_private_sector(building_centroids[i]):
                     continue
                 centroid = geom.centroid
                 lon_c, lat_c = centroid.x, centroid.y
@@ -1073,10 +1115,25 @@ class DataService:
                 self.logger.debug(f"Здание {i}: {e}")
                 continue
 
-        # Частный сектор: 4 точки на углах каждого полигона (landuse или кварталы)
+        # Частный сектор: 4 точки на углах каждого квартала; для landuse — только если внутри нет кварталов
         if edge_geoms and building_centroids:
             seen = set()
-            for block_poly in private_sector_landuse + private_sector_blocks:
+            # Landuse-полигоны, внутри которых нет кварталов — добавляем 4 угла на весь полигон
+            landuse_for_corners = []
+            for p in private_sector_landuse:
+                has_block_inside = False
+                try:
+                    for b in all_blocks:
+                        if not b.is_valid or b.is_empty:
+                            continue
+                        if p.contains(b.centroid):
+                            has_block_inside = True
+                            break
+                except Exception:
+                    pass
+                if not has_block_inside:
+                    landuse_for_corners.append(p)
+            for block_poly in landuse_for_corners + effective_private_blocks:
                 for lon_a, lat_a in self._four_corners_of_block(block_poly):
                     pt = Point(lon_a, lat_a)
                     rx, ry = self._point_to_road(pt, edge_tree, edge_geoms)
@@ -1090,9 +1147,9 @@ class DataService:
                         'delivery_lon': lon_d,
                         'delivery_lat': lat_d,
                     })
-            n_areas = len(private_sector_landuse) + len(private_sector_blocks)
+            n_areas = len(landuse_for_corners) + len(effective_private_blocks)
             if n_areas:
-                self.logger.info(f"Частный сектор: landuse {len(private_sector_landuse)}, кварталов {len(private_sector_blocks)}, точек по углам: {len(seen)}")
+                self.logger.info(f"Частный сектор: landuse без кварталов {len(landuse_for_corners)}, кварталов {len(effective_private_blocks)}, точек по углам: {len(seen)}")
 
         if not rows:
             return gpd.GeoDataFrame()
