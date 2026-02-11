@@ -40,6 +40,8 @@
             left: 16px;
             z-index: 1200;
             width: 320px;
+            max-height: calc(100vh - 100px);
+            overflow-y: auto;
             background: #fff;
             border-radius: 12px;
             box-shadow: 0 20px 60px rgba(0, 0, 0, .35);
@@ -189,7 +191,11 @@
                     <option value="2">Эшелон 2</option>
                     <option value="3">Эшелон 3</option>
                     <option value="4">Эшелон 4</option>
+                    <option value="5">Эшелон 5</option>
                 </select>
+                <span id="flightLevelFilterHint" style="font-size:11px; color:#6b7280; margin-top:2px; line-height:1.3;">
+                    <strong>Все</strong> — дроны на всех эшелонах, каждый учитывает ограничения полёта своего эшелона. <strong>Эшелон N</strong> — только дроны на выбранном эшелоне.
+                </span>
             </label>
         </div>
         
@@ -206,6 +212,11 @@
         <div id="flightLevelsPanel" class="flight-levels-panel" style="display:none">
             <h3>Эшелоны полётов</h3>
             <div id="flightLevelsList"></div>
+            <div id="flightLevelsConnected" class="flight-levels-connected" style="display:none; margin-top:10px; padding:10px; background:#eff6ff; border:1px solid #93c5fd; border-radius:8px; font-size:12px; color:#1e40af;">
+                <div style="font-weight:700; margin-bottom:6px; font-size:13px;">Связанность эшелонов</div>
+                <div id="flightLevelsChain" style="margin-bottom:6px; font-size:14px;"></div>
+                <div class="flight-levels-connected-hint" style="opacity:0.95; line-height:1.4;">В узлах графа возможен переход между уровнями (например, спуск 2→1 для экономии батареи). Траектория строится по кривой — высота плавно меняется вдоль маршрута.</div>
+            </div>
             <div class="height-legend">
                 <span><span class="swatch" style="background:#22c55e"></span> &lt;15 м</span>
                 <span><span class="swatch" style="background:#eab308"></span> 15–30 м</span>
@@ -321,9 +332,9 @@
             return '#ef4444';               // красный
         }
 
-        /** Цвет точки эшелона на легенде */
+        /** Цвет точки эшелона на легенде (1–5) */
         function getFlightLevelColor(level) {
-            const colors = ['#22c55e', '#3b82f6', '#f59e0b', '#ef4444'];
+            const colors = ['#22c55e', '#ef4444', '#f97316', '#3b82f6', '#10b981'];
             return colors[(level - 1) % colors.length] || '#6b7280';
         }
 
@@ -348,24 +359,38 @@
             const filter = sel ? sel.value : '';
             const features = getFilteredEdges(lastGraphData, filter);
             map.removeLayer(edgesLayer);
-            edgesLayer = createEdgesLayer(lastGraphData, features);
+            edgesLayer = createEdgesLayer(lastGraphData, features, filter);
             edgesLayer.addTo(map);
-            const statsEl = document.getElementById('statsInfo');
+                const statsEl = document.getElementById('statsInfo');
                 if (statsEl && (lastGraphData.graph_type === 'delaunay' || lastGraphData.graph_type === 'merged')) {
                     const total = lastGraphData.edges?.features?.length || 0;
                     const shown = features.length;
                     const base = `Узлов: ${lastGraphData.stats?.nodes || 0}, Рёбер: ${lastGraphData.stats?.edges || 0}`;
-                    statsEl.textContent = filter ? `${base} (показано: ${shown} для эшелона ${filter})` : base;
+                    if (filter) {
+                        statsEl.textContent = `${base} (показано: ${shown} для эшелона ${filter})`;
+                    } else {
+                        statsEl.textContent = base + ' · Цвет рёбер = минимальный допустимый эшелон';
+                    }
                 }
         }
 
-        function createEdgesLayer(graphData, features) {
+        function createEdgesLayer(graphData, features, flightLevelFilter) {
             const geojson = { type: 'FeatureCollection', features };
+            const type = graphData?.graph_type;
+            const showByEchelon = (type === 'delaunay' || type === 'merged') && !flightLevelFilter && features.length > 0;
             return L.geoJSON(geojson, {
                 style: function(feature) {
                     const edgeType = feature.properties?.edge_type || 'unknown';
+                    let color = getEdgeColor(edgeType);
+                    if (showByEchelon) {
+                        const allowed = feature.properties?.allowed_flight_levels;
+                        if (Array.isArray(allowed) && allowed.length > 0) {
+                            const minLevel = Math.min(...allowed);
+                            color = getFlightLevelColor(minLevel);
+                        }
+                    }
                     const base = {
-                        color: getEdgeColor(edgeType),
+                        color: color,
                         weight: getEdgeWeight(edgeType),
                         opacity: 0.7
                     };
@@ -391,9 +416,11 @@
             });
         }
 
-        function updateFlightLevelsPanel(flightLevels) {
+        function updateFlightLevelsPanel(flightLevels, multilevelPlanning, graphType) {
             const panel = document.getElementById('flightLevelsPanel');
             const list = document.getElementById('flightLevelsList');
+            const connectedBlock = document.getElementById('flightLevelsConnected');
+            const chainEl = document.getElementById('flightLevelsChain');
             if (!flightLevels || flightLevels.length === 0) {
                 panel.style.display = 'none';
                 return;
@@ -404,6 +431,23 @@
                     <span>${fl.label || 'Эшелон ' + fl.level + ' (' + fl.altitude_m + ' м)'}</span>
                 </div>
             `).join('');
+            if (connectedBlock && chainEl) {
+                var showConnected = (graphType === 'delaunay' || graphType === 'merged') && flightLevels.length >= 2;
+                if (showConnected) {
+                    chainEl.innerHTML = flightLevels.map((fl, i) =>
+                        (i > 0 ? ' <span style="color:#3b82f6">↔</span> ' : '') +
+                        `<span style="font-weight:600">${fl.level}</span>`
+                    ).join('');
+                    var hint = multilevelPlanning
+                        ? 'В узлах графа возможен переход между уровнями (например, спуск 2→1 для экономии батареи). Траектория строится по кривой — высота плавно меняется вдоль маршрута.'
+                        : 'Эшелоны связаны: при перепостроении графа станут доступны переходы между уровнями в узлах и траектория по кривой (плавное изменение высоты).';
+                    var hintEl = connectedBlock.querySelector('.flight-levels-connected-hint');
+                    if (hintEl) hintEl.textContent = hint;
+                    connectedBlock.style.display = 'block';
+                } else {
+                    connectedBlock.style.display = 'none';
+                }
+            }
             panel.style.display = 'block';
         }
 
@@ -424,7 +468,7 @@
                     return;
                 }
                 
-                updateFlightLevelsPanel(data.flight_levels || []);
+                updateFlightLevelsPanel(data.flight_levels || [], false, null);
                 
                 const geojson = { type: 'FeatureCollection', features: data.features };
                 const layerOptions = {
@@ -521,7 +565,7 @@
                 statusEl.textContent = 'Отрисовка...';
                 lastGraphData = graphData;
                 lastGraphType = graphType;
-                updateFlightLevelsPanel(graphData.flight_levels || []);
+                updateFlightLevelsPanel(graphData.flight_levels || [], graphData.multilevel_planning === true, graphType);
 
                 const flLabel = document.getElementById('flightLevelFilterLabel');
                 const flSel = document.getElementById('flightLevelFilter');
@@ -605,7 +649,7 @@
                 const featuresToShow = getFilteredEdges(graphData, flightFilter);
                 console.log(`Отрисовка графа: ${featuresToShow.length} рёбер (всего ${graphData.edges?.features?.length || 0})`);
                 try {
-                    edgesLayer = createEdgesLayer(graphData, featuresToShow);
+                    edgesLayer = createEdgesLayer(graphData, featuresToShow, flightFilter);
                     edgesLayer.addTo(map);
                 } catch (edgeError) {
                     console.error('ОШИБКА при создании слоя рёбер:', edgeError);
@@ -623,8 +667,12 @@
                 statusEl.textContent = '✓ Готово';
                 const stats = graphData.stats || {};
                 let statsText = `Узлов: ${stats.nodes || 0}, Рёбер: ${stats.edges || 0}`;
-                if ((graphType === 'delaunay' || graphType === 'merged') && flightFilter && graphData.edges?.features) {
-                    statsText += ` (показано: ${featuresToShow.length} для эшелона ${flightFilter})`;
+                if (graphType === 'delaunay' || graphType === 'merged') {
+                    if (flightFilter) {
+                        statsText += ` (показано: ${featuresToShow.length} для эшелона ${flightFilter})`;
+                    } else {
+                        statsText += ' · Цвет = мин. эшелон';
+                    }
                 }
                 if (stats.road_nodes !== undefined) {
                     statsText += `\nДороги: ${stats.road_nodes}, Свободные: ${stats.free_nodes}`;

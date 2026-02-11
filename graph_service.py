@@ -604,24 +604,27 @@ class GraphService:
         graph: nx.Graph,
         edge_type_filter: Optional[str] = None,
         obstacles: Optional[Polygon] = None,
+        include_node_ids: bool = False,
     ) -> dict:
         """
-        Конвертирует NetworkX граф в GeoJSON для визуализации (ОПТИМИЗИРОВАНО)
-        
+        Конвертирует NetworkX граф в GeoJSON для визуализации.
+
         Args:
             graph: NetworkX граф
             edge_type_filter: фильтр по типу рёбер ('road', 'free', 'connection', None для всех)
             obstacles: препятствия — рёбра над ними исключаются из вывода
-            
+            include_node_ids: если True, в свойства каждого ребра добавляются source_id, target_id,
+                             и в ответ добавляется ключ "nodes" для многоуровневого планирования
+
         Returns:
-            GeoJSON FeatureCollection
+            GeoJSON FeatureCollection (при include_node_ids=True — с ключом "nodes")
         """
         features = []
         edges = list(graph.edges(data=True))
-        
+
         if edge_type_filter:
             edges = [(u, v, d) for u, v, d in edges if d.get('edge_type') == edge_type_filter]
-        
+
         node_coords = {}
         for node_id, node_data in graph.nodes(data=True):
             if 'y' in node_data and 'x' in node_data:
@@ -631,7 +634,7 @@ class GraphService:
             elif 'pos' in node_data:
                 pos = node_data['pos']
                 node_coords[node_id] = (pos[0], pos[1])
-        
+
         for u, v, data in edges:
             if u not in node_coords or v not in node_coords:
                 continue
@@ -643,24 +646,35 @@ class GraphService:
                     continue
                 if self._is_point_in_obstacles(Point(u_lon, u_lat), obstacles) or self._is_point_in_obstacles(Point(v_lon, v_lat), obstacles):
                     continue
-            
+
+            props = {
+                "edge_type": data.get('edge_type', 'unknown'),
+                "weight": data.get('weight', 0),
+                "length": data.get('length', 0)
+            }
+            if include_node_ids:
+                props["source_id"] = str(u)
+                props["target_id"] = str(v)
+
             features.append({
                 "type": "Feature",
                 "geometry": {
                     "type": "LineString",
                     "coordinates": [[u_lon, u_lat], [v_lon, v_lat]]
                 },
-                "properties": {
-                    "edge_type": data.get('edge_type', 'unknown'),
-                    "weight": data.get('weight', 0),
-                    "length": data.get('length', 0)
-                }
+                "properties": props
             })
-        
-        return {
+
+        out = {
             "type": "FeatureCollection",
             "features": features
         }
+        if include_node_ids:
+            out["nodes"] = [
+                {"id": str(n), "lon": float(lon), "lat": float(lat)}
+                for n, (lon, lat) in node_coords.items()
+            ]
+        return out
 
     # Запас над зданием для разрешения полёта. Строгий: эшелон 1 (40м) не летает над оранжевыми (30+м)
     FLIGHT_LEVEL_SAFETY_MARGIN = 15.0
@@ -747,3 +761,211 @@ class GraphService:
             feature.setdefault("properties", {})["allowed_flight_levels"] = allowed
 
         return edges_geojson
+
+    # --- Многоуровневое планирование: связь эшелонов и траектория по кривой ---
+    # Вес перехода по высоте: спуск дешевле подъёма (экономия батареи)
+    VERTICAL_DESCENT_COST_PER_M = 0.002   # условных единиц за метр спуска
+    VERTICAL_CLIMB_COST_PER_M = 0.01      # условных единиц за метр подъёма
+
+    def build_multilevel_graph(
+        self,
+        graph: nx.Graph,
+        edges_geojson: dict,
+        flight_levels: list,
+    ) -> nx.Graph:
+        """
+        Строит граф, в котором эшелоны связаны: дрон может переходить с одного уровня на другой в узле.
+        Узлы нового графа — пары (node_id, level). Рёбра: горизонтальные (то же ребро на допустимом уровне)
+        и вертикальные (тот же node_id, соседние уровни) для планирования с переходом эшелонов.
+
+        Returns:
+            NetworkX граф с узлами (node_id, level) и весами рёбер (горизонталь — длина, вертикаль — стоимость по высоте).
+        """
+        if not flight_levels:
+            return nx.Graph()
+        level_list = [fl["level"] for fl in flight_levels]
+        alt_by_level = {fl["level"]: float(fl["altitude_m"]) for fl in flight_levels}
+
+        # (u, v) -> [allowed levels]; u,v как строки из GeoJSON
+        edge_allowed = {}
+        for f in edges_geojson.get("features", []):
+            p = f.get("properties") or {}
+            sid = p.get("source_id")
+            tid = p.get("target_id")
+            if sid is None or tid is None:
+                continue
+            allowed = p.get("allowed_flight_levels") or []
+            key = (min(sid, tid), max(sid, tid))
+            edge_allowed[key] = list(allowed)
+
+        G_multi = nx.Graph()
+        node_coords = {}
+        for n, data in graph.nodes(data=True):
+            c = self._get_node_coords(graph, n)
+            if c is None:
+                continue
+            node_coords[str(n)] = c
+            for level in level_list:
+                G_multi.add_node((str(n), level), lon=c[0], lat=c[1], level=level, altitude_m=alt_by_level.get(level))
+
+        for u, v, data in graph.edges(data=True):
+            u_s, v_s = str(u), str(v)
+            key = (min(u_s, v_s), max(u_s, v_s))
+            allowed = edge_allowed.get(key)
+            if not allowed:
+                continue
+            w = float(data.get("weight") or data.get("length") or 0)
+            for level in allowed:
+                if (u_s, level) not in G_multi.nodes or (v_s, level) not in G_multi.nodes:
+                    continue
+                G_multi.add_edge((u_s, level), (v_s, level), weight=w, length=w, edge_kind="horizontal")
+
+        for n_s in node_coords:
+            for i in range(len(level_list) - 1):
+                L1, L2 = level_list[i], level_list[i + 1]
+                alt1 = alt_by_level.get(L1, 0)
+                alt2 = alt_by_level.get(L2, 0)
+                if (n_s, L1) not in G_multi.nodes or (n_s, L2) not in G_multi.nodes:
+                    continue
+                delta = abs(alt2 - alt1)
+                cost = delta * (self.VERTICAL_DESCENT_COST_PER_M if alt2 < alt1 else self.VERTICAL_CLIMB_COST_PER_M)
+                G_multi.add_edge((n_s, L1), (n_s, L2), weight=cost, length=0, edge_kind="vertical")
+
+        self.logger.info(
+            f"Многоуровневый граф: {G_multi.number_of_nodes()} узлов, {G_multi.number_of_edges()} рёбер "
+            f"(эшелоны связаны, переход по кривой возможен)"
+        )
+        return G_multi
+
+    def path_to_3d_curve(
+        self,
+        path_with_levels: List[Tuple],
+        node_coords: dict,
+        flight_levels: list,
+        points_per_segment: int = 10,
+    ) -> List[dict]:
+        """
+        Преобразует путь [(node_id, level), ...] в 3D-траекторию по кривой:
+        высота плавно меняется вдоль сегмента (не только вертикальный скачок в узле).
+        Возвращает список {"lon", "lat", "alt_m"} для построения маршрута дрона.
+
+        path_with_levels: список кортежей (node_id, level). node_id — строка.
+        node_coords: {node_id: (lon, lat)}
+        flight_levels: [{"level": 1, "altitude_m": 40}, ...]
+        points_per_segment: число точек на сегменте для плавной кривой (по умолчанию 10).
+        """
+        if not path_with_levels or not flight_levels:
+            return []
+        alt_by_level = {fl["level"]: float(fl["altitude_m"]) for fl in flight_levels}
+        out = []
+        for k in range(len(path_with_levels) - 1):
+            n1, l1 = path_with_levels[k]
+            n2, l2 = path_with_levels[k + 1]
+            n1_s, n2_s = str(n1), str(n2)
+            c1 = node_coords.get(n1_s)
+            c2 = node_coords.get(n2_s)
+            if c1 is None or c2 is None:
+                continue
+            lon1, lat1 = c1
+            lon2, lat2 = c2
+            alt1 = alt_by_level.get(l1, 0)
+            alt2 = alt_by_level.get(l2, 0)
+
+            if n1_s == n2_s:
+                out.append({"lon": lon1, "lat": lat1, "alt_m": alt1})
+                out.append({"lon": lon2, "lat": lat2, "alt_m": alt2})
+                continue
+
+            for i in range(points_per_segment + 1):
+                t = i / points_per_segment
+                lon = lon1 + t * (lon2 - lon1)
+                lat = lat1 + t * (lat2 - lat1)
+                alt = alt1 + t * (alt2 - alt1)
+                out.append({"lon": lon, "lat": lat, "alt_m": round(alt, 2)})
+        if path_with_levels and not out:
+            n1, l1 = path_with_levels[0]
+            c1 = node_coords.get(str(n1))
+            if c1:
+                out.append({"lon": c1[0], "lat": c1[1], "alt_m": round(alt_by_level.get(l1, 0), 2)})
+        return out
+
+    def shortest_path_multilevel(
+        self,
+        graph: nx.Graph,
+        edges_geojson: dict,
+        flight_levels: list,
+        source_node,
+        target_node,
+        source_level: Optional[int] = None,
+        target_level: Optional[int] = None,
+    ) -> Tuple[List[Tuple], List[dict]]:
+        """
+        Строит кратчайший путь в многоуровневом графе (с переходами между эшелонами).
+        Возвращает путь как список (node_id, level) и 3D-кривую для траектории (плавное изменение высоты).
+
+        source_node, target_node: id узла в исходном графе (строка или как в графе).
+        source_level, target_level: желаемый эшелон в начале/конце (None — любой).
+        """
+        G_multi = self.build_multilevel_graph(graph, edges_geojson, flight_levels)
+        if G_multi.number_of_nodes() == 0:
+            return [], []
+
+        node_coords = {}
+        for n, data in graph.nodes(data=True):
+            c = self._get_node_coords(graph, n)
+            if c is not None:
+                node_coords[str(n)] = c
+
+        levels = [fl["level"] for fl in flight_levels]
+        src_s, tgt_s = str(source_node), str(target_node)
+
+        starts = [(src_s, source_level)] if source_level is not None else [(src_s, L) for L in levels if (src_s, L) in G_multi.nodes]
+        ends = [(tgt_s, target_level)] if target_level is not None else [(tgt_s, L) for L in levels if (tgt_s, L) in G_multi.nodes]
+        if not starts or not ends:
+            return [], []
+
+        best_path = None
+        best_len = float("inf")
+
+        for start in starts:
+            for end in ends:
+                try:
+                    path = nx.shortest_path(G_multi, start, end, weight="weight")
+                    length = sum(
+                        G_multi.edges[path[i], path[i + 1]].get("weight", 0)
+                        for i in range(len(path) - 1)
+                    )
+                    if length < best_len:
+                        best_len = length
+                        best_path = path
+                except (nx.NetworkXNoPath, nx.NodeNotFound):
+                    continue
+        if best_path is None:
+            return [], []
+        curve = self.path_to_3d_curve(best_path, node_coords, flight_levels)
+        return best_path, curve
+
+    def graph_from_geojson_with_nodes(self, edges_geojson: dict) -> nx.Graph:
+        """
+        Собирает NetworkX граф из GeoJSON с узлами и рёбрами (source_id, target_id, weight).
+        Нужен для расчёта маршрута по API, когда есть только edges + nodes.
+        """
+        G = nx.Graph()
+        nodes = edges_geojson.get("nodes") or []
+        for no in nodes:
+            nid = no.get("id")
+            lon = no.get("lon")
+            lat = no.get("lat")
+            if nid is not None and lon is not None and lat is not None:
+                G.add_node(str(nid), lon=float(lon), lat=float(lat))
+        for f in edges_geojson.get("features", []):
+            p = f.get("properties") or {}
+            u, v = p.get("source_id"), p.get("target_id")
+            if u is None or v is None:
+                continue
+            u, v = str(u), str(v)
+            if not G.has_node(u) or not G.has_node(v):
+                continue
+            w = float(p.get("weight") or p.get("length") or 0)
+            G.add_edge(u, v, weight=w, length=w)
+        return G

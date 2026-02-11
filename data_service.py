@@ -808,7 +808,7 @@ class DataService:
         return has_building and not has_non_private
 
     def _four_corners_of_block(self, block_poly):
-        """Четыре точки на углах квартала (углы ограничивающего прямоугольника). (lon, lat)."""
+        """Четыре точки на углах ограничивающего прямоугольника. Оставлено для совместимости."""
         minx, miny, maxx, maxy = block_poly.bounds
         return [
             (minx, miny),
@@ -816,6 +816,38 @@ class DataService:
             (maxx, maxy),
             (minx, maxy),
         ]
+
+    def _block_corner_points(self, block_poly, max_corners=32):
+        """
+        Углы квартала — вершины полигона (контур), а не bbox.
+        Возвращает список (lon, lat). Для сложных полигонов ограничено max_corners.
+        """
+        try:
+            if block_poly is None or not block_poly.is_valid or block_poly.is_empty:
+                return []
+            if block_poly.geom_type == 'Polygon':
+                ring = block_poly.exterior
+                if ring is None:
+                    return []
+                coords = list(ring.coords)
+                if len(coords) <= 1:
+                    return []
+                # кольцо замкнуто: первый и последний совпадают — не дублируем
+                points = [(float(x), float(y)) for x, y in coords[:-1]]
+            elif block_poly.geom_type == 'MultiPolygon':
+                # берём самый большой полигон по площади
+                best = max(block_poly.geoms, key=lambda g: g.area if g.is_valid else 0)
+                return self._block_corner_points(best, max_corners)
+            else:
+                return []
+            if len(points) > max_corners:
+                # упрощаем: равномерно берём max_corners вершин
+                step = (len(points) - 1) / max(1, max_corners - 1)
+                indices = [min(int(round(i * step)), len(points) - 1) for i in range(max_corners)]
+                points = [points[i] for i in sorted(set(indices))]
+            return points
+        except Exception:
+            return []
 
     def _load_entrances_bbox(self, bbox):
         """Загружает точки подъездов (entrance=*) из OSM по bbox. (north, south, east, west)."""
@@ -1115,11 +1147,11 @@ class DataService:
                 self.logger.debug(f"Здание {i}: {e}")
                 continue
 
-        # Частный сектор: 4 точки на углах каждого квартала; для landuse — только если внутри нет кварталов
-        if edge_geoms and building_centroids:
+        # На каждом квартале — минимум один узел: центр квартала, привязанный к дороге (для забора заказов)
+        if building_centroids and (edge_tree and edge_geoms) and all_blocks:
             seen = set()
-            # Landuse-полигоны, внутри которых нет кварталов — добавляем 4 угла на весь полигон
-            landuse_for_corners = []
+            # Landuse-полигоны, внутри которых нет кварталов — одна точка на полигон
+            landuse_for_center = []
             for p in private_sector_landuse:
                 has_block_inside = False
                 try:
@@ -1132,10 +1164,14 @@ class DataService:
                 except Exception:
                     pass
                 if not has_block_inside:
-                    landuse_for_corners.append(p)
-            for block_poly in landuse_for_corners + effective_private_blocks:
-                for lon_a, lat_a in self._four_corners_of_block(block_poly):
-                    pt = Point(lon_a, lat_a)
+                    landuse_for_center.append(p)
+            # Все кварталы (all_blocks) — по одному узлу на квартал у дороги посередине
+            for block_poly in landuse_for_center + all_blocks:
+                try:
+                    if not block_poly.is_valid or block_poly.is_empty:
+                        continue
+                    centroid = block_poly.centroid
+                    pt = centroid
                     rx, ry = self._point_to_road(pt, edge_tree, edge_geoms)
                     lon_d, lat_d = self._shift_near_road_no_building(rx, ry, pt, building_tree, building_geoms)
                     key = (round(lon_d, 6), round(lat_d, 6))
@@ -1147,14 +1183,14 @@ class DataService:
                         'delivery_lon': lon_d,
                         'delivery_lat': lat_d,
                     })
-            n_areas = len(landuse_for_corners) + len(effective_private_blocks)
-            if n_areas:
-                self.logger.info(f"Частный сектор: landuse без кварталов {len(landuse_for_corners)}, кварталов {len(effective_private_blocks)}, точек по углам: {len(seen)}")
+                except Exception as e:
+                    self.logger.debug(f"Квартал: {e}")
+            self.logger.info(f"Узлы по кварталам: landuse без кварталов {len(landuse_for_center)}, всего кварталов {len(all_blocks)}, уникальных узлов у дороги: {len(seen)}")
 
         if not rows:
             return gpd.GeoDataFrame()
         gdf = gpd.GeoDataFrame(rows, crs=buildings.crs)
-        self.logger.info(f"Точки высадки: {len(gdf)} (многоквартирные — по подъездам; частный сектор — 4 точки на квартал)")
+        self.logger.info(f"Точки высадки: {len(gdf)} (многоквартирные — по подъездам; на каждом квартале — узел у дороги посередине)")
         return gdf
     
     def address_to_coords(self, address, city_name=None):
@@ -1280,9 +1316,10 @@ class DataService:
     # --- Высоты зданий и эшелоны полётов ---
     METERS_PER_FLOOR = 3.0  # типичная высота этажа
     DEFAULT_BUILDING_HEIGHT = 10.0  # м, если нет данных (типичный 3-этажный дом)
-    MAX_DRONE_ALTITUDE = 120.0  # м, лимит для БВП в РФ
+    MAX_DRONE_ALTITUDE = 150.0  # м, ограничение максимальной высоты подъёма дрона
     MIN_FLIGHT_LEVEL = 40.0  # м, минимальный эшелон (выше типичной застройки)
     FLIGHT_LEVEL_MARGIN = 10.0  # м, запас над высочайшими зданиями
+    NUM_FLIGHT_LEVELS = 5  # количество эшелонов (5-й на MAX_DRONE_ALTITUDE)
 
     @staticmethod
     def _parse_osm_height(value) -> float | None:
@@ -1342,7 +1379,7 @@ class DataService:
     def _compute_flight_levels(
         self,
         buildings: gpd.GeoDataFrame,
-        num_levels: int = 4,
+        num_levels: int | None = None,
         max_altitude: float | None = None,
         min_altitude: float | None = None,
     ) -> list[dict]:
@@ -1351,14 +1388,15 @@ class DataService:
 
         Args:
             buildings: GeoDataFrame с колонкой height_m
-            num_levels: количество эшелонов (по умолчанию 4)
-            max_altitude: максимальная высота (м), по умолчанию MAX_DRONE_ALTITUDE
+            num_levels: количество эшелонов (по умолчанию NUM_FLIGHT_LEVELS, 5)
+            max_altitude: максимальная высота (м), по умолчанию MAX_DRONE_ALTITUDE (150)
             min_altitude: минимальная высота первого эшелона (м)
 
         Returns:
             Список dict: [{"level": 1, "altitude_m": 45, "label": "Эшелон 1"}, ...]
         """
-        max_alt = max_altitude or self.MAX_DRONE_ALTITUDE
+        num_levels = num_levels if num_levels is not None else self.NUM_FLIGHT_LEVELS
+        max_alt = max_altitude if max_altitude is not None else self.MAX_DRONE_ALTITUDE
         min_alt = min_altitude
 
         if buildings is not None and len(buildings) > 0 and 'height_m' in buildings.columns:
@@ -1390,10 +1428,11 @@ class DataService:
         self.logger.info(f"Эшелоны полётов: {[l['altitude_m'] for l in levels]}")
         return levels
 
-    def ensure_flight_levels(self, data: dict, num_levels: int = 4) -> dict:
+    def ensure_flight_levels(self, data: dict, num_levels: int | None = None) -> dict:
         """
         Добавляет в data поля buildings (с height_m), building_height_stats, flight_levels.
         Вызывать после загрузки/кэша для совместимости со старым кэшем.
+        По умолчанию 5 эшелонов, верхний на 150 м.
         """
         buildings = data.get('buildings')
         if buildings is None or len(buildings) == 0:
@@ -1418,7 +1457,9 @@ class DataService:
             }
         data['building_height_stats'] = stats
         data['flight_levels'] = self._compute_flight_levels(
-            buildings, num_levels=num_levels
+            buildings,
+            num_levels=num_levels if num_levels is not None else self.NUM_FLIGHT_LEVELS,
+            max_altitude=self.MAX_DRONE_ALTITUDE,
         )
         return data
     

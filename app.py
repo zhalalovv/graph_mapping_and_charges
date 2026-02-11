@@ -3,7 +3,7 @@ from typing import Optional
 import pickle
 import logging
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -351,7 +351,7 @@ def graph_geojson(
                 )
                 obstacles = graph_service._prepare_obstacles(None, no_fly_zones, 0.0001)
                 edges_geojson = graph_service.graph_to_geojson(
-                    delaunay_graph, obstacles=obstacles
+                    delaunay_graph, obstacles=obstacles, include_node_ids=True
                 )
                 stats = {
                     "nodes": len(delaunay_graph.nodes),
@@ -448,15 +448,17 @@ def graph_geojson(
                 }
                 road_features.append(f)
             free_fc = graph_service.graph_to_geojson(
-                merged_graph, edge_type_filter="free", obstacles=obstacles
+                merged_graph, edge_type_filter="free", obstacles=obstacles, include_node_ids=True
             )
             conn_fc = graph_service.graph_to_geojson(
-                merged_graph, edge_type_filter="connection", obstacles=obstacles
+                merged_graph, edge_type_filter="connection", obstacles=obstacles, include_node_ids=True
             )
             edges_geojson = {
                 "type": "FeatureCollection",
                 "features": road_features + free_fc["features"] + conn_fc["features"],
             }
+            if free_fc.get("nodes"):
+                edges_geojson["nodes"] = free_fc["nodes"]
             n_road = sum(1 for n in merged_graph.nodes() if not str(n).startswith("d_"))
             n_free = merged_graph.number_of_nodes() - n_road
             n_conn = sum(1 for _u, _v, d in merged_graph.edges(data=True) if d.get("edge_type") == "connection")
@@ -518,16 +520,19 @@ def graph_geojson(
                 import logging
                 logging.getLogger(__name__).warning(f"Ошибка создания GeoJSON беспилотных зон: {e}")
         
+        nodes = edges_geojson.get("nodes", [])
         return JSONResponse({
             "bbox": bbox,
             "center": {"lat": center_lat, "lon": center_lon},
             "edges": edges_geojson,
             "stats": stats,
             "graph_type": graph_type,
-            "city_boundary": city_boundary_geojson,  # Границы города для визуализации
-            "no_fly_zones": no_fly_zones_geojson,  # Беспилотные зоны для визуализации
-            "flight_levels": data.get("flight_levels", []),  # Эшелоны полётов
+            "city_boundary": city_boundary_geojson,
+            "no_fly_zones": no_fly_zones_geojson,
+            "flight_levels": data.get("flight_levels", []),
             "building_height_stats": data.get("building_height_stats", {}),
+            "nodes": nodes,
+            "multilevel_planning": bool(nodes),
         })
     except HTTPException:
         raise
@@ -535,6 +540,34 @@ def graph_geojson(
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/path")
+def compute_path_multilevel(
+    edges: dict = Body(..., description="edges GeoJSON с nodes и allowed_flight_levels"),
+    flight_levels: list = Body(..., description="Список эшелонов"),
+    source_node: str = Body(..., description="ID узла старта"),
+    target_node: str = Body(..., description="ID узла цели"),
+    source_level: Optional[int] = Body(None, description="Эшелон старта (опционально)"),
+    target_level: Optional[int] = Body(None, description="Эшелон цели (опционально)"),
+):
+    """
+    Строит маршрут с возможностью перехода между эшелонами (например, спуск с 2 на 1 для экономии батареи).
+    Возвращает путь как список (node_id, level) и 3D-кривую: высота плавно меняется вдоль сегментов.
+    """
+    if not edges.get("nodes"):
+        raise HTTPException(status_code=400, detail="Для расчёта маршрута нужны nodes в edges")
+    try:
+        G = graph_service.graph_from_geojson_with_nodes(edges)
+        path, curve = graph_service.shortest_path_multilevel(
+            G, edges, flight_levels,
+            source_node=source_node, target_node=target_node,
+            source_level=source_level, target_level=target_level,
+        )
+        return {"path": path, "path_3d_curve": curve}
+    except Exception as e:
+        logger.warning(f"Ошибка расчёта маршрута: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 def _ensure_static_mount():
