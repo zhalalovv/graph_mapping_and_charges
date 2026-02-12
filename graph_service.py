@@ -563,7 +563,19 @@ class GraphService:
             w = float(w) if w else 0.0
             G.add_edge(mu, mv, weight=w, length=w, edge_type="free")
         
-        # 5. Соединяем каждый узел Delaunay с ближайшим узлом дороги, если в пределах порога
+        # 4b. Дерево Delaunay-узлов для поиска ближайших к тупикам дорог
+        delaunay_coords = []
+        delaunay_merged_ids = []
+        for n, data in G.nodes(data=True):
+            if str(n).startswith(d_prefix):
+                lon, lat = data.get("lon"), data.get("lat")
+                if lon is not None and lat is not None:
+                    delaunay_coords.append((lon, lat))
+                    delaunay_merged_ids.append(n)
+        delaunay_tree = cKDTree(delaunay_coords) if delaunay_coords else None
+        
+        # 5. Соединяем каждый узел Delaunay с несколькими ближайшими узлами дороги (больше соединений)
+        k_road = min(5, len(road_node_ids))
         for merged_id, data in list(G.nodes(data=True)):
             if not str(merged_id).startswith(d_prefix):
                 continue
@@ -571,9 +583,15 @@ class GraphService:
             lat = data.get("lat")
             if lon is None or lat is None:
                 continue
-            dist_deg, idx_min = road_tree.query([lon, lat], k=1)
-            idx_min = int(np.atleast_1d(idx_min).flat[0])
-            if float(dist_deg) <= max_connection_distance_deg:
+            if k_road == 0:
+                break
+            dists_deg, indices = road_tree.query([lon, lat], k=k_road)
+            dists_deg = np.atleast_1d(dists_deg)
+            indices = np.atleast_1d(indices)
+            for dist_deg, idx_min in zip(dists_deg, indices):
+                if float(dist_deg) > max_connection_distance_deg:
+                    continue
+                idx_min = int(idx_min)
                 road_node = road_node_ids[idx_min]
                 road_lon, road_lat = road_coords_arr[idx_min, 0], road_coords_arr[idx_min, 1]
                 conn_line = LineString([(lon, lat), (road_lon, road_lat)])
@@ -586,6 +604,34 @@ class GraphService:
                     continue
                 dist_km = self._calculate_distance(lat, lon, road_lat, road_lon)
                 G.add_edge(merged_id, road_node, weight=dist_km, length=dist_km, edge_type="connection")
+        
+        # 5b. Тупики дорог (degree == 1): соединяем с ближайшим узлом Delaunay
+        dead_end_distance_deg = max_connection_distance_deg * 2.5  # больший радиус, чтобы тупик точно связался
+        road_degree = dict(road_graph.degree())
+        for i, road_node in enumerate(road_node_ids):
+            if road_degree.get(road_node, 0) != 1:
+                continue
+            if delaunay_tree is None:
+                break
+            lon_r, lat_r = road_coords_arr[i, 0], road_coords_arr[i, 1]
+            dist_deg, idx_d = delaunay_tree.query([lon_r, lat_r], k=1)
+            idx_d = int(np.atleast_1d(idx_d).flat[0])
+            if float(dist_deg) > dead_end_distance_deg:
+                continue
+            merged_d_id = delaunay_merged_ids[idx_d]
+            d_lon, d_lat = delaunay_coords[idx_d][0], delaunay_coords[idx_d][1]
+            if G.has_edge(merged_d_id, road_node):
+                continue
+            conn_line = LineString([(lon_r, lat_r), (d_lon, d_lat)])
+            if obstacles is not None and self._line_intersects_obstacles(conn_line, obstacles):
+                continue
+            if obstacles is not None and (
+                self._is_point_in_obstacles(Point(lon_r, lat_r), obstacles)
+                or self._is_point_in_obstacles(Point(d_lon, d_lat), obstacles)
+            ):
+                continue
+            dist_km = self._calculate_distance(lat_r, lon_r, d_lat, d_lon)
+            G.add_edge(merged_d_id, road_node, weight=dist_km, length=dist_km, edge_type="connection")
         
         # 6. Удаляем все рёбра (free, connection), проходящие над беспилотными зонами
         if obstacles is not None:
