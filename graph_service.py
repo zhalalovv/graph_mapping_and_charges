@@ -2,6 +2,7 @@ import numpy as np
 import networkx as nx
 from shapely.geometry import Point, LineString, Polygon
 from shapely.ops import unary_union, nearest_points
+from shapely.prepared import prep
 import geopandas as gpd
 from scipy.spatial import Delaunay, cKDTree
 from shapely.strtree import STRtree
@@ -28,6 +29,8 @@ class GraphService:
         add_perpendicular_edges: bool = True,
         max_perpendicular_distance_deg: float = 0.009,
         add_vertex_to_midpoint_edges: bool = True,
+        add_centroid_refinement: bool = True,
+        max_triangle_area_deg2: float = 0.00004,
     ) -> nx.Graph:
         """
         Создает граф на основе триангуляции Делоне по точкам высадки или центроидам зданий.
@@ -43,6 +46,8 @@ class GraphService:
             add_perpendicular_edges: добавлять перпендикуляры между противоположными рёбрами смежных треугольников
             max_perpendicular_distance_deg: макс. длина перпендикуляра в градусах (~0.009 ≈ 1000 м)
             add_vertex_to_midpoint_edges: добавлять рёбра от вершин в центр (середину) противолежащего ребра
+            add_centroid_refinement: делить крупные треугольники — добавлять узел в центр, соединять с вершинами
+            max_triangle_area_deg2: порог площади (deg²) — треугольники больше делятся (~4e-5 ≈ 0.5 км²)
             
         Returns:
             NetworkX граф
@@ -121,6 +126,11 @@ class GraphService:
         
         if add_vertex_to_midpoint_edges:
             G = self._add_vertex_to_midpoint_edges(G, points_arr, tri, obstacles)
+        
+        if add_centroid_refinement and max_triangle_area_deg2 > 0:
+            G = self._add_centroid_refinement(
+                G, points_arr, tri, obstacles, max_triangle_area_deg2
+            )
         
         G = self._remove_nodes_in_obstacles(G, obstacles)
         G = self._remove_edges_over_obstacles(G, obstacles)
@@ -402,7 +412,61 @@ class GraphService:
         if added > 0:
             self.logger.info(f"Добавлено {added} рёбер вершина->центр противолежащего ребра")
         return G
-    
+
+    def _add_centroid_refinement(
+        self,
+        G: nx.Graph,
+        points_arr: np.ndarray,
+        tri,
+        obstacles: Optional[Polygon],
+        max_area_deg2: float,
+    ) -> nx.Graph:
+        """
+        Делит крупные треугольники: добавляет узел в центроид и соединяет с вершинами.
+        Увеличивает вариации движения в разреженных зонах (вода, поля, леса).
+        """
+        def get_node_coords(n):
+            if n < len(points_arr):
+                return points_arr[n][0], points_arr[n][1]
+            d = G.nodes.get(n, {})
+            return d.get("lon", d.get("pos", (0, 0))[0]), d.get("lat", d.get("pos", (0, 0))[1])
+
+        next_node_id = max(G.nodes(), default=-1) + 1
+        added_nodes = 0
+        added_edges = 0
+
+        for simplex in tri.simplices:
+            a, b, c = simplex[0], simplex[1], simplex[2]
+            pa, pb, pc = points_arr[a], points_arr[b], points_arr[c]
+            try:
+                tri_poly = Polygon([pa, pb, pc])
+            except Exception:
+                continue
+            if not tri_poly.is_valid or tri_poly.is_empty:
+                continue
+            area_deg2 = tri_poly.area
+            if area_deg2 < max_area_deg2:
+                continue
+            centroid = tri_poly.centroid
+            cen_lon, cen_lat = centroid.x, centroid.y
+            if self._is_point_in_obstacles(centroid, obstacles):
+                continue
+            cen_id = next_node_id
+            next_node_id += 1
+            G.add_node(cen_id, lat=cen_lat, lon=cen_lon, pos=(cen_lon, cen_lat))
+            added_nodes += 1
+            for v in (a, b, c):
+                pv = get_node_coords(v)
+                line = LineString([(cen_lon, cen_lat), pv])
+                if not self._line_intersects_obstacles(line, obstacles) and not G.has_edge(cen_id, v):
+                    dist = self._calculate_distance(cen_lat, cen_lon, pv[1], pv[0])
+                    G.add_edge(cen_id, v, weight=dist, length=dist)
+                    added_edges += 1
+
+        if added_nodes > 0:
+            self.logger.info(f"Центроидная доработка: +{added_nodes} узлов, +{added_edges} рёбер (площадь>{max_area_deg2:.2e} deg²)")
+        return G
+
     def _prepare_obstacles(
         self,
         buildings: Optional[gpd.GeoDataFrame],
@@ -490,7 +554,192 @@ class GraphService:
             c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
         
         return R * c
-    
+
+    def poisson_disk_sample_in_polygon(
+        self,
+        polygon,
+        min_distance_deg: float,
+        max_points: int = 3000,
+        rng: Optional[np.random.Generator] = None,
+    ) -> List[Tuple[float, float]]:
+        """
+        Poisson-disk sampling внутри полигона (алгоритм Бридсона).
+        Возвращает список (lon, lat) в градусах.
+
+        Args:
+            polygon: Shapely Polygon или MultiPolygon
+            min_distance_deg: минимальное расстояние между точками в градусах (~0.0003 ≈ 30–35 м)
+            max_points: максимальное количество точек
+            rng: опциональный генератор случайных чисел
+        """
+        if polygon is None or polygon.is_empty or not polygon.is_valid:
+            return []
+        rng = rng or np.random.default_rng()
+        minx, miny, maxx, maxy = polygon.bounds
+        try:
+            prep_poly = prep(polygon)
+        except Exception:
+            prep_poly = polygon
+
+        def contains(pt):
+            try:
+                return prep_poly.contains(pt)
+            except Exception:
+                return polygon.contains(pt) if hasattr(polygon, "contains") else False
+
+        r = min_distance_deg
+        cell_size = r / np.sqrt(2)
+        cols = int(np.ceil((maxx - minx) / cell_size)) or 1
+        rows = int(np.ceil((maxy - miny) / cell_size)) or 1
+        grid = np.full((rows, cols), -1, dtype=np.int32)
+        points = []
+        active: List[int] = []
+
+        def grid_cell(lon, lat):
+            c = int((lon - minx) / cell_size)
+            rw = int((lat - miny) / cell_size)
+            c = max(0, min(c, cols - 1))
+            rw = max(0, min(rw, rows - 1))
+            return rw, c
+
+        def valid_point(lon, lat):
+            pt = Point(lon, lat)
+            if not contains(pt):
+                return False
+            rr, cc = grid_cell(lon, lat)
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    r2, c2 = rr + dr, cc + dc
+                    if 0 <= r2 < rows and 0 <= c2 < cols:
+                        idx = grid[r2, c2]
+                        if idx >= 0:
+                            px, py = points[idx][0], points[idx][1]
+                            if np.hypot(px - lon, py - lat) < r:
+                                return False
+            return True
+
+        candidates = []
+        for _ in range(30):
+            lon = minx + rng.random() * (maxx - minx)
+            lat = miny + rng.random() * (maxy - miny)
+            if contains(Point(lon, lat)):
+                candidates.append((lon, lat))
+                break
+        if not candidates:
+            return []
+        lon, lat = candidates[0]
+        points.append((lon, lat))
+        idx0 = len(points) - 1
+        rr, cc = grid_cell(lon, lat)
+        grid[rr, cc] = idx0
+        active.append(idx0)
+
+        k = 30
+        while active and len(points) < max_points:
+            i = rng.integers(0, len(active))
+            idx = active[i]
+            px, py = points[idx][0], points[idx][1]
+            found = False
+            for _ in range(k):
+                angle = rng.random() * 2 * np.pi
+                rad = r + rng.random() * r
+                nlon = px + rad * np.cos(angle)
+                nlat = py + rad * np.sin(angle)
+                if minx <= nlon <= maxx and miny <= nlat <= maxy and valid_point(nlon, nlat):
+                    points.append((nlon, nlat))
+                    new_idx = len(points) - 1
+                    rr, cc = grid_cell(nlon, nlat)
+                    grid[rr, cc] = new_idx
+                    active.append(new_idx)
+                    found = True
+                    break
+            if not found:
+                active[i] = active[-1]
+                active.pop()
+
+        self.logger.info(f"Poisson-disk: {len(points)} точек в свободном пространстве (min_dist={min_distance_deg:.6f}°)")
+        return points
+
+    def get_flyable_points(
+        self,
+        city_boundary,
+        buildings: Optional[gpd.GeoDataFrame] = None,
+        no_fly_zones: Optional[Union[gpd.GeoDataFrame, List]] = None,
+        building_buffer_deg: float = 0.00025,
+        min_distance_deg: float = 0.0003,
+        max_points: int = 3000,
+    ) -> List[Tuple[float, float]]:
+        """
+        Точки для полёта в свободном пространстве (леса, поля, парки) — Poisson-disk sampling.
+        Свободная зона = city_boundary - здания (с буфером) - no_fly_zones.
+
+        Returns:
+            Список (lon, lat) в градусах.
+        """
+        if city_boundary is None or (not hasattr(city_boundary, "is_valid") or not city_boundary.is_valid):
+            return []
+        try:
+            if city_boundary.geom_type == "MultiPolygon":
+                free_area = city_boundary
+            else:
+                free_area = city_boundary
+            geometries = []
+            if buildings is not None and len(buildings) > 0:
+                for geom in buildings.geometry:
+                    if geom is not None and geom.is_valid:
+                        geometries.append(geom.buffer(building_buffer_deg))
+            if no_fly_zones is not None:
+                if isinstance(no_fly_zones, gpd.GeoDataFrame) and len(no_fly_zones) > 0:
+                    for _, row in no_fly_zones.iterrows():
+                        if row.geometry is not None and row.geometry.is_valid:
+                            geometries.append(row.geometry.buffer(building_buffer_deg))
+                elif isinstance(no_fly_zones, list):
+                    for zone in no_fly_zones:
+                        g = getattr(zone, "geometry", zone)
+                        if g is not None and getattr(g, "is_valid", True):
+                            geometries.append(g.buffer(building_buffer_deg) if hasattr(g, "buffer") else g)
+            if geometries:
+                obstacles_union = unary_union(geometries)
+                if obstacles_union is not None and not obstacles_union.is_empty:
+                    free_area = free_area.difference(obstacles_union)
+            if free_area is None or free_area.is_empty:
+                return []
+            if free_area.geom_type == "MultiPolygon":
+                all_points = []
+                for poly in free_area.geoms:
+                    if poly.is_valid and not poly.is_empty and poly.area > 1e-12:
+                        pts = self.poisson_disk_sample_in_polygon(
+                            poly, min_distance_deg, max_points=max_points // max(1, len(free_area.geoms))
+                        )
+                        all_points.extend(pts)
+                return all_points[:max_points]
+            return self.poisson_disk_sample_in_polygon(free_area, min_distance_deg, max_points)
+        except Exception as e:
+            self.logger.warning(f"Ошибка get_flyable_points: {e}")
+            return []
+
+    def merge_points_min_distance(
+        self,
+        points_a: List[Tuple[float, float]],
+        points_b: List[Tuple[float, float]],
+        min_distance_deg: float,
+    ) -> List[Tuple[float, float]]:
+        """Объединяет точки, отбрасывая из points_b те, что ближе min_distance_deg к любой из points_a."""
+        if not points_b:
+            return list(points_a)
+        if not points_a:
+            return list(points_b)
+        arr_a = np.array(points_a)
+        tree = cKDTree(arr_a)
+        result = list(points_a)
+        for lon, lat in points_b:
+            d, _ = tree.query([lon, lat], k=1)
+            if d >= min_distance_deg:
+                result.append((lon, lat))
+                arr_a = np.vstack([arr_a, [[lon, lat]]])
+                tree = cKDTree(arr_a)
+        return result
+
     def merge_road_and_delaunay(
         self,
         road_graph: nx.Graph,

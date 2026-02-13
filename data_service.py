@@ -1467,7 +1467,7 @@ class DataService:
         """Возвращает Redis клиент для использования в других сервисах"""
         return self._redis
     
-    def generate_graph_cache_key(self, city_name: str, network_type: str, simplify: bool, 
+    def generate_graph_cache_key(self, city_name: str, network_type: str, simplify: bool,
                                  graph_type: str, grid_spacing: float, connect_diagonal: bool) -> str:
         """Генерирует ключ кэша для графа на основе всех параметров"""
         normalized_name = city_name.strip()
@@ -1479,5 +1479,7 @@ class DataService:
             f"{grid_spacing:.6f}".replace('.', '_'),
             str(int(bool(connect_diagonal)))
         ]
+        if graph_type in ("delaunay", "merged"):
+            key_parts.append("flyable_v2")
         key_suffix = "__".join(key_parts)
         return f"drone_planner:graph:{key_suffix}"

@@ -341,13 +341,23 @@ def graph_geojson(
                 delivery_points = []
                 if len(delivery_gdf) > 0:
                     delivery_points = [(float(row["delivery_lon"]), float(row["delivery_lat"])) for _, row in delivery_gdf.iterrows()]
+                flyable_points = graph_service.get_flyable_points(
+                    city_boundary=city_boundary,
+                    buildings=buildings,
+                    no_fly_zones=no_fly_zones,
+                    min_distance_deg=0.0003,
+                    max_points=2500,
+                )
+                all_points = graph_service.merge_points_min_distance(
+                    delivery_points, flyable_points, min_distance_deg=0.0002
+                )
                 delaunay_graph = graph_service.create_delaunay_graph(
                     bounds=bounds,
                     num_points=0,
-                    buildings=buildings if len(delivery_points) < 3 else None,
+                    buildings=buildings if len(all_points) < 3 else None,
                     no_fly_zones=no_fly_zones,
                     city_boundary=city_boundary,
-                    points=delivery_points if len(delivery_points) >= 3 else None,
+                    points=all_points if len(all_points) >= 3 else None,
                 )
                 obstacles = graph_service._prepare_obstacles(None, no_fly_zones, 0.0001)
                 edges_geojson = graph_service.graph_to_geojson(
@@ -414,18 +424,28 @@ def graph_geojson(
                 seen_road.add(key)
                 length = float(row.get('length') or row.get('weight') or 0)
                 G_road.add_edge(u, v, length=length, weight=length)
-            # Delaunay граф (как для graph_type == 'delaunay')
+            # Delaunay граф (delivery + flyable точки в лесах/полях)
             delivery_gdf = data_service.get_delivery_points(buildings, road_graph, city_boundary)
             delivery_points = []
             if len(delivery_gdf) > 0:
                 delivery_points = [(float(row["delivery_lon"]), float(row["delivery_lat"])) for _, row in delivery_gdf.iterrows()]
+            flyable_points = graph_service.get_flyable_points(
+                city_boundary=city_boundary,
+                buildings=buildings,
+                no_fly_zones=no_fly_zones,
+                min_distance_deg=0.0003,
+                max_points=2500,
+            )
+            all_points = graph_service.merge_points_min_distance(
+                delivery_points, flyable_points, min_distance_deg=0.0002
+            )
             delaunay_graph = graph_service.create_delaunay_graph(
                 bounds=bounds,
                 num_points=0,
-                buildings=buildings if len(delivery_points) < 3 else None,
+                buildings=buildings if len(all_points) < 3 else None,
                 no_fly_zones=no_fly_zones,
                 city_boundary=city_boundary,
-                points=delivery_points if len(delivery_points) >= 3 else None,
+                points=all_points if len(all_points) >= 3 else None,
             )
             obstacles = graph_service._prepare_obstacles(None, no_fly_zones, 0.0001)
             merged_graph = graph_service.merge_road_and_delaunay(
