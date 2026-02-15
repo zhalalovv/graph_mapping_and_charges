@@ -220,15 +220,16 @@ def graph_geojson(
     city: str = Query(..., description="Название города, как в /api/city"),
     network_type: str = Query('drive', description="Тип сети OSM"),
     simplify: bool = Query(True, description="Упрощение графа"),
-    graph_type: str = Query('road', description="Тип графа: road, delaunay"),
+    graph_type: str = Query('road', description="Тип графа: road, roads_only, delaunay, merged"),
     grid_spacing: float = Query(0.001, description="Размер ячейки сетки для Delaunay (в градусах)"),
 ):
     import logging
     logger = logging.getLogger(__name__)
     
     try:
-        # Загружаем (или берём из кэша) данные города
-        data = data_service.get_city_data(city, network_type=network_type, simplify=simplify)
+        # Загружаем (или берём из кэша) данные города. Для "Только дороги" не грузим беспилотные зоны.
+        load_no_fly = (graph_type != 'roads_only')
+        data = data_service.get_city_data(city, network_type=network_type, simplify=simplify, load_no_fly_zones=load_no_fly)
         road_graph = data.get("road_graph")
         if road_graph is None:
             raise HTTPException(status_code=404, detail="Граф не найден")
@@ -244,7 +245,7 @@ def graph_geojson(
         center_lon = (xmin + xmax) / 2.0
         
         # Если есть границы города, используем их для bounds и центра (только для не-road графов)
-        if graph_type != 'road' and city_boundary is not None:
+        if graph_type not in ('road', 'roads_only') and city_boundary is not None:
             try:
                 boundary_bounds = city_boundary.bounds
                 # Используем границы города вместо bounding box дорожного графа
@@ -256,7 +257,7 @@ def graph_geojson(
             except Exception as e:
                 import logging
                 logging.getLogger(__name__).warning(f"Ошибка использования границ города: {e}")
-        elif graph_type != 'road':
+        elif graph_type not in ('road', 'roads_only'):
             import logging
             logging.getLogger(__name__).warning("⚠ Границы города не найдены! Используется bounding box")
         
@@ -279,14 +280,11 @@ def graph_geojson(
             except Exception as e:
                 logger.warning(f"Ошибка чтения графа из Redis: {e}")
 
-        # Генерируем нужный тип графа
-        if graph_type == 'road':
-            # Только дорожный граф
-            # Для road графа используем данные из кэша города (не кэшируем отдельно)
-            # ОПТИМИЗАЦИЯ: фильтруем рёбра дорожного графа, которые пересекают беспилотные зоны
-            if no_fly_zones is not None:
+        # Генерируем нужный тип графа (roads_only — только дороги, без загрузки/фильтра по беспилотным зонам)
+        if graph_type in ('road', 'roads_only'):
+            # Фильтруем рёбра по беспилотным зонам только для типа "Дороги (OSM)"; для "Только дороги" — не трогаем
+            if graph_type == 'road' and no_fly_zones is not None:
                 try:
-                    # Создаем объединенную геометрию беспилотных зон
                     if isinstance(no_fly_zones, gpd.GeoDataFrame) and len(no_fly_zones) > 0:
                         no_fly_union = no_fly_zones.geometry.unary_union
                     elif isinstance(no_fly_zones, list) and len(no_fly_zones) > 0:
@@ -294,37 +292,23 @@ def graph_geojson(
                         no_fly_union = unary_union(no_fly_zones)
                     else:
                         no_fly_union = None
-                    
                     if no_fly_union is not None:
-                        # Фильтруем рёбра, которые пересекают беспилотные зоны
                         original_count = len(gdf_edges)
-                        # Проверяем пересечение каждого ребра с беспилотными зонами
                         mask = ~gdf_edges.geometry.intersects(no_fly_union)
-                        gdf_edges_filtered = gdf_edges[mask]
-                        filtered_count = len(gdf_edges_filtered)
-                        logger.info(f"Фильтрация дорожного графа: {original_count} -> {filtered_count} рёбер (удалено {original_count - filtered_count} в беспилотных зонах)")
-                        gdf_edges = gdf_edges_filtered
-                    else:
-                        pass  # Используем gdf_edges как есть
+                        gdf_edges = gdf_edges[mask]
+                        logger.info(f"Фильтрация дорожного графа: {original_count} -> {len(gdf_edges)} рёбер (удалено в беспилотных зонах)")
                 except Exception as e:
                     logger.warning(f"Ошибка фильтрации дорожного графа по беспилотным зонам: {e}")
-                    # Продолжаем с исходными рёбрами
-                
-                # Отправляем ВСЕ рёбра без ограничений
-                try:
-                    edges_geojson = json.loads(gdf_edges.to_json())
-                    logger.info(f"Отправлено {len(gdf_edges)} рёбер дорожного графа")
-                except Exception as e:
-                    logger.error(f"Ошибка конвертации рёбер в GeoJSON: {e}")
-                    raise
-            else:
-                # Отправляем ВСЕ рёбра без ограничений
-                try:
-                    edges_geojson = json.loads(gdf_edges.to_json())
-                    logger.info(f"Отправлено {len(gdf_edges)} рёбер дорожного графа")
-                except Exception as e:
-                    logger.error(f"Ошибка конвертации рёбер в GeoJSON: {e}")
-                    raise
+            try:
+                edges_geojson = json.loads(gdf_edges.to_json())
+                for f in edges_geojson.get("features", []):
+                    p = f.get("properties") or {}
+                    p["edge_type"] = "road"
+                    f["properties"] = p
+                logger.info(f"Отправлено {len(gdf_edges)} рёбер дорожного графа")
+            except Exception as e:
+                logger.error(f"Ошибка конвертации рёбер в GeoJSON: {e}")
+                raise
             stats = data.get("stats", {})
             
         elif graph_type == 'delaunay':
@@ -539,6 +523,10 @@ def graph_geojson(
             except Exception as e:
                 import logging
                 logging.getLogger(__name__).warning(f"Ошибка создания GeoJSON беспилотных зон: {e}")
+        
+        # Тип "Только дороги" — не отдаём беспилотные зоны; границы города оставляем для ориентира
+        if graph_type == 'roads_only':
+            no_fly_zones_geojson = None
         
         nodes = edges_geojson.get("nodes", [])
         return JSONResponse({

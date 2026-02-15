@@ -178,6 +178,7 @@
                 Тип графа
                 <select id="graphType" style="width:100%">
                     <option value="road">Дороги (OSM)</option>
+                    <option value="roads_only">Только дороги</option>
                     <option value="delaunay">Delaunay триангуляция</option>
                     <option value="merged">Объединённый (дороги + Delaunay)</option>
                 </select>
@@ -224,10 +225,18 @@
                 <span><span class="swatch" style="background:#ef4444"></span> &gt;50 м</span>
             </div>
         </div>
+        <div id="roadTypeLegend" class="flight-levels-panel" style="display:none; margin-top:8px">
+            <h3 style="margin:0 0 8px">Дороги по типу (скорость)</h3>
+            <div style="display:flex; flex-direction:column; gap:4px; font-size:12px">
+                <span><span class="swatch" style="background:#dc2626; display:inline-block; width:12px; height:4px; vertical-align:middle"></span> trunk — 80 км/ч</span>
+                <span><span class="swatch" style="background:#f59e0b; display:inline-block; width:12px; height:4px; vertical-align:middle"></span> primary, secondary — 60 км/ч</span>
+                <span><span class="swatch" style="background:#10b981; display:inline-block; width:12px; height:4px; vertical-align:middle"></span> tertiary — 40 км/ч</span>
+            </div>
+        </div>
         <div id="edgeLegend" class="flight-levels-panel" style="display:none; margin-top:8px">
             <h3 style="margin:0 0 8px">Типы рёбер</h3>
             <div style="display:flex; flex-direction:column; gap:4px; font-size:12px">
-                <span><span class="swatch" style="background:#2563eb; display:inline-block; width:12px; height:4px; vertical-align:middle"></span> Дороги (OSM)</span>
+                <span><span class="swatch" style="background:#0ea5e9; display:inline-block; width:12px; height:4px; vertical-align:middle"></span> Дороги (OSM)</span>
                 <span><span class="swatch" style="background:#10b981; display:inline-block; width:12px; height:4px; vertical-align:middle"></span> Delaunay</span>
                 <span><span class="swatch" style="background:#f59e0b; display:inline-block; width:12px; height:4px; vertical-align:middle"></span> Соединения дорога–Delaunay</span>
             </div>
@@ -292,9 +301,19 @@
             return value;
         }
 
+        /** Цвет дороги по типу highway: trunk 80 км/ч, primary/secondary 60, tertiary 40 */
+        function getRoadColorByHighway(highway) {
+            const raw = Array.isArray(highway) ? (highway[0] || '') : (highway || '');
+            const h = String(raw).toLowerCase();
+            if (h === 'trunk' || h === 'trunk_link') return '#dc2626';   // 80 км/ч — красный
+            if (h === 'primary' || h === 'primary_link' || h === 'secondary' || h === 'secondary_link') return '#f59e0b'; // 60 км/ч — оранжевый
+            if (h === 'tertiary' || h === 'tertiary_link') return '#10b981'; // 40 км/ч — зелёный
+            return '#6b7280'; // прочие — серый
+        }
+
         function getEdgeColor(edgeType) {
             switch(edgeType) {
-                case 'road': return '#2563eb';      // синий для дорог
+                case 'road': return '#0ea5e9';      // fallback для дорог (если нет highway)
                 case 'free': return '#10b981';      // зеленый для свободного пространства
                 case 'connection': return '#f59e0b'; // оранжевый для соединений
                 default: return '#6b7280';          // серый по умолчанию
@@ -380,8 +399,12 @@
             const showByEchelon = (type === 'delaunay' || type === 'merged') && !flightLevelFilter && features.length > 0;
             return L.geoJSON(geojson, {
                 style: function(feature) {
-                    const edgeType = feature.properties?.edge_type || 'unknown';
+                    const graphType = graphData?.graph_type;
+                    const edgeType = feature.properties?.edge_type || (graphType === 'road' || graphType === 'roads_only' ? 'road' : 'unknown');
                     let color = getEdgeColor(edgeType);
+                    if (edgeType === 'road' && feature.properties?.highway) {
+                        color = getRoadColorByHighway(feature.properties.highway);
+                    }
                     if (showByEchelon) {
                         const allowed = feature.properties?.allowed_flight_levels;
                         if (Array.isArray(allowed) && allowed.length > 0) {
@@ -406,8 +429,10 @@
                         const p = feature.properties;
                         const allowed = p.allowed_flight_levels;
                         const allowedStr = Array.isArray(allowed) ? allowed.join(', ') : '—';
+                        const hw = Array.isArray(p.highway) ? (p.highway[0] || '') : (p.highway || '');
+                        const speed = (hw === 'trunk' || hw === 'trunk_link') ? '80' : (hw === 'tertiary' || hw === 'tertiary_link') ? '40' : (hw === 'primary' || hw === 'primary_link' || hw === 'secondary' || hw === 'secondary_link') ? '60' : '—';
                         layer.bindPopup(`
-                            Тип: ${p.edge_type || 'unknown'}<br>
+                            Тип: ${p.edge_type || 'unknown'}${hw ? `<br>highway: ${hw}${speed !== '—' ? ` (${speed} км/ч)` : ''}` : ''}<br>
                             Длина: ${(p.length || 0).toFixed(4)} км<br>
                             Эшелоны: ${allowedStr}
                         `);
@@ -582,6 +607,8 @@
                 }
                 const edgeLegendEl = document.getElementById('edgeLegend');
                 if (edgeLegendEl) edgeLegendEl.style.display = graphType === 'merged' ? 'block' : 'none';
+                const roadTypeLegendEl = document.getElementById('roadTypeLegend');
+                if (roadTypeLegendEl) roadTypeLegendEl.style.display = (graphType === 'road' || graphType === 'roads_only') ? 'block' : 'none';
 
                 ensureMap([graphData.center.lat, graphData.center.lon]);
                 
@@ -630,19 +657,16 @@
                     }).addTo(map);
                 }
 
-                // Загружаем здания с высотами (полигоны, окраска по высоте)
-                try {
-                    console.log('Начало загрузки зданий с высотами...');
-                    await loadBuildingsWithHeights(city, network, simplify);
-                    console.log('✓ Здания по высоте загружены');
-                } catch (err) {
-                    console.error('ОШИБКА загрузки зданий:', err);
-                    console.error('Детали ошибки:', {
-                        name: err.name,
-                        message: err.message,
-                        stack: err.stack
-                    });
-                    statusEl.textContent = '✓ Готово (ошибка загрузки зданий: ' + err.message + ')';
+                // Здания только для типов, где нужна полная карта (не для "Только дороги")
+                if (graphType !== 'roads_only') {
+                    try {
+                        console.log('Начало загрузки зданий с высотами...');
+                        await loadBuildingsWithHeights(city, network, simplify);
+                        console.log('✓ Здания по высоте загружены');
+                    } catch (err) {
+                        console.error('ОШИБКА загрузки зданий:', err);
+                        statusEl.textContent = '✓ Готово (ошибка загрузки зданий: ' + err.message + ')';
+                    }
                 }
                 
                 const flightFilter = document.getElementById('flightLevelFilter')?.value || '';

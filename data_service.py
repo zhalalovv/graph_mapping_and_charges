@@ -57,10 +57,12 @@ class DataService:
         for callback in self.progress_callbacks:
             callback(stage, percentage, message)
     
-    def get_city_data(self, city_name: str, network_type: str = 'drive', simplify: bool = True):
-        """Получение данных города (универсально для любой страны)"""
+    def get_city_data(self, city_name: str, network_type: str = 'drive', simplify: bool = True, load_no_fly_zones: bool = True):
+        """Получение данных города (универсально для любой страны). load_no_fly_zones=False — только дороги, без загрузки беспилотных зон."""
         normalized_name = city_name.strip()
-        key_suffix = f"{self._sanitize_name(normalized_name)}__{self._sanitize_name(network_type)}__{int(bool(simplify))}"
+        # Для совместимости: при load_no_fly_zones=True ключ без суффикса (старый кэш); при False — __nofly0
+        base_suffix = f"{self._sanitize_name(normalized_name)}__{self._sanitize_name(network_type)}__{int(bool(simplify))}"
+        key_suffix = base_suffix if load_no_fly_zones else f"{base_suffix}__nofly0"
         cache_file = os.path.join(self.cache_dir, f"{key_suffix}.pkl")
         redis_key = f"drone_planner:city:{key_suffix}"
         
@@ -89,41 +91,78 @@ class DataService:
                 if 'city_boundary' not in cached_data:
                     self.logger.info("В кэше нет границ города, перезагружаем данные")
                     os.remove(cache_file)
-                    return self._download_city_data(normalized_name, cache_file, redis_key, network_type=network_type, simplify=simplify)
+                    return self._download_city_data(normalized_name, cache_file, redis_key, network_type=network_type, simplify=simplify, load_no_fly_zones=load_no_fly_zones)
                 return self.ensure_flight_levels(cached_data)
             except Exception as e:
                 self.logger.warning(f"Ошибка загрузки кэша: {e}, перезагружаем данные")
                 os.remove(cache_file)
         
-        return self._download_city_data(normalized_name, cache_file, redis_key, network_type=network_type, simplify=simplify)
+        return self._download_city_data(normalized_name, cache_file, redis_key, network_type=network_type, simplify=simplify, load_no_fly_zones=load_no_fly_zones)
     
-    def _download_city_data(self, city_name, cache_file, redis_key: str | None = None, *, network_type: str = 'drive', simplify: bool = True):
+    def _download_city_data(self, city_name, cache_file, redis_key: str | None = None, *, network_type: str = 'drive', simplify: bool = True, load_no_fly_zones: bool = True):
         self._update_progress("download", 0, "Начало загрузки данных")
         
         try:
-            self._update_progress("download", 20, "Загрузка дорожной сети")
-            road_graph = None
-            query_variants = [
-                city_name,
-                city_name.replace(", ", ","),
-                city_name.split(",")[0].strip() if "," in city_name else None,
-            ]
-            for q in query_variants:
-                if not q:
-                    continue
-                for which in [1, 2, 3]:
-                    try:
-                        road_graph = ox.graph_from_place(q, network_type=network_type, simplify=simplify, which_result=which)
-                        if road_graph is not None and len(road_graph.nodes) > 0:
-                            self.logger.info(f"Успешно загружена дорожная сеть для: {q} (which_result={which})")
-                            break
-                    except Exception as e:
-                        self.logger.warning(f"Не удалось загрузить для '{q}' which_result={which}: {e}")
-                        continue
-                if road_graph is not None and len(road_graph.nodes) > 0:
-                    break
+            self._update_progress("download", 15, "Получение границ города для загрузки дорог")
+            # Сначала получаем границу города, чтобы грузить дороги по ней (все дороги, пересекающие границу, в т.ч. в отдалённых участках и слегка выходящие за границу)
+            boundary_for_roads = None
+            try:
+                gdf_place = ox.geocode_to_gdf(city_name)
+                if len(gdf_place) > 0 and gdf_place.geometry.iloc[0] is not None:
+                    boundary_for_roads = gdf_place.geometry.iloc[0]
+                    if boundary_for_roads.is_valid and boundary_for_roads.geom_type in ['Polygon', 'MultiPolygon']:
+                        self.logger.info(f"Граница для загрузки дорог: {boundary_for_roads.geom_type} (geocode_to_gdf)")
+            except Exception as e:
+                self.logger.debug(f"geocode_to_gdf для границы: {e}")
+            if boundary_for_roads is None:
+                try:
+                    boundary_gdf = ox.features_from_place(city_name, tags={"boundary": "administrative"})
+                    if len(boundary_gdf) > 0:
+                        largest_idx = boundary_gdf.geometry.area.idxmax()
+                        boundary_for_roads = boundary_gdf.geometry.iloc[largest_idx]
+                        if boundary_for_roads.is_valid and boundary_for_roads.geom_type in ['Polygon', 'MultiPolygon']:
+                            self.logger.info(f"Граница для загрузки дорог: {boundary_for_roads.geom_type} (administrative)")
+                except Exception as e:
+                    self.logger.debug(f"features_from_place boundary для границы: {e}")
             
-            # Fallback 1: геокодируем и загружаем по bbox
+            self._update_progress("download", 20, "Загрузка дорожной сети")
+            road_filter = '["highway"~"trunk|primary|secondary|tertiary"]'
+            road_graph = None
+            # 1) Загрузка по полигону границы с буфером — чтобы дороги, чуть выходящие за границу, не обрезались OSMnx
+            # Буфер ~0.002° (~200–250 м) даёт запас: граф грузится по расширенной области, отрисовка границы — по исходной
+            if boundary_for_roads is not None:
+                try:
+                    buffer_deg = 0.002
+                    boundary_buffered = boundary_for_roads.buffer(buffer_deg) if boundary_for_roads.is_valid else boundary_for_roads
+                    road_graph = ox.graph_from_polygon(boundary_buffered, custom_filter=road_filter, simplify=simplify)
+                    if road_graph is not None and len(road_graph.nodes) > 0:
+                        self.logger.info(f"Успешно загружена дорожная сеть по границе города (с буфером {buffer_deg}°), узлов: {len(road_graph.nodes)}")
+                except Exception as e:
+                    self.logger.warning(f"Загрузка дорог по полигону не удалась: {e}, пробуем по названию места")
+            
+            # 2) Fallback: по названию места
+            if road_graph is None or len(road_graph.nodes) == 0:
+                query_variants = [
+                    city_name,
+                    city_name.replace(", ", ","),
+                    city_name.split(",")[0].strip() if "," in city_name else None,
+                ]
+                for q in query_variants:
+                    if not q:
+                        continue
+                    for which in [1, 2, 3]:
+                        try:
+                            road_graph = ox.graph_from_place(q, custom_filter=road_filter, simplify=simplify, which_result=which)
+                            if road_graph is not None and len(road_graph.nodes) > 0:
+                                self.logger.info(f"Успешно загружена дорожная сеть для: {q} (which_result={which})")
+                                break
+                        except Exception as e:
+                            self.logger.warning(f"Не удалось загрузить для '{q}' which_result={which}: {e}")
+                            continue
+                    if road_graph is not None and len(road_graph.nodes) > 0:
+                        break
+            
+            # Fallback 2: геокодируем и загружаем по bbox
             if road_graph is None or len(road_graph.nodes) == 0:
                 try:
                     gdf_place = ox.geocode_to_gdf(city_name)
@@ -133,18 +172,18 @@ class DataService:
                         if len(bbox) >= 4:
                             north, south = bbox[3], bbox[1]
                             east, west = bbox[2], bbox[0]
-                            road_graph = ox.graph_from_bbox(north, south, east, west, network_type=network_type, simplify=simplify)
+                            road_graph = ox.graph_from_bbox(north, south, east, west, custom_filter=road_filter, simplify=simplify)
                             if road_graph is not None and len(road_graph.nodes) > 0:
                                 self.logger.info(f"Успешно загружена дорожная сеть по bbox геокодинга: {city_name}")
                 except Exception as e:
                     self.logger.warning(f"Fallback geocode+bbox не сработал: {e}")
             
-            # Fallback 2: геокодируем точку и загружаем по радиусу (~10 км)
+            # Fallback 3: геокодируем точку и загружаем по радиусу (~10 км)
             if road_graph is None or len(road_graph.nodes) == 0:
                 try:
                     loc = self.geolocators['nominatim'].geocode(city_name)
                     if loc and loc.latitude and loc.longitude:
-                        road_graph = ox.graph_from_point((loc.latitude, loc.longitude), dist=10000, network_type=network_type, simplify=simplify)
+                        road_graph = ox.graph_from_point((loc.latitude, loc.longitude), dist=10000, custom_filter=road_filter, simplify=simplify)
                         if road_graph is not None and len(road_graph.nodes) > 0:
                             self.logger.info(f"Успешно загружена дорожная сеть по точке+радиусу: {city_name}")
                 except Exception as e:
@@ -154,24 +193,24 @@ class DataService:
                 raise Exception(f"Не удалось загрузить дорожную сеть для города: {city_name}")
             
             self._update_progress("download", 40, "Загрузка границ города")
-            city_boundary = None
-            
-            # Сначала получаем узлы дорожного графа для fallback
             gdf_nodes, _ = ox.graph_to_gdfs(road_graph)
+            # Используем границу, по которой грузили дороги (чтобы отрисовка границы совпадала с областью загрузки)
+            city_boundary = boundary_for_roads if boundary_for_roads is not None else None
             
             try:
-                # Метод 1: Пробуем получить границы через geocode_to_gdf (самый точный)
-                try:
-                    gdf_place = ox.geocode_to_gdf(city_name)
-                    if len(gdf_place) > 0 and gdf_place.geometry.iloc[0] is not None:
-                        city_boundary = gdf_place.geometry.iloc[0]
-                        if city_boundary.is_valid and city_boundary.geom_type in ['Polygon', 'MultiPolygon']:
-                            self.logger.info(f"✓ Загружены границы города через geocode_to_gdf: {city_boundary.geom_type}")
-                        else:
-                            city_boundary = None
-                            self.logger.warning("Границы из geocode_to_gdf невалидны")
-                except Exception as e:
-                    self.logger.warning(f"geocode_to_gdf не сработал: {e}")
+                if city_boundary is None:
+                    # Метод 1: Пробуем получить границы через geocode_to_gdf (самый точный)
+                    try:
+                        gdf_place = ox.geocode_to_gdf(city_name)
+                        if len(gdf_place) > 0 and gdf_place.geometry.iloc[0] is not None:
+                            city_boundary = gdf_place.geometry.iloc[0]
+                            if city_boundary.is_valid and city_boundary.geom_type in ['Polygon', 'MultiPolygon']:
+                                self.logger.info(f"✓ Загружены границы города через geocode_to_gdf: {city_boundary.geom_type}")
+                            else:
+                                city_boundary = None
+                                self.logger.warning("Границы из geocode_to_gdf невалидны")
+                    except Exception as e:
+                        self.logger.warning(f"geocode_to_gdf не сработал: {e}")
                 
                 # Метод 2: Если не получилось, пробуем через features_from_place
                 if city_boundary is None:
@@ -242,8 +281,8 @@ class DataService:
             except Exception as e:
                 self.logger.warning(f"Не удалось загрузить здания: {e}")
             
-            self._update_progress("download", 80, "Загрузка запретных зон")
-            no_fly_zones = self._get_no_fly_zones(city_name, buildings)
+            self._update_progress("download", 80, "Загрузка запретных зон" if load_no_fly_zones else "Пропуск беспилотных зон (только дороги)")
+            no_fly_zones = self._get_no_fly_zones(city_name, buildings) if load_no_fly_zones else []
             
             data = {
                 'road_graph': road_graph,
@@ -308,14 +347,14 @@ class DataService:
         """
         no_fly_zones = []
         # Радиус буфера для точек (когда в OSM нет контура и не найден nearby building)
-        BUFFER_RADIUS_DEGREES = 0.0005  # ~55 метров
-        # Радиус поиска здания рядом с точкой (~80 м)
-        POINT_SEARCH_BUFFER_DEG = 0.0008
+        BUFFER_RADIUS_DEGREES = 0.0002  # ~39 метров (урезано с ~55 м)
+        # Радиус поиска здания рядом с точкой (~55 м)
+        POINT_SEARCH_BUFFER_DEG = 0.0005
         
         def zone_from_geometry(geom, use_building_perimeter: bool = True):
             """
             Полигоны берём по границам из OSM. Для точек — ищем здание поблизости
-            и используем его периметр; если не найдено — круг ~55 м.
+            и используем его периметр; если не найдено — круг ~39 м.
             """
             if geom.geom_type in ("Polygon", "MultiPolygon"):
                 return geom
