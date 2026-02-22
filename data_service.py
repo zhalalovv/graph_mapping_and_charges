@@ -334,13 +334,14 @@ class DataService:
         1. Аэропорты и аэродромы
         2. Военные объекты
         3. Атомные и правительственные объекты
-        4. Явные запретные зоны (restriction:drone=no)
-        5. Парки и зоны отдыха (leisure=park, landuse=recreation_ground)
-        6. Школы, детсады, университеты, колледжи, техникумы (amenity + building из OSM)
-        7. Больницы (по границам из OSM)
-        8. Поликлиники и клиники (amenity=clinic, healthcare=clinic)
-        9. Заправки (amenity=fuel)
-        10. Вокзалы (railway=station)
+        4. Электростанции (ГЭС, ТЭЦ, АЭС, power=plant/station, man_made=hydroelectric_plant)
+        5. Явные запретные зоны (restriction:drone=no)
+        6. Парки и зоны отдыха (leisure=park, landuse=recreation_ground)
+        7. Школы, детсады, университеты, колледжи, техникумы (amenity + building из OSM)
+        8. Больницы (по границам из OSM)
+        9. Поликлиники и клиники (amenity=clinic, healthcare=clinic)
+        10. Заправки (amenity=fuel)
+        11. Вокзалы (railway=station)
         
         Returns:
             GeoDataFrame или список беспилотных зон
@@ -450,7 +451,24 @@ class DataService:
             except Exception as e:
                 self.logger.warning(f"Ошибка загрузки атомных объектов: {e}")
             
-            # 4. Правительственные объекты (опционально, меньший буфер)
+            # 4. Электростанции: ГЭС, ТЭЦ, АЭС и подобные (power=plant, power=station, гидро)
+            for tag_dict, label in [
+                ({"power": "plant"}, "power=plant (ТЭЦ, ГЭС и др.)"),
+                ({"power": "station"}, "power=station"),
+                ({"man_made": "hydroelectric_plant"}, "man_made=hydroelectric_plant (ГЭС)"),
+            ]:
+                try:
+                    power_objs = ox.features_from_place(city_name, tags=tag_dict)
+                    if len(power_objs) > 0:
+                        self.logger.info(f"Найдено {len(power_objs)} объектов: {label}")
+                        for idx, obj in power_objs.iterrows():
+                            if obj.geometry is not None and obj.geometry.is_valid:
+                                no_fly_zones.append(zone_from_geometry(obj.geometry))
+                except Exception as e:
+                    if "No data elements" not in str(e):
+                        self.logger.warning(f"Ошибка загрузки {label}: {e}")
+            
+            # 5. Правительственные объекты (опционально, меньший буфер)
             try:
                 government = ox.features_from_place(
                     city_name,
@@ -469,7 +487,7 @@ class DataService:
             except Exception as e:
                 self.logger.warning(f"Ошибка загрузки правительственных объектов: {e}")
             
-            # 5. Явные запретные зоны из OSM (если есть теги)
+            # 6. Явные запретные зоны из OSM (если есть теги)
             try:
                 restricted = ox.features_from_place(
                     city_name,
@@ -488,7 +506,7 @@ class DataService:
             except Exception as e:
                 self.logger.warning(f"Ошибка загрузки запретных зон: {e}")
             
-            # 6. Парки и зоны отдыха
+            # 7. Парки и зоны отдыха
             try:
                 parks = ox.features_from_place(
                     city_name,
@@ -514,7 +532,7 @@ class DataService:
             except Exception as e:
                 self.logger.warning(f"Ошибка загрузки зон отдыха: {e}")
             
-            # 7. Школы, детсады, университеты, колледжи, техникумы
+            # 8. Школы, детсады, университеты, колледжи, техникумы
             try:
                 education = ox.features_from_place(
                     city_name,
@@ -527,7 +545,7 @@ class DataService:
                             no_fly_zones.append(zone_from_geometry(obj.geometry))
             except Exception as e:
                 self.logger.warning(f"Ошибка загрузки объектов образования: {e}")
-            # 7b. Здания колледжей/школ по тегу building (техникумы, училища и т.д.)
+            # 8b. Здания колледжей/школ по тегу building (техникумы, училища и т.д.)
             try:
                 edu_buildings = ox.features_from_place(
                     city_name,
@@ -541,7 +559,7 @@ class DataService:
             except Exception as e:
                 self.logger.warning(f"Ошибка загрузки зданий образования: {e}")
             
-            # 8. Больницы
+            # 9. Больницы
             try:
                 hospitals = ox.features_from_place(
                     city_name,
@@ -555,7 +573,7 @@ class DataService:
             except Exception as e:
                 self.logger.warning(f"Ошибка загрузки больниц: {e}")
             
-            # 8b. Поликлиники и клиники (включая детские)
+            # 9b. Поликлиники и клиники (включая детские)
             for tag_dict, label in [
                 ({"amenity": "clinic"}, "amenity=clinic"),
                 ({"healthcare": "clinic"}, "healthcare=clinic"),
@@ -571,7 +589,7 @@ class DataService:
                     if "No data elements" not in str(e):
                         self.logger.warning(f"Ошибка загрузки {label}: {e}")
             
-            # 9. Заправки (АЗС)
+            # 10. Заправки (АЗС)
             try:
                 fuel = ox.features_from_place(
                     city_name,
@@ -585,7 +603,7 @@ class DataService:
             except Exception as e:
                 self.logger.warning(f"Ошибка загрузки заправок: {e}")
             
-            # 10. Вокзалы (железнодорожные станции)
+            # 11. Вокзалы (железнодорожные станции)
             try:
                 stations = ox.features_from_place(
                     city_name,
@@ -630,6 +648,330 @@ class DataService:
         
         return []
     
+    # --- Кандидаты размещения станций (Шаг A) и точки спроса (Шаг B) ---
+    # η=0.8: R_cov=0.4*D_max (зарядка/ожидание), R_reach=0.8*D_max (гараж/ТО, one-way)
+    # FlyCart 30: D_max=16 км → R_cov=6.4 км, R_reach=12.8 км (базовые для универсальной сети)
+    NO_FLY_BUFFER_DEGREES_PER_M = 0.000009  # ~1 м в градусах на широте ~55
+    ROOF_MIN_AREA_M2 = 80.0  # минимальная площадь крыши для крышной зарядки
+    GROUND_MIN_AREA_M2 = 100.0  # минимальная площадка для наземной зарядки
+    # Крышные зарядки: МКД + коммерция/офисы, чтобы покрыть весь город (доступ отовсюду)
+    ALLOWED_ROOF_BUILDING_TAGS = frozenset((
+        'apartments', 'apartment', 'apartment_block', 'multistory', 'block', 'flats',
+        'semidetached_house', 'dormitory', 'hotel',
+        'commercial', 'office', 'retail', 'supermarket', 'civic', 'public', 'service',
+    ))
+
+    def _load_industrial_and_parking_areas(self, bbox_osm, crs_4326):
+        """
+        Загружает полигоны промзон и парковок/площадок из OSM по bbox.
+        bbox_osm: (north, south, east, west).
+        Returns: dict with 'industrial': list of Shapely polygons (4326), 'parking': list of (centroid Point or polygon).
+        """
+        north, south, east, west = bbox_osm
+        industrial = []
+        parking = []
+        try:
+            # Промзоны: landuse=industrial, warehouse; здания industrial/warehouse
+            for tags in (
+                {"landuse": ["industrial", "warehouse"]},
+                {"building": ["industrial", "warehouse", "factory", "manufacture"]},
+            ):
+                gdf = ox.features_from_bbox(bbox=(north, south, east, west), tags=tags)
+                if gdf is not None and len(gdf) > 0:
+                    if gdf.crs is None:
+                        gdf = gdf.set_crs("EPSG:4326")
+                    gdf = gdf.to_crs(crs_4326)
+                    for _, row in gdf.iterrows():
+                        g = row.geometry
+                        if g is None or not getattr(g, "is_valid", True):
+                            continue
+                        if g.geom_type == "Polygon":
+                            industrial.append(g)
+                        elif g.geom_type == "MultiPolygon":
+                            for poly in g.geoms:
+                                if poly.is_valid and not poly.is_empty:
+                                    industrial.append(poly)
+        except Exception as e:
+            self.logger.warning(f"Загрузка промзон OSM: {e}")
+        try:
+            # Парковки и площадки: amenity=parking, landuse=commercial (часто с парковками)
+            for tags in (
+                {"amenity": "parking"},
+                {"parking": True},
+            ):
+                gdf = ox.features_from_bbox(bbox=(north, south, east, west), tags=tags)
+                if gdf is not None and len(gdf) > 0:
+                    if gdf.crs is None:
+                        gdf = gdf.set_crs("EPSG:4326")
+                    gdf = gdf.to_crs(crs_4326)
+                    for _, row in gdf.iterrows():
+                        g = row.geometry
+                        if g is None or not getattr(g, "is_valid", True):
+                            continue
+                        if g.geom_type == "Point":
+                            parking.append(g)
+                        else:
+                            try:
+                                c = g.centroid
+                                if not c.is_empty:
+                                    parking.append(c)
+                            except Exception:
+                                pass
+        except Exception as e:
+            self.logger.warning(f"Загрузка парковок OSM: {e}")
+        return {"industrial": industrial, "parking": parking}
+
+    def _building_footprint_area_m2(self, buildings: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+        """Добавляет колонку area_m2 — площадь footprint здания в м² (в UTM)."""
+        if buildings is None or len(buildings) == 0:
+            return buildings
+        try:
+            crs_utm = buildings.estimate_utm_crs()
+            b_utm = buildings.to_crs(crs_utm)
+            areas = [float(g.area) if g is not None and g.is_valid else 0.0 for g in b_utm.geometry]
+            out = buildings.copy()
+            out["area_m2"] = areas
+            return out
+        except Exception as e:
+            self.logger.warning(f"Расчёт площади зданий: {e}")
+            out = buildings.copy()
+            out["area_m2"] = 0.0
+            return out
+
+    def _point_outside_no_fly(self, pt, no_fly_zones, buffer_deg: float) -> bool:
+        """True, если точка вне всех no-fly зон с заданным буфером."""
+        if no_fly_zones is None:
+            return True
+        if isinstance(no_fly_zones, gpd.GeoDataFrame) and no_fly_zones.empty:
+            return True
+        if isinstance(no_fly_zones, list) and len(no_fly_zones) == 0:
+            return True
+        try:
+            geoms = []
+            if isinstance(no_fly_zones, gpd.GeoDataFrame) and len(no_fly_zones) > 0:
+                geoms = list(no_fly_zones.geometry)
+            elif isinstance(no_fly_zones, list):
+                geoms = [z.geometry if hasattr(z, "geometry") else z for z in no_fly_zones]
+            for g in geoms:
+                if g is None:
+                    continue
+                buf = g.buffer(buffer_deg) if buffer_deg != 0 else g
+                if buf.contains(pt) or buf.intersects(pt):
+                    return False
+            return True
+        except Exception:
+            return True
+
+    def get_station_candidates(
+        self,
+        buildings: gpd.GeoDataFrame,
+        city_boundary,
+        no_fly_zones,
+        road_graph,
+        *,
+        station_type: str = "rooftop",
+        no_fly_buffer_m: float = 50.0,
+        min_roof_area_m2: float = None,
+        min_ground_area_m2: float = None,
+    ) -> gpd.GeoDataFrame:
+        """
+        Шаг A: формирует кандидатов размещения станций.
+        station_type: 'rooftop' | 'ground' | 'garage' | 'to'
+        Кандидаты проходят: вне no-fly + буфер, минимальная площадка/доступность.
+        """
+        if buildings is None or len(buildings) == 0:
+            return gpd.GeoDataFrame()
+        buffer_deg = no_fly_buffer_m * self.NO_FLY_BUFFER_DEGREES_PER_M
+        min_roof = min_roof_area_m2 if min_roof_area_m2 is not None else self.ROOF_MIN_AREA_M2
+        min_ground = min_ground_area_m2 if min_ground_area_m2 is not None else self.GROUND_MIN_AREA_M2
+
+        buildings = buildings.to_crs("EPSG:4326")
+        if city_boundary is not None:
+            try:
+                crs_utm = buildings.estimate_utm_crs()
+                buildings_proj = buildings.to_crs(crs_utm)
+                boundary_proj = gpd.GeoSeries([city_boundary], crs="EPSG:4326").to_crs(crs_utm).iloc[0]
+                mask = buildings_proj.geometry.centroid.within(boundary_proj)
+                buildings = buildings[mask]
+            except Exception as e:
+                self.logger.warning(f"Фильтр зданий по границе: {e}")
+        if len(buildings) == 0:
+            return gpd.GeoDataFrame()
+
+        rows = []
+        if station_type == "rooftop":
+            buildings = self._building_footprint_area_m2(buildings)
+            for idx, row in buildings.iterrows():
+                geom = row.geometry
+                if geom is None or not geom.is_valid:
+                    continue
+                area = row.get("area_m2", 0) or 0
+                if area < min_roof:
+                    continue
+                tag = row.get("building")
+                tag_str = str(tag).lower().strip() if tag is not None and not (isinstance(tag, float) and pd.isna(tag)) else ""
+                # Только многоэтажки: явный тег из ALLOWED_ROOF_BUILDING_TAGS (без yes/true)
+                if not tag_str or tag_str not in self.ALLOWED_ROOF_BUILDING_TAGS:
+                    continue
+                centroid = geom.centroid
+                if not self._point_outside_no_fly(centroid, no_fly_zones, buffer_deg):
+                    continue
+                rows.append({
+                    "geometry": centroid,
+                    "station_type": "rooftop",
+                    "area_m2": area,
+                    "source": "building",
+                })
+        elif station_type in ("ground", "garage", "to"):
+            bbox = (buildings.total_bounds[3], buildings.total_bounds[1], buildings.total_bounds[2], buildings.total_bounds[0])
+            zones = self._load_industrial_and_parking_areas(bbox, "EPSG:4326")
+            # Наземные: центроиды парковок и промзон (площадка ≥ min_ground)
+            for g in zones["parking"]:
+                if g is None:
+                    continue
+                pt = g if g.geom_type == "Point" else g.centroid
+                if not self._point_outside_no_fly(pt, no_fly_zones, buffer_deg):
+                    continue
+                try:
+                    area = float(g.area) if hasattr(g, "area") and g.geom_type != "Point" else min_ground * 2
+                    if g.geom_type == "Point":
+                        area = min_ground * 2
+                    else:
+                        crs_utm = gpd.GeoSeries([g], crs="EPSG:4326").estimate_utm_crs()
+                        area = gpd.GeoSeries([g], crs="EPSG:4326").to_crs(crs_utm).iloc[0].area
+                    if area < min_ground and g.geom_type != "Point":
+                        continue
+                except Exception:
+                    area = min_ground * 2
+                rows.append({
+                    "geometry": pt,
+                    "station_type": "ground",
+                    "area_m2": area,
+                    "source": "parking",
+                })
+            for poly in zones["industrial"]:
+                try:
+                    c = poly.centroid
+                    if not self._point_outside_no_fly(c, no_fly_zones, buffer_deg):
+                        continue
+                    crs_utm = gpd.GeoSeries([poly], crs="EPSG:4326").estimate_utm_crs()
+                    area = gpd.GeoSeries([poly], crs="EPSG:4326").to_crs(crs_utm).iloc[0].area
+                    if area < min_ground:
+                        continue
+                    rows.append({
+                        "geometry": c,
+                        "station_type": "ground" if station_type == "ground" else "garage",
+                        "area_m2": area,
+                        "source": "industrial",
+                    })
+                except Exception:
+                    continue
+            if station_type == "garage":
+                rows = [r for r in rows if r.get("source") == "industrial"]
+            elif station_type == "to":
+                # ТО только в промышленной зоне
+                rows = [r for r in rows if r.get("source") == "industrial"]
+                for r in rows:
+                    r["station_type"] = "to"
+        if not rows:
+            return gpd.GeoDataFrame()
+        gdf = gpd.GeoDataFrame(rows, crs="EPSG:4326")
+        self.logger.info(f"Кандидаты размещения ({station_type}): {len(gdf)}")
+        return gdf
+
+    def get_demand_points_weighted(
+        self,
+        buildings: gpd.GeoDataFrame,
+        road_graph,
+        city_boundary,
+        *,
+        method: str = "grid",
+        cell_size_m: float = 250.0,
+        dbscan_eps_m: float = 200.0,
+        dbscan_min_samples: int = 3,
+        use_delivery_points: bool = True,
+    ) -> gpd.GeoDataFrame:
+        """
+        Шаг B: точки спроса для размещения — не «подъезды», а кластеры застройки или ячейки плотности с весом.
+        method: 'grid' — ячейки 200–300 м с весом (число зданий/точек), 'dbscan' — кластеры DBSCAN.
+        """
+        if buildings is None or len(buildings) == 0:
+            return gpd.GeoDataFrame()
+        buildings = buildings.to_crs("EPSG:4326")
+        if use_delivery_points and road_graph is not None and len(road_graph.nodes) > 0:
+            delivery = self.get_delivery_points(buildings, road_graph, city_boundary)
+            if len(delivery) > 0:
+                base_points = np.array([[row["delivery_lon"], row["delivery_lat"]] for _, row in delivery.iterrows()])
+            else:
+                base_points = np.array([[g.centroid.x, g.centroid.y] for g in buildings.geometry if g is not None and g.is_valid])
+        else:
+            base_points = np.array([[g.centroid.x, g.centroid.y] for g in buildings.geometry if g is not None and g.is_valid])
+        if len(base_points) < 2:
+            return gpd.GeoDataFrame()
+        use_utm = True
+        crs_utm = None
+        try:
+            crs_utm = gpd.GeoSeries([Point(base_points[0][0], base_points[0][1])], crs="EPSG:4326").estimate_utm_crs()
+            from pyproj import Transformer
+            trans = Transformer.from_crs("EPSG:4326", crs_utm, always_xy=True)
+            pts_utm = np.array([trans.transform(x, y) for x, y in base_points])
+        except Exception:
+            use_utm = False
+            pts_utm = base_points
+            crs_utm = None
+            if method == "grid":
+                cell_size_m = 0.0025  # ~250 m в градусах
+        rows = []
+        if method == "dbscan" and use_utm and crs_utm is not None:
+            try:
+                from sklearn.cluster import DBSCAN
+                from pyproj import Transformer
+                eps_m = dbscan_eps_m
+                clustering = DBSCAN(eps=eps_m, min_samples=dbscan_min_samples, metric="euclidean").fit(pts_utm)
+                labels = clustering.labels_
+                inv = Transformer.from_crs(crs_utm, "EPSG:4326", always_xy=True)
+                for lid in set(labels) - {-1}:
+                    mask = labels == lid
+                    cluster_pts = pts_utm[mask]
+                    weight = int(mask.sum())
+                    cx, cy = cluster_pts.mean(axis=0)
+                    lon, lat = inv.transform(cx, cy)
+                    rows.append({"geometry": Point(lon, lat), "weight": weight})
+            except Exception:
+                method = "grid"
+        elif method == "dbscan":
+            method = "grid"
+        if method == "grid":
+            cell = cell_size_m
+            cell_centers = {}
+            for i in range(len(pts_utm)):
+                x, y = pts_utm[i, 0], pts_utm[i, 1]
+                gx = int(x // cell) * cell + cell / 2
+                gy = int(y // cell) * cell + cell / 2
+                key = (gx, gy)
+                cell_centers[key] = cell_centers.get(key, 0) + 1
+            trans_inv = None
+            if use_utm:
+                try:
+                    from pyproj import Transformer
+                    trans_inv = Transformer.from_crs(crs_utm, "EPSG:4326", always_xy=True)
+                except Exception:
+                    pass
+            for (gx, gy), weight in cell_centers.items():
+                if weight == 0:
+                    continue
+                if trans_inv:
+                    lon, lat = trans_inv.transform(gx, gy)
+                else:
+                    lon, lat = float(gx), float(gy)
+                rows.append({"geometry": Point(lon, lat), "weight": weight})
+        if not rows:
+            return gpd.GeoDataFrame()
+        gdf = gpd.GeoDataFrame(rows, crs="EPSG:4326")
+        gdf["weight"] = gdf.get("weight", 1)
+        self.logger.info(f"Точки спроса ({method}): {len(gdf)}, сумма весов {gdf['weight'].sum()}")
+        return gdf
+
     @staticmethod
     def _is_apartment(row) -> bool:
         """Многоквартирный дом по OSM-тегу building."""

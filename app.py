@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from data_service import DataService
 from graph_service import GraphService
+from station_placement import run_full_pipeline, R_CHARGE_KM, R_GARAGE_TO_KM, D_MAX_KM
 import json
 import osmnx as ox
 import geopandas as gpd
@@ -215,6 +216,55 @@ def get_city(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/city/map")
+def get_city_map(
+    city: str = Query(..., description="Название города"),
+    network_type: str = Query("drive", description="Тип сети OSM"),
+    simplify: bool = Query(True, description="Упрощение"),
+):
+    """Возвращает границы города, no_fly_zones и bbox/center для отрисовки карты (без графов)."""
+    try:
+        data = data_service.get_city_data(city, network_type=network_type, simplify=simplify, load_no_fly_zones=True)
+        city_boundary = data.get("city_boundary")
+        road_graph = data.get("road_graph")
+        no_fly_zones = data.get("no_fly_zones")
+        no_fly_zones_geojson = None
+        if no_fly_zones is not None:
+            try:
+                if isinstance(no_fly_zones, gpd.GeoDataFrame) and len(no_fly_zones) > 0:
+                    no_fly_zones_geojson = json.loads(no_fly_zones.to_json())
+                elif isinstance(no_fly_zones, list) and len(no_fly_zones) > 0:
+                    zones_gdf = gpd.GeoDataFrame([{"geometry": z} for z in no_fly_zones], crs="EPSG:4326")
+                    no_fly_zones_geojson = json.loads(zones_gdf.to_json())
+            except Exception as e:
+                logger.warning(f"Ошибка сериализации no_fly_zones: {e}")
+        if city_boundary is not None:
+            boundary_gdf = gpd.GeoDataFrame([{"geometry": city_boundary}], crs="EPSG:4326")
+            city_boundary_geojson = json.loads(boundary_gdf.to_json())
+            bbox = list(city_boundary.bounds)
+            center_lon = (bbox[0] + bbox[2]) / 2.0
+            center_lat = (bbox[1] + bbox[3]) / 2.0
+        elif road_graph is not None and len(road_graph.nodes) > 0:
+            gdf_nodes, _ = ox.graph_to_gdfs(road_graph)
+            xmin, ymin, xmax, ymax = gdf_nodes.total_bounds
+            bbox = [xmin, ymin, xmax, ymax]
+            center_lat = (ymin + ymax) / 2.0
+            center_lon = (xmin + xmax) / 2.0
+            city_boundary_geojson = None
+        else:
+            raise HTTPException(status_code=404, detail="Нет данных по городу")
+        return JSONResponse({
+            "city_boundary": city_boundary_geojson,
+            "no_fly_zones": no_fly_zones_geojson,
+            "bbox": bbox,
+            "center": {"lat": center_lat, "lon": center_lon},
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/graph")
 def graph_geojson(
     city: str = Query(..., description="Название города, как в /api/city"),
@@ -227,7 +277,6 @@ def graph_geojson(
     logger = logging.getLogger(__name__)
     
     try:
-        # Загружаем (или берём из кэша) данные города. Для "Только дороги" не грузим беспилотные зоны.
         load_no_fly = (graph_type != 'roads_only')
         data = data_service.get_city_data(city, network_type=network_type, simplify=simplify, load_no_fly_zones=load_no_fly)
         road_graph = data.get("road_graph")
@@ -544,6 +593,103 @@ def graph_geojson(
         })
     except HTTPException:
         raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/stations/placement")
+def get_stations_placement(
+    city: str = Query(..., description="Название города"),
+    network_type: str = Query("drive", description="Тип сети OSM"),
+    simplify: bool = Query(True, description="Упрощение"),
+    demand_cell_m: float = Query(250.0, description="Размер ячейки спроса (м)"),
+    max_charge_stations: Optional[int] = Query(None, description="Макс. число зарядок (по умолчанию — до покрытия)"),
+    num_garages: int = Query(3, description="Число гаражей"),
+    num_to: int = Query(2, description="Число станций ТО"),
+):
+    """
+    Размещение станций по правилам:
+    - Зарядка+ожидание: R_charge = 0.4·D_max = 6.4 км (FlyCart 30).
+    - Гаражи/ТО: R_garage/TO = 0.8·D_max = 12.8 км.
+    Возвращает GeoJSON: точки спроса, зарядки, гаражи, ТО, рёбра магистрали, метрики.
+    """
+    try:
+        result = run_full_pipeline(
+            data_service,
+            graph_service,
+            city,
+            network_type=network_type,
+            simplify=simplify,
+            demand_cell_m=demand_cell_m,
+            max_charge_stations=max_charge_stations,
+            num_garages=num_garages,
+            num_to=num_to,
+        )
+        if result.get("error"):
+            return JSONResponse({"error": result["error"]}, status_code=400)
+
+        def gdf_to_geojson(gdf, default_props=None):
+            if gdf is None or len(gdf) == 0:
+                return {"type": "FeatureCollection", "features": []}
+            return json.loads(gdf.to_json())
+
+        def round_coords(obj, precision=6):
+            if isinstance(obj, dict):
+                return {k: round_coords(v, precision) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [round_coords(x, precision) for x in obj]
+            if isinstance(obj, float):
+                return round(obj, precision)
+            return obj
+
+        demand_geojson = gdf_to_geojson(result.get("demand"))
+        charge_geojson = gdf_to_geojson(result.get("charge_stations"))
+        garages_geojson = gdf_to_geojson(result.get("garages"))
+        to_geojson = gdf_to_geojson(result.get("to_stations"))
+
+        # Рёбра магистрали (LineString) из trunk_graph
+        trunk = result.get("trunk_graph")
+        trunk_edges = []
+        if trunk is not None and trunk.number_of_edges() > 0:
+            for u, v, data in trunk.edges(data=True):
+                nu, nv = trunk.nodes[u], trunk.nodes[v]
+                lon1 = nu.get("lon") or nu.get("x")
+                lat1 = nu.get("lat") or nu.get("y")
+                lon2 = nv.get("lon") or nv.get("x")
+                lat2 = nv.get("lat") or nv.get("y")
+                if lon1 is not None and lat1 is not None and lon2 is not None and lat2 is not None:
+                    trunk_edges.append({
+                        "type": "Feature",
+                        "geometry": {"type": "LineString", "coordinates": [[lon1, lat1], [lon2, lat2]]},
+                        "properties": {"weight_km": data.get("weight") or data.get("length")},
+                    })
+        trunk_fc = round_coords({"type": "FeatureCollection", "features": trunk_edges})
+
+        # Граница города для карты
+        city_boundary_geojson = None
+        if result.get("city_boundary") is not None:
+            try:
+                boundary_gdf = gpd.GeoDataFrame([{"geometry": result["city_boundary"]}], crs="EPSG:4326")
+                city_boundary_geojson = json.loads(boundary_gdf.to_json())
+            except Exception:
+                pass
+
+        return JSONResponse({
+            "demand": round_coords(demand_geojson),
+            "charge_stations": round_coords(charge_geojson),
+            "garages": round_coords(garages_geojson),
+            "to_stations": round_coords(to_geojson),
+            "trunk_edges": trunk_fc,
+            "metrics": result.get("metrics", {}),
+            "params": {
+                "R_charge_km": R_CHARGE_KM,
+                "R_garage_to_km": R_GARAGE_TO_KM,
+                "D_max_km": D_MAX_KM,
+            },
+            "city_boundary": city_boundary_geojson,
+        })
     except Exception as e:
         import traceback
         traceback.print_exc()
