@@ -1,6 +1,6 @@
 import os
 import warnings
-from typing import Optional
+from typing import Optional, Union, List
 
 import osmnx as ox
 import geopandas as gpd
@@ -14,7 +14,7 @@ from geopy.extra.rate_limiter import RateLimiter
 import logging
 import json
 from redis import Redis
-from shapely.geometry import box, MultiPoint, Point, LineString
+from shapely.geometry import box, MultiPoint, Point, LineString, Polygon
 from shapely.ops import unary_union, polygonize
 from shapely.strtree import STRtree
 from shapely.prepared import prep
@@ -649,17 +649,58 @@ class DataService:
         return []
     
     # --- Кандидаты размещения станций (Шаг A) и точки спроса (Шаг B) ---
-    # η=0.8: R_cov=0.4*D_max (зарядка/ожидание), R_reach=0.8*D_max (гараж/ТО, one-way)
-    # FlyCart 30: D_max=16 км → R_cov=6.4 км, R_reach=12.8 км (базовые для универсальной сети)
+    # Теги OSM, по которым отстраиваются кандидаты станций:
+    #
+    # Зарядки (крыша): здания с building=* из ALLOWED_ROOF_BUILDING_TAGS (см. ниже),
+    #   площадь footprint ≥ ROOF_MIN_AREA_M2; здания грузятся по tags={"building": True}.
+    # Зарядки (земля), гаражи, ТО: промзоны и парковки из _load_industrial_and_parking_areas:
+    #   landuse=industrial | warehouse; building=industrial | warehouse | factory | manufacture;
+    #   amenity=parking; parking=True. Гаражи и ТО — только промзоны (industrial), без парковок.
+    #
     NO_FLY_BUFFER_DEGREES_PER_M = 0.000009  # ~1 м в градусах на широте ~55
     ROOF_MIN_AREA_M2 = 80.0  # минимальная площадь крыши для крышной зарядки
     GROUND_MIN_AREA_M2 = 100.0  # минимальная площадка для наземной зарядки
-    # Крышные зарядки: МКД + коммерция/офисы, чтобы покрыть весь город (доступ отовсюду)
+    # Крышные зарядки: МКД + коммерция/офисы (building=* из списка)
     ALLOWED_ROOF_BUILDING_TAGS = frozenset((
         'apartments', 'apartment', 'apartment_block', 'multistory', 'block', 'flats',
         'semidetached_house', 'dormitory', 'hotel',
         'commercial', 'office', 'retail', 'supermarket', 'civic', 'public', 'service',
     ))
+    # Спрос доставки: только жилые + часть коммерции; пром/склады — только для кандидатов станций, не для спроса
+    DEMAND_BUILDING_TAGS = frozenset((
+        'house', 'residential', 'apartments', 'apartment', 'apartment_block', 'multistory', 'block', 'flats',
+        'semidetached_house', 'dormitory', 'detached', 'terrace', 'hut', 'cabin', 'bungalow',
+        'retail', 'office', 'commercial', 'supermarket',
+        'yes', 'true', '1',  # в OSM жилые часто без уточнения
+    ))
+    EXCLUDE_FROM_DEMAND_TAGS = frozenset((
+        'industrial', 'warehouse', 'factory', 'manufacture', 'garage', 'shed', 'garages',
+        'school', 'university', 'college', 'hospital', 'kindergarten', 'civic', 'government',
+        'train_station', 'service',
+    ))
+    # Вес спроса: многоквартирники дают повышенный спрос (больше людей)
+    APARTMENT_DEMAND_WEIGHT = 4
+
+    def _filter_buildings_for_demand(self, buildings: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+        """
+        Оставляет только здания, релевантные для спроса доставки: жилые (house/residential/apartments/dormitory)
+        и часть коммерции (retail/office). Пром/склады исключены — они только для кандидатов станций.
+        """
+        if buildings is None or len(buildings) == 0:
+            return buildings
+        def keep(row):
+            tag = row.get("building") if hasattr(row, "get") else None
+            if tag is None or (isinstance(tag, float) and pd.isna(tag)) or str(tag).strip() == "":
+                tag = "yes"
+            tag = str(tag).lower().strip()
+            if tag in self.EXCLUDE_FROM_DEMAND_TAGS:
+                return False
+            return tag in self.DEMAND_BUILDING_TAGS
+        mask = buildings.apply(keep, axis=1)
+        out = buildings.loc[mask].copy()
+        if len(out) > 0 and len(out) < len(buildings):
+            self.logger.info(f"Спрос доставки: оставлено {len(out)} зданий из {len(buildings)} (жилые + retail/office, без пром/складов)")
+        return out
 
     def _load_industrial_and_parking_areas(self, bbox_osm, crs_4326):
         """
@@ -887,25 +928,82 @@ class DataService:
         *,
         method: str = "grid",
         cell_size_m: float = 250.0,
-        dbscan_eps_m: float = 200.0,
-        dbscan_min_samples: int = 3,
-        use_delivery_points: bool = True,
-    ) -> gpd.GeoDataFrame:
+        dbscan_eps_m: float = 180.0,
+        dbscan_min_samples: int = 15,
+        return_hulls: bool = False,
+        use_all_buildings: bool = False,
+        no_fly_zones: Optional[Union[gpd.GeoDataFrame, List]] = None,
+        min_buildings_for_zone: int = 2,
+    ):
         """
-        Шаг B: точки спроса для размещения — не «подъезды», а кластеры застройки или ячейки плотности с весом.
-        method: 'grid' — ячейки 200–300 м с весом (число зданий/точек), 'dbscan' — кластеры DBSCAN.
+        Шаг B: точки спроса для размещения — только по зданиям (центроиды), дороги не используются.
+        При use_all_buildings=False — только жилые и часть коммерции; при True — все здания
+        (кроме попавших в беспилотные зоны, если заданы no_fly_zones).
+        method: 'grid' — ячейки 200–300 м с весом, 'dbscan' — кластеры DBSCAN.
+        dbscan_eps_m: 120–180 м — кварталы, 200–300 м — микрорайоны (при большом min_samples).
+        dbscan_min_samples: 10–25 для городской застройки (15 — компромисс).
+        return_hulls: при method=dbscan можно вернуть (gdf, hulls_gdf) — области кластеров.
+        use_all_buildings: если True — по всем зданиям, иначе только жилые/коммерция.
+        no_fly_zones: при заданных зонах из спроса исключаются здания, пересекающие эти зоны.
+        min_buildings_for_zone: кластер/ячейка с числом зданий меньше этого — не считается зоной спроса (одиночки = выбросы).
         """
         if buildings is None or len(buildings) == 0:
             return gpd.GeoDataFrame()
         buildings = buildings.to_crs("EPSG:4326")
-        if use_delivery_points and road_graph is not None and len(road_graph.nodes) > 0:
-            delivery = self.get_delivery_points(buildings, road_graph, city_boundary)
-            if len(delivery) > 0:
-                base_points = np.array([[row["delivery_lon"], row["delivery_lat"]] for _, row in delivery.iterrows()])
-            else:
-                base_points = np.array([[g.centroid.x, g.centroid.y] for g in buildings.geometry if g is not None and g.is_valid])
-        else:
-            base_points = np.array([[g.centroid.x, g.centroid.y] for g in buildings.geometry if g is not None and g.is_valid])
+        if not use_all_buildings:
+            buildings = self._filter_buildings_for_demand(buildings)
+        if buildings is None or len(buildings) == 0:
+            return (gpd.GeoDataFrame(), gpd.GeoDataFrame()) if return_hulls else gpd.GeoDataFrame()
+        no_fly_union = None
+        # Исключаем здания, попадающие в беспилотные зоны
+        if no_fly_zones is not None:
+            try:
+                if isinstance(no_fly_zones, gpd.GeoDataFrame) and len(no_fly_zones) > 0:
+                    no_fly_zones = no_fly_zones.to_crs("EPSG:4326")
+                    no_fly_union = no_fly_zones.geometry.unary_union
+                elif isinstance(no_fly_zones, list) and len(no_fly_zones) > 0:
+                    no_fly_union = unary_union(no_fly_zones)
+                if no_fly_union is not None and not no_fly_union.is_empty:
+                    mask = ~buildings.geometry.intersects(no_fly_union)
+                    buildings = buildings[mask].copy()
+                    self.logger.info(f"После исключения зданий в беспилотных зонах: {len(buildings)} зданий")
+                    if len(buildings) == 0:
+                        return (gpd.GeoDataFrame(), gpd.GeoDataFrame()) if return_hulls else gpd.GeoDataFrame()
+            except Exception as e:
+                self.logger.warning(f"Ошибка фильтрации по беспилотным зонам: {e}")
+                no_fly_union = None
+        # Только здания внутри границ города
+        if city_boundary is not None:
+            try:
+                boundary_geom = city_boundary if hasattr(city_boundary, "geom_type") else None
+                if boundary_geom is not None and boundary_geom.is_valid and boundary_geom.geom_type in ("Polygon", "MultiPolygon"):
+                    crs_utm = buildings.estimate_utm_crs()
+                    buildings_proj = buildings.to_crs(crs_utm)
+                    boundary_proj = gpd.GeoSeries([boundary_geom], crs="EPSG:4326").to_crs(crs_utm).iloc[0]
+                    mask = buildings_proj.geometry.centroid.within(boundary_proj)
+                    n_before = len(buildings)
+                    buildings = buildings[mask].copy()
+                    if len(buildings) < n_before:
+                        self.logger.info(f"Здания только внутри границы города: {len(buildings)} из {n_before}")
+                    if len(buildings) == 0:
+                        return (gpd.GeoDataFrame(), gpd.GeoDataFrame()) if return_hulls else gpd.GeoDataFrame()
+            except Exception as e:
+                self.logger.warning(f"Фильтрация зданий по границе города: {e}")
+        # Зоны спроса — только по домам (центроиды зданий). Дороги не используются.
+        # Вес спроса: многоквартирники — повышенный (APARTMENT_DEMAND_WEIGHT), остальные — 1
+        pts_list = []
+        weights_list = []
+        for idx, b in buildings.iterrows():
+            g = b.geometry
+            if g is None or not getattr(g, "is_valid", True):
+                continue
+            c = g.centroid
+            pts_list.append([c.x, c.y])
+            weights_list.append(self.APARTMENT_DEMAND_WEIGHT if self._is_apartment(b) else 1)
+        base_points = np.array(pts_list) if pts_list else np.empty((0, 2))
+        base_weights = np.array(weights_list, dtype=float) if weights_list else np.ones(len(base_points))
+        if len(base_points) > 0:
+            self.logger.info(f"Точки для кластеризации: только по зданиям ({len(base_points)} центроидов), многоквартирники с весом {self.APARTMENT_DEMAND_WEIGHT}")
         if len(base_points) < 2:
             return gpd.GeoDataFrame()
         use_utm = True
@@ -922,34 +1020,76 @@ class DataService:
             if method == "grid":
                 cell_size_m = 0.0025  # ~250 m в градусах
         rows = []
+        hull_rows = [] if (method == "dbscan" and return_hulls) else None
         if method == "dbscan" and use_utm and crs_utm is not None:
             try:
                 from sklearn.cluster import DBSCAN
                 from pyproj import Transformer
                 eps_m = dbscan_eps_m
                 clustering = DBSCAN(eps=eps_m, min_samples=dbscan_min_samples, metric="euclidean").fit(pts_utm)
-                labels = clustering.labels_
+                labels = np.array(clustering.labels_, dtype=int)
+                # Точки-шум (label -1) не присваиваем кластерам — одиночные здания остаются выбросами, зоной спроса не считаются
+                cluster_ids = sorted(set(labels) - {-1})
+                n_noise = int((labels == -1).sum())
+                if n_noise > 0:
+                    self.logger.info(f"Точки-шум (одиночки/выбросы): {n_noise} — не образуют зону спроса")
                 inv = Transformer.from_crs(crs_utm, "EPSG:4326", always_xy=True)
-                for lid in set(labels) - {-1}:
+                from shapely.ops import transform as sh_transform
+                for lid in cluster_ids:
                     mask = labels == lid
                     cluster_pts = pts_utm[mask]
-                    weight = int(mask.sum())
+                    n_buildings = len(cluster_pts)
+                    if n_buildings < min_buildings_for_zone:
+                        continue  # одиночки и малые группы — выбросы, зону спроса не создаём
+                    weight = float(base_weights[mask].sum())
                     cx, cy = cluster_pts.mean(axis=0)
                     lon, lat = inv.transform(cx, cy)
-                    rows.append({"geometry": Point(lon, lat), "weight": weight})
+                    rows.append({"geometry": Point(lon, lat), "weight": int(round(weight))})
+                    if return_hulls and hull_rows is not None and len(cluster_pts) >= 1:
+                        try:
+                            circles_utm = [Point(float(x), float(y)).buffer(eps_m) for x, y in cluster_pts]
+                            region_utm = unary_union(circles_utm)
+                            if region_utm is None or region_utm.is_empty:
+                                continue
+                            region_utm = region_utm.simplify(2.0)
+                            region_4326 = sh_transform(lambda x, y: inv.transform(x, y), region_utm)
+                            # Обрезаем область кластера по границе города
+                            if city_boundary is not None and hasattr(city_boundary, "is_valid") and getattr(city_boundary, "is_valid", True) and region_4326.is_valid and not region_4326.is_empty:
+                                try:
+                                    clipped = region_4326.intersection(city_boundary)
+                                    if clipped is not None and not clipped.is_empty and clipped.is_valid:
+                                        region_4326 = clipped
+                                except Exception:
+                                    pass
+                            # Исключаем беспилотные зоны из полигона зоны спроса (не выделяем no_fly в зонах спроса)
+                            if no_fly_union is not None and not no_fly_union.is_empty and region_4326.is_valid and not region_4326.is_empty:
+                                try:
+                                    region_4326 = region_4326.difference(no_fly_union)
+                                    if region_4326.is_empty:
+                                        continue
+                                except Exception:
+                                    pass
+                            if region_4326.is_valid and not region_4326.is_empty:
+                                hull_rows.append({"geometry": region_4326, "weight": int(round(weight)), "cluster_id": len(hull_rows)})
+                        except Exception as e:
+                            self.logger.debug(f"Область кластера {lid}: {e}")
             except Exception:
                 method = "grid"
+                hull_rows = None
         elif method == "dbscan":
             method = "grid"
         if method == "grid":
             cell = cell_size_m
             cell_centers = {}
+            cell_counts = {}
             for i in range(len(pts_utm)):
                 x, y = pts_utm[i, 0], pts_utm[i, 1]
+                w = base_weights[i] if i < len(base_weights) else 1.0
                 gx = int(x // cell) * cell + cell / 2
                 gy = int(y // cell) * cell + cell / 2
                 key = (gx, gy)
-                cell_centers[key] = cell_centers.get(key, 0) + 1
+                cell_centers[key] = cell_centers.get(key, 0) + w
+                cell_counts[key] = cell_counts.get(key, 0) + 1
             trans_inv = None
             if use_utm:
                 try:
@@ -958,6 +1098,8 @@ class DataService:
                 except Exception:
                     pass
             for (gx, gy), weight in cell_centers.items():
+                if cell_counts.get((gx, gy), 0) < min_buildings_for_zone:
+                    continue  # одиночки в ячейке — выбросы, зону спроса не создаём
                 if weight == 0:
                     continue
                 if trans_inv:
@@ -966,10 +1108,15 @@ class DataService:
                     lon, lat = float(gx), float(gy)
                 rows.append({"geometry": Point(lon, lat), "weight": weight})
         if not rows:
+            if return_hulls:
+                return (gpd.GeoDataFrame(), gpd.GeoDataFrame())
             return gpd.GeoDataFrame()
         gdf = gpd.GeoDataFrame(rows, crs="EPSG:4326")
         gdf["weight"] = gdf.get("weight", 1)
         self.logger.info(f"Точки спроса ({method}): {len(gdf)}, сумма весов {gdf['weight'].sum()}")
+        if return_hulls:
+            hulls_gdf = gpd.GeoDataFrame(hull_rows, crs="EPSG:4326") if hull_rows else gpd.GeoDataFrame()
+            return (gdf, hulls_gdf)
         return gdf
 
     @staticmethod
@@ -1507,6 +1654,7 @@ class DataService:
                     continue
                 centroid = geom.centroid
                 lon_c, lat_c = centroid.x, centroid.y
+                w = self.APARTMENT_DEMAND_WEIGHT if is_apartment[i] else 1
                 if is_apartment[i] and i in building_entrances and len(building_entrances[i]) > 0:
                     for entrance_pt in building_entrances[i]:
                         rx, ry = self._point_to_road(entrance_pt, edge_tree, edge_geoms)
@@ -1515,6 +1663,7 @@ class DataService:
                             'geometry': Point(lon_d, lat_d),
                             'delivery_lon': lon_d,
                             'delivery_lat': lat_d,
+                            'weight': w,
                         })
                 else:
                     rx, ry = self._point_to_road(centroid, edge_tree, edge_geoms)
@@ -1523,6 +1672,7 @@ class DataService:
                             'geometry': Point(lon_d, lat_d),
                             'delivery_lon': lon_d,
                             'delivery_lat': lat_d,
+                            'weight': w,
                     })
             except Exception as e:
                 self.logger.debug(f"Здание {i}: {e}")
@@ -1563,6 +1713,7 @@ class DataService:
                         'geometry': Point(lon_d, lat_d),
                         'delivery_lon': lon_d,
                         'delivery_lat': lat_d,
+                        'weight': 1,
                     })
                 except Exception as e:
                     self.logger.debug(f"Квартал: {e}")
@@ -1847,20 +1998,3 @@ class DataService:
     def get_redis_client(self):
         """Возвращает Redis клиент для использования в других сервисах"""
         return self._redis
-    
-    def generate_graph_cache_key(self, city_name: str, network_type: str, simplify: bool,
-                                 graph_type: str, grid_spacing: float, connect_diagonal: bool) -> str:
-        """Генерирует ключ кэша для графа на основе всех параметров"""
-        normalized_name = city_name.strip()
-        key_parts = [
-            self._sanitize_name(normalized_name),
-            self._sanitize_name(network_type),
-            str(int(bool(simplify))),
-            self._sanitize_name(graph_type),
-            f"{grid_spacing:.6f}".replace('.', '_'),
-            str(int(bool(connect_diagonal)))
-        ]
-        if graph_type in ("delaunay", "merged"):
-            key_parts.append("flyable_v2")
-        key_suffix = "__".join(key_parts)
-        return f"drone_planner:graph:{key_suffix}"

@@ -23,7 +23,7 @@ import pandas as pd
 import geopandas as gpd
 import networkx as nx
 from shapely.geometry import Point
-from scipy.spatial import Delaunay, cKDTree
+from scipy.spatial import Delaunay, cKDTree, ConvexHull
 
 # Радиус Земли в км
 EARTH_R_KM = 6371.0
@@ -89,9 +89,8 @@ def km_to_deg_approx(km: float, lat_center: float) -> float:
 
 
 class StationPlacement:
-    def __init__(self, data_service, graph_service, logger=None):
+    def __init__(self, data_service, logger=None):
         self.data_service = data_service
-        self.graph_service = graph_service
         self.logger = logger or logging.getLogger(__name__)
 
     # --- Шаг 1: точки спроса ---
@@ -101,20 +100,65 @@ class StationPlacement:
         road_graph,
         city_boundary,
         *,
-        method: str = "grid",
+        method: str = "dbscan",
         cell_size_m: float = 250.0,
+        dbscan_eps_m: float = 180.0,
+        dbscan_min_samples: int = 15,
+        use_all_buildings: bool = False,
+        no_fly_zones=None,
     ) -> gpd.GeoDataFrame:
-        """Точки спроса: кластеры или ячейки плотности с весом."""
+        """Точки спроса: DBSCAN-кластеры или сеточные ячейки с весом. При use_all_buildings=True — по всем зданиям вне беспилотных зон."""
         return self.data_service.get_demand_points_weighted(
             buildings,
             road_graph,
             city_boundary,
             method=method,
             cell_size_m=cell_size_m,
-            use_delivery_points=True,
+            dbscan_eps_m=dbscan_eps_m,
+            dbscan_min_samples=dbscan_min_samples,
+            use_all_buildings=use_all_buildings,
+            no_fly_zones=no_fly_zones,
         )
 
-    # --- Шаг 2: зарядки (weighted set cover) ---
+    # --- Кандидаты зарядок относительно кластеров DBSCAN ---
+    def build_charge_candidates_from_clusters(
+        self,
+        demand: gpd.GeoDataFrame,
+        full_candidates: gpd.GeoDataFrame,
+        *,
+        radius_km: float = R_CHARGE_KM,
+        max_distance_km: Optional[float] = None,
+    ) -> gpd.GeoDataFrame:
+        """
+        Строит кандидатов зарядки относительно кластеров DBSCAN: для каждого кластера (центроид спроса)
+        выбирается ближайшая точка из full_candidates (крыши/площадки) в пределах max_distance_km.
+        Возвращает уникальный набор кандидатов — по одному месту на кластер (лучшая позиция для кластера).
+        """
+        if demand is None or len(demand) == 0 or full_candidates is None or len(full_candidates) == 0:
+            return full_candidates if full_candidates is not None else gpd.GeoDataFrame()
+        max_dist = max_distance_km if max_distance_km is not None else radius_km * 2.0
+        dem_pts = _points_array(demand)
+        cand_pts = _points_array(full_candidates)
+        chosen_indices = set()
+        for i in range(len(dem_pts)):
+            lat_d, lon_d = dem_pts[i, 1], dem_pts[i, 0]
+            best_j = -1
+            best_d_km = np.inf
+            for j in range(len(cand_pts)):
+                d_km = haversine_km(lat_d, lon_d, cand_pts[j, 1], cand_pts[j, 0])
+                if d_km <= max_dist and d_km < best_d_km:
+                    best_d_km = d_km
+                    best_j = j
+            if best_j >= 0:
+                chosen_indices.add(best_j)
+        if not chosen_indices:
+            self.logger.warning("Нет кандидатов в радиусе от кластеров — используем все кандидаты")
+            return full_candidates
+        out = full_candidates.iloc[sorted(chosen_indices)].copy()
+        self.logger.info(f"Кандидаты зарядки относительно кластеров: {len(out)} из {len(full_candidates)} (по кластерам DBSCAN)")
+        return out
+
+    # --- Шаг 2: зарядки — тип А (основное покрытие) + дополнительные (до 100%, поддержка развозки) ---
     def place_charging_stations(
         self,
         candidates: gpd.GeoDataFrame,
@@ -123,76 +167,98 @@ class StationPlacement:
         *,
         radius_km: float = R_CHARGE_KM,
         max_stations: Optional[int] = None,
-        min_coverage_ratio: float = 0.99,
+        type_a_coverage_ratio: float = 0.85,
     ) -> Tuple[gpd.GeoDataFrame, Dict[str, Any]]:
         """
-        Жадно выбирает зарядки: на каждом шаге — кандидат, покрывающий максимум ещё непокрытого веса спроса.
-        Возвращает (GeoDataFrame выбранных зарядок, метрики).
+        Два типа зарядок:
+        - Тип А: покрывают большую часть зон спроса (type_a_coverage_ratio, по умолчанию 85%).
+        - Дополнительные: добивают покрытие до 100% и помогают при развозке заказов.
+        Жадно: на каждом шаге — кандидат с макс. непокрытым весом. Тип А не дублируются в радиусе;
+        дополнительные могут стоять ближе к типу А, чтобы покрыть остаток.
         """
         if candidates is None or len(candidates) == 0 or demand is None or len(demand) == 0:
-            return gpd.GeoDataFrame(), {"placed": 0, "demand_covered": 0, "demand_total": 0, "coverage_ratio": 0.0}
+            return gpd.GeoDataFrame(), {
+                "placed": 0, "placed_type_a": 0, "placed_extra": 0,
+                "demand_covered": 0, "demand_total": 0, "coverage_ratio": 0.0,
+            }
 
         cand_pts = _points_array(candidates)
         dem_pts = _points_array(demand)
         weights = demand["weight"].values if "weight" in demand.columns else np.ones(len(demand))
-
         n_demand = len(dem_pts)
-        covered = np.zeros(n_demand, dtype=bool)
         total_weight = float(weights.sum())
+        covered = np.zeros(n_demand, dtype=bool)
         selected = []
-        selected_indices = []
+        selected_indices = []  # индексы кандидатов (и тип А, и доп)
+        type_a_indices = []   # только тип А (для ограничения "не ближе radius друг от друга")
 
-        while True:
-            best_idx = -1
-            best_new_weight = 0.0
-            for i in range(len(cand_pts)):
-                lon_c, lat_c = cand_pts[i, 0], cand_pts[i, 1]
-                # Не ставим зарядку в радиус другой уже выбранной зарядки
-                if selected_indices:
-                    if any(
+        def run_phase(station_type: str, stop_at_ratio: float, exclude_near_getter) -> None:
+            """exclude_near_getter() -> индексы кандидатов, рядом с которыми не ставим (в радиусе radius_km)."""
+            nonlocal covered, selected, selected_indices
+            while True:
+                exclude_near = exclude_near_getter()
+                best_idx = -1
+                best_new_weight = 0.0
+                for i in range(len(cand_pts)):
+                    if i in selected_indices:
+                        continue
+                    lon_c, lat_c = cand_pts[i, 0], cand_pts[i, 1]
+                    if exclude_near and any(
                         haversine_km(lat_c, lon_c, cand_pts[s, 1], cand_pts[s, 0]) <= radius_km
-                        for s in selected_indices
+                        for s in exclude_near
                     ):
                         continue
-                new_weight = 0.0
+                    new_weight = 0.0
+                    for j in range(n_demand):
+                        if covered[j]:
+                            continue
+                        d_km = haversine_km(lat_c, lon_c, dem_pts[j, 1], dem_pts[j, 0])
+                        if d_km <= radius_km:
+                            new_weight += weights[j]
+                    if new_weight > best_new_weight:
+                        best_new_weight = new_weight
+                        best_idx = i
+                if best_idx < 0 or best_new_weight <= 0:
+                    break
+                selected_indices.append(best_idx)
+                lon_c, lat_c = cand_pts[best_idx, 0], cand_pts[best_idx, 1]
                 for j in range(n_demand):
-                    if covered[j]:
-                        continue
-                    d_km = haversine_km(lat_c, lon_c, dem_pts[j, 1], dem_pts[j, 0])
-                    if d_km <= radius_km:
-                        new_weight += weights[j]
-                if new_weight > best_new_weight:
-                    best_new_weight = new_weight
-                    best_idx = i
-            if best_idx < 0 or best_new_weight <= 0:
-                break
-            selected_indices.append(best_idx)
-            lon_c, lat_c = cand_pts[best_idx, 0], cand_pts[best_idx, 1]
-            for j in range(n_demand):
-                if covered[j]:
-                    continue
-                if haversine_km(lat_c, lon_c, dem_pts[j, 1], dem_pts[j, 0]) <= radius_km:
-                    covered[j] = True
-            selected.append({
-                "geometry": Point(cand_pts[best_idx, 0], cand_pts[best_idx, 1]),
-                "station_type": "charge",
-                "source_index": best_idx,
-            })
-            if max_stations is not None and len(selected) >= max_stations:
-                break
-            covered_weight = weights[covered].sum()
-            if total_weight > 0 and covered_weight / total_weight >= min_coverage_ratio:
-                break
+                    if not covered[j] and haversine_km(lat_c, lon_c, dem_pts[j, 1], dem_pts[j, 0]) <= radius_km:
+                        covered[j] = True
+                selected.append({
+                    "geometry": Point(cand_pts[best_idx, 0], cand_pts[best_idx, 1]),
+                    "station_type": station_type,
+                    "source_index": best_idx,
+                })
+                if station_type == "charge_a":
+                    type_a_indices.append(best_idx)
+                if max_stations is not None and len(selected) >= max_stations:
+                    return
+                ratio = (weights[covered].sum() / total_weight) if total_weight > 0 else 0.0
+                if ratio >= stop_at_ratio:
+                    return
+
+        # Фаза 1: зарядки типа А — большая часть спроса, без сближения друг с другом
+        run_phase("charge_a", type_a_coverage_ratio, exclude_near_getter=lambda: type_a_indices)
+
+        # Фаза 2: дополнительные зарядки — до 100%; не дублируем доп. в радиусе, рядом с типом А можно
+        run_phase("charge_extra", 1.0, exclude_near_getter=lambda: [selected_indices[i] for i in range(len(selected)) if selected[i]["station_type"] == "charge_extra"])
 
         gdf = gpd.GeoDataFrame(selected, crs=candidates.crs) if selected else gpd.GeoDataFrame()
-        covered_weight = weights[covered].sum()
+        covered_weight = float(weights[covered].sum())
+        n_a = sum(1 for r in selected if r["station_type"] == "charge_a")
+        n_extra = sum(1 for r in selected if r["station_type"] == "charge_extra")
         metrics = {
             "placed": len(selected),
-            "demand_covered": float(covered_weight),
-            "demand_total": float(total_weight),
-            "coverage_ratio": float(covered_weight / total_weight) if total_weight > 0 else 0.0,
+            "placed_type_a": n_a,
+            "placed_extra": n_extra,
+            "demand_covered": covered_weight,
+            "demand_total": total_weight,
+            "coverage_ratio": covered_weight / total_weight if total_weight > 0 else 0.0,
         }
-        self.logger.info(f"Зарядки: размещено {len(selected)}, покрытие спроса {metrics['coverage_ratio']:.2%}")
+        self.logger.info(
+            f"Зарядки: тип А {n_a}, доп. {n_extra}, покрытие {metrics['coverage_ratio']:.2%}"
+        )
         return gdf, metrics
 
     # --- Шаг 3: магистральный граф (узлы: Charge_A + гаражи/ТО; рёбра: Delaunay/kNN) ---
@@ -206,11 +272,13 @@ class StationPlacement:
         max_edge_km: float = R_GARAGE_TO_KM,
         k_neighbors: int = 5,
     ) -> nx.Graph:
-        """Строит граф магистрали: узлы — зарядки (Charge_A), гаражи, ТО; рёбра — Delaunay/kNN, длина не больше max_edge_km."""
+        """Строит граф магистрали в виде окружности: узлы — зарядки типа А, гаражи, ТО; рёбра — по выпуклой оболочке (кольцо) + связи внутренних узлов с кольцом."""
         nodes_list = []
         node_ids = []
-        # Зарядки
+        # Только зарядки типа А (доп. зарядки не участвуют в магистрали)
         for i, row in (charge_stations.iterrows() if charge_stations is not None and len(charge_stations) > 0 else []):
+            if row.get("station_type") != "charge_a":
+                continue
             g = row.geometry
             nodes_list.append((_coords_from_geom(g), "charge", f"charge_{i}"))
             node_ids.append(f"charge_{i}")
@@ -234,43 +302,49 @@ class StationPlacement:
         pts = np.array([[c[0][0], c[0][1]] for c in nodes_list])
         id_by_idx = [c[2] for c in nodes_list]
 
-        # Рёбра: Delaunay + фильтр по длине
         G = nx.Graph()
         for (lon, lat), typ, nid in nodes_list:
             G.add_node(nid, lon=lon, lat=lat, node_type=typ)
 
+        # Рёбра по выпуклой оболочке — магистраль в виде окружности (кольцо)
         try:
-            tri = Delaunay(pts)
-            for simplex in tri.simplices:
-                for i in range(3):
-                    u, v = simplex[i], simplex[(i + 1) % 3]
-                    uid, vid = id_by_idx[u], id_by_idx[v]
-                    if G.has_edge(uid, vid):
+            hull = ConvexHull(pts)
+            n_hull = len(hull.vertices)
+            for k in range(n_hull):
+                i, j = hull.vertices[k], hull.vertices[(k + 1) % n_hull]
+                uid, vid = id_by_idx[i], id_by_idx[j]
+                d_km = haversine_km(pts[i, 1], pts[i, 0], pts[j, 1], pts[j, 0])
+                if d_km <= max_edge_km and not G.has_edge(uid, vid):
+                    G.add_edge(uid, vid, weight=d_km, length=d_km)
+            # Внутренние узлы: соединяем с ближайшей точкой на оболочке, чтобы граф оставался связным
+            if n_hull < len(pts):
+                tree = cKDTree(pts[hull.vertices])
+                for i in range(len(pts)):
+                    if i in hull_vertices:
                         continue
-                    lat1, lon1 = pts[u, 1], pts[u, 0]
-                    lat2, lon2 = pts[v, 1], pts[v, 0]
-                    d_km = haversine_km(lat1, lon1, lat2, lon2)
-                    if d_km <= max_edge_km:
+                    uid = id_by_idx[i]
+                    _, nearest_idx = tree.query(pts[i], k=1)
+                    j = hull.vertices[int(nearest_idx) if np.isscalar(nearest_idx) else nearest_idx[0]]
+                    vid = id_by_idx[j]
+                    d_km = haversine_km(pts[i, 1], pts[i, 0], pts[j, 1], pts[j, 0])
+                    if d_km <= max_edge_km and not G.has_edge(uid, vid):
                         G.add_edge(uid, vid, weight=d_km, length=d_km)
+            self.logger.info(f"Trunk (окружность): {G.number_of_nodes()} узлов, {G.number_of_edges()} рёбер, оболочка из {n_hull} точек")
         except Exception as e:
-            self.logger.warning(f"Delaunay trunk: {e}, fallback to kNN")
-            tree = cKDTree(pts)
-            for i in range(len(pts)):
-                uid = id_by_idx[i]
-                lat1, lon1 = pts[i, 1], pts[i, 0]
-                dists, idxs = tree.query(pts, k=min(k_neighbors + 1, len(pts)))
-                if not hasattr(dists, "__len__"):
-                    dists, idxs = [dists], [idxs]
-                for j, (d_deg, jj) in enumerate(zip(dists, idxs)):
-                    if jj == i or jj >= len(id_by_idx):
-                        continue
-                    d_km = haversine_km(lat1, lon1, pts[jj, 1], pts[jj, 0])
-                    if d_km <= max_edge_km:
-                        vid = id_by_idx[jj]
-                        if not G.has_edge(uid, vid):
+            self.logger.warning(f"Trunk по оболочке: {e}, fallback Delaunay")
+            try:
+                tri = Delaunay(pts)
+                for simplex in tri.simplices:
+                    for i in range(3):
+                        u, v = simplex[i], simplex[(i + 1) % 3]
+                        uid, vid = id_by_idx[u], id_by_idx[v]
+                        if G.has_edge(uid, vid):
+                            continue
+                        d_km = haversine_km(pts[u, 1], pts[u, 0], pts[v, 1], pts[v, 0])
+                        if d_km <= max_edge_km:
                             G.add_edge(uid, vid, weight=d_km, length=d_km)
-
-        self.logger.info(f"Trunk: {G.number_of_nodes()} узлов, {G.number_of_edges()} рёбер")
+            except Exception as e2:
+                self.logger.warning(f"Delaunay fallback: {e2}")
         return G
 
     # --- Шаг 4: гаражи (k-median по спросу, только промзоны) ---
@@ -440,18 +514,21 @@ class StationPlacement:
 
 def run_full_pipeline(
     data_service,
-    graph_service,
     city_name: str,
     network_type: str = "drive",
     simplify: bool = True,
     *,
+    demand_method: str = "dbscan",
     demand_cell_m: float = 250.0,
+    dbscan_eps_m: float = 180.0,
+    dbscan_min_samples: int = 15,
+    use_all_buildings: bool = False,
     max_charge_stations: Optional[int] = None,
     num_garages: int = 3,
     num_to: int = 2,
 ) -> Dict[str, Any]:
     """
-    Запускает полный пайплайн: данные города → спрос → зарядки → гаражи/ТО кандидаты → trunk → гаражи/ТО → метрики.
+    Запускает полный пайплайн: данные города → спрос (DBSCAN или сетка) → зарядки → гаражи/ТО → метрики.
     """
     logger = logging.getLogger(__name__)
     data = data_service.get_city_data(city_name, network_type=network_type, simplify=simplify, load_no_fly_zones=True)
@@ -460,10 +537,18 @@ def run_full_pipeline(
     city_boundary = data.get("city_boundary")
     no_fly_zones = data.get("no_fly_zones")
 
-    placement = StationPlacement(data_service, graph_service, logger=logger)
+    placement = StationPlacement(data_service, logger=logger)
 
-    # Шаг 1: спрос
-    demand = placement.build_demand_points(buildings, road_graph, city_boundary, cell_size_m=demand_cell_m)
+    # Шаг 1: спрос (DBSCAN по умолчанию)
+    demand = placement.build_demand_points(
+        buildings, road_graph, city_boundary,
+        method=demand_method,
+        cell_size_m=demand_cell_m,
+        dbscan_eps_m=dbscan_eps_m,
+        dbscan_min_samples=dbscan_min_samples,
+        use_all_buildings=use_all_buildings,
+        no_fly_zones=no_fly_zones,
+    )
     if demand is None or len(demand) == 0:
         return {"error": "Нет точек спроса", "demand": None, "charge_stations": None, "garages": None, "to_stations": None, "trunk_graph": None, "metrics": {}}
 
@@ -479,7 +564,15 @@ def run_full_pipeline(
         parts.append(candidates_rooftop)
     if candidates_ground is not None and len(candidates_ground) > 0:
         parts.append(candidates_ground)
-    charge_candidates = gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), crs=(parts[0].crs if parts else "EPSG:4326")) if parts else gpd.GeoDataFrame()
+    charge_candidates_full = gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), crs=(parts[0].crs if parts else "EPSG:4326")) if parts else gpd.GeoDataFrame()
+
+    # При спросе по DBSCAN: кандидаты зарядки строим относительно кластеров (ближайшая крыша/площадка к каждому кластеру)
+    if demand_method == "dbscan" and charge_candidates_full is not None and len(charge_candidates_full) > 0:
+        charge_candidates = placement.build_charge_candidates_from_clusters(
+            demand, charge_candidates_full, radius_km=R_CHARGE_KM, max_distance_km=R_CHARGE_KM * 2.0
+        )
+    else:
+        charge_candidates = charge_candidates_full
 
     # Шаг 2: зарядки
     charge_stations, charge_metrics = placement.place_charging_stations(

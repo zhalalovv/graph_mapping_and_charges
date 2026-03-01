@@ -1,16 +1,13 @@
 import numpy as np
 import networkx as nx
 from shapely.geometry import Point, LineString, Polygon
-from shapely.ops import unary_union, nearest_points
+from shapely.ops import unary_union
 from shapely.prepared import prep
 import geopandas as gpd
 from scipy.spatial import Delaunay, cKDTree
 from shapely.strtree import STRtree
 import logging
 from typing import Tuple, List, Optional, Union
-from collections import defaultdict
-
-
 class GraphService:
     """Сервис для генерации различных типов графов для планирования маршрутов дронов"""
     
@@ -26,15 +23,10 @@ class GraphService:
         min_clearance: float = 0.0001,
         city_boundary: Optional[Polygon] = None,
         points: Optional[List[Tuple[float, float]]] = None,
-        add_perpendicular_edges: bool = True,
-        max_perpendicular_distance_deg: float = 0.009,
-        add_vertex_to_midpoint_edges: bool = True,
-        add_centroid_refinement: bool = True,
-        max_triangle_area_deg2: float = 0.00004,
     ) -> nx.Graph:
         """
         Создает граф на основе триангуляции Делоне по точкам высадки или центроидам зданий.
-        
+
         Args:
             bounds: (min_lon, min_lat, max_lon, max_lat)
             num_points: игнорируется при наличии buildings или points
@@ -43,12 +35,7 @@ class GraphService:
             min_clearance: минимальное расстояние от препятствий
             city_boundary: границы города для фильтрации
             points: если задан — узлы графа строятся по этим точкам (lon, lat), иначе по центроидам зданий
-            add_perpendicular_edges: добавлять перпендикуляры между противоположными рёбрами смежных треугольников
-            max_perpendicular_distance_deg: макс. длина перпендикуляра в градусах (~0.009 ≈ 1000 м)
-            add_vertex_to_midpoint_edges: добавлять рёбра от вершин в центр (середину) противолежащего ребра
-            add_centroid_refinement: делить крупные треугольники — добавлять узел в центр, соединять с вершинами
-            max_triangle_area_deg2: порог площади (deg²) — треугольники больше делятся (~4e-5 ≈ 0.5 км²)
-            
+
         Returns:
             NetworkX граф
         """
@@ -118,19 +105,6 @@ class GraphService:
                     if not self._line_intersects_obstacles(line, obstacles):
                         distance = self._calculate_distance(p1[1], p1[0], p2[1], p2[0])
                         G.add_edge(n1, n2, weight=distance, length=distance)
-        
-        if add_perpendicular_edges:
-            G = self._add_perpendicular_edges(
-                G, points_arr, tri, obstacles, max_perpendicular_distance_deg
-            )
-        
-        if add_vertex_to_midpoint_edges:
-            G = self._add_vertex_to_midpoint_edges(G, points_arr, tri, obstacles)
-        
-        if add_centroid_refinement and max_triangle_area_deg2 > 0:
-            G = self._add_centroid_refinement(
-                G, points_arr, tri, obstacles, max_triangle_area_deg2
-            )
         
         G = self._remove_nodes_in_obstacles(G, obstacles)
         G = self._remove_edges_over_obstacles(G, obstacles)
@@ -203,268 +177,6 @@ class GraphService:
             G.remove_edge(u, v)
         if to_remove:
             self.logger.info(f"Удалено {len(to_remove)} рёбер над no_fly_zones")
-        return G
-    
-    def _add_perpendicular_edges(
-        self,
-        G: nx.Graph,
-        points_arr: np.ndarray,
-        tri,
-        obstacles: Optional[Polygon],
-        max_distance_deg: float,
-    ) -> nx.Graph:
-        """
-        Добавляет перпендикулярные рёбра между противоположными рёбрами смежных треугольников Delaunay.
-        Для каждой внутренней стороны (общей для 2 треугольников) берутся два противоположных ребра
-        четырёхугольника и соединяются кратчайшим перпендикуляром.
-        """
-        # Собираем пары противоположных рёбер: для каждого internal edge (n1,n2) получаем
-        # два треугольника, откуда пары (n1,n3)-(n2,n4) и (n2,n3)-(n1,n4)
-        edge_to_triangles = defaultdict(list)  # (min(n1,n2), max(n1,n2)) -> [simplex_idx, ...]
-        for idx, simplex in enumerate(tri.simplices):
-            for i in range(3):
-                a, b = simplex[i], simplex[(i + 1) % 3]
-                key = (min(a, b), max(a, b))
-                edge_to_triangles[key].append(idx)
-        
-        next_node_id = len(points_arr)
-        perpendiculars_added = 0
-        processed_pairs = set()  # frozenset({(a,b),(c,d)}) чтобы не дублировать
-        
-        for (n1, n2), tri_idxs in edge_to_triangles.items():
-            if len(tri_idxs) != 2:
-                continue  # граничное ребро
-            s1, s2 = tri.simplices[tri_idxs[0]], tri.simplices[tri_idxs[1]]
-            # Находим общие вершины n1,n2 и оставшиеся n3, n4
-            common = set(s1) & set(s2)
-            others = (set(s1) | set(s2)) - common
-            if len(common) != 2 or len(others) != 2:
-                continue
-            n3, n4 = list(others)
-            # Пары противоположных рёбер (без общей вершины): (n1,n3)-(n2,n4) и (n1,n4)-(n2,n3)
-            pairs = [
-                ((n1, n3), (n2, n4)),
-                ((n1, n4), (n2, n3)),
-            ]
-            for (e1_a, e1_b), (e2_a, e2_b) in pairs:
-                pair_key = frozenset([(min(e1_a, e1_b), max(e1_a, e1_b)), (min(e2_a, e2_b), max(e2_a, e2_b))])
-                if pair_key in processed_pairs:
-                    continue
-                processed_pairs.add(pair_key)
-                if not G.has_edge(e1_a, e1_b) or not G.has_edge(e2_a, e2_b):
-                    continue
-                line1 = LineString([points_arr[e1_a], points_arr[e1_b]])
-                line2 = LineString([points_arr[e2_a], points_arr[e2_b]])
-                try:
-                    pt1, pt2 = nearest_points(line1, line2)
-                except Exception:
-                    continue
-                lon1, lat1 = pt1.x, pt1.y
-                lon2, lat2 = pt2.x, pt2.y
-                if self._is_point_in_obstacles(Point(lon1, lat1), obstacles) or self._is_point_in_obstacles(Point(lon2, lat2), obstacles):
-                    continue
-                dist_deg = np.hypot(lon2 - lon1, lat2 - lat1)
-                if dist_deg <= 1e-9 or dist_deg > max_distance_deg:
-                    continue
-                perp_line = LineString([pt1, pt2])
-                if self._line_intersects_obstacles(perp_line, obstacles):
-                    continue
-                # Добавляем узлы и ребро; разбиваем исходные рёбра
-                id1, id2 = next_node_id, next_node_id + 1
-                next_node_id += 2
-                G.add_node(id1, lat=lat1, lon=lon1, pos=(lon1, lat1))
-                G.add_node(id2, lat=lat2, lon=lon2, pos=(lon2, lat2))
-                dist_km = self._calculate_distance(lat1, lon1, lat2, lon2)
-                G.add_edge(id1, id2, weight=dist_km, length=dist_km)
-                perpendiculars_added += 1
-                # Подключаем к графу: id1 на линии (e1_a,e1_b), id2 на (e2_a,e2_b)
-                for (na, nb), (nid, flon, flat) in [
-                    ((e1_a, e1_b), (id1, lon1, lat1)),
-                    ((e2_a, e2_b), (id2, lon2, lat2)),
-                ]:
-                    G.remove_edge(na, nb)
-                    pa, pb = points_arr[na], points_arr[nb]
-                    da = self._calculate_distance(pa[1], pa[0], flat, flon)
-                    db = self._calculate_distance(pb[1], pb[0], flat, flon)
-                    G.add_edge(na, nid, weight=da, length=da)
-                    G.add_edge(nid, nb, weight=db, length=db)
-        
-        if perpendiculars_added > 0:
-            self.logger.info(f"Добавлено {perpendiculars_added} перпендикулярных рёбер")
-        return G
-    
-    def _add_vertex_to_midpoint_edges(
-        self,
-        G: nx.Graph,
-        points_arr: np.ndarray,
-        tri,
-        obstacles: Optional[Polygon],
-    ) -> nx.Graph:
-        """
-        Добавляет рёбра от каждой вершины треугольника в центр (середину) противолежащего ребра.
-        Для треугольника ABC: A->mid(BC), B->mid(AC), C->mid(AB).
-        Пропускает треугольники, близкие к равносторонним: их медианы уходят в пустую область
-        (ранее no_fly_zone), такие рёбра не добавляем.
-        """
-        def get_node_coords(n):
-            if n < len(points_arr):
-                return points_arr[n][0], points_arr[n][1]
-            d = G.nodes.get(n, {})
-            return d.get("lon", d.get("pos", (0, 0))[0]), d.get("lat", d.get("pos", (0, 0))[1])
-        
-        def find_edge_containing_point(ua, wb, mid_pt):
-            """Находит ребро на пути ua->wb, содержащее точку mid_pt."""
-            try:
-                path = nx.shortest_path(G, ua, wb)
-            except (nx.NetworkXNoPath, nx.NodeNotFound):
-                return None
-            pt = Point(mid_pt.x, mid_pt.y)
-            tol = 1e-8
-            for i in range(len(path) - 1):
-                a, b = path[i], path[i + 1]
-                ax, ay = get_node_coords(a)
-                bx, by = get_node_coords(b)
-                line = LineString([(ax, ay), (bx, by)])
-                if line.distance(pt) > tol:
-                    continue
-                proj = line.project(pt)
-                if -tol <= proj <= line.length + tol:
-                    return (a, b)
-            return None
-        
-        # Пропуск треугольников, близких к равносторонним: медианы уходят в пустоту (бывшая no_fly_zone)
-        EQUILATERAL_SIDE_RATIO = 1.25  # max(side)/min(side) < this => считаем равносторонним
-
-        edge_to_midpoint_id = {}
-        next_node_id = max(G.nodes(), default=-1) + 1
-        added = 0
-        mid_pt = Point(0, 0)  # placeholder
-
-        for simplex in tri.simplices:
-            a, b, c = simplex[0], simplex[1], simplex[2]
-            pa, pb, pc = points_arr[a], points_arr[b], points_arr[c]
-
-            # Не добавляем медианы, если внутри треугольника есть запретная зона —
-            # иначе рёбра из углов уходят в воду/в зону (лишние зелёные линии на карте)
-            if obstacles is not None:
-                try:
-                    tri_poly = Polygon([pa, pb, pc])
-                    if tri_poly.is_valid and not tri_poly.is_empty and obstacles.intersects(tri_poly):
-                        continue
-                except Exception:
-                    pass
-
-            # Пропуск треугольников, близких к равносторонним: медианы уходят в пустоту
-            len_bc = self._calculate_distance(pb[1], pb[0], pc[1], pc[0])
-            len_ac = self._calculate_distance(pa[1], pa[0], pc[1], pc[0])
-            len_ab = self._calculate_distance(pa[1], pa[0], pb[1], pb[0])
-            sides = [len_ab, len_bc, len_ac]
-            min_side, max_side = min(sides), max(sides)
-            if min_side > 1e-9 and max_side / min_side < EQUILATERAL_SIDE_RATIO:
-                continue  # равносторонний — не добавляем рёбра вершина->середина
-
-            for i in range(3):
-                v = simplex[i]
-                u, w = simplex[(i + 1) % 3], simplex[(i + 2) % 3]
-                edge_key = (min(u, w), max(u, w))
-                pu, pw, pv = points_arr[u], points_arr[w], points_arr[v]
-                mid_lon = (pu[0] + pw[0]) / 2
-                mid_lat = (pu[1] + pw[1]) / 2
-                mid_pt = Point(mid_lon, mid_lat)
-                if self._is_point_in_obstacles(mid_pt, obstacles):
-                    continue
-                if edge_key not in edge_to_midpoint_id:
-                    mid_id = next_node_id
-                    next_node_id += 1
-                    G.add_node(mid_id, lat=mid_lat, lon=mid_lon, pos=(mid_lon, mid_lat))
-                    edge_to_midpoint_id[edge_key] = mid_id
-                    if G.has_edge(u, w):
-                        G.remove_edge(u, w)
-                        d_um = self._calculate_distance(pu[1], pu[0], mid_lat, mid_lon)
-                        d_mw = self._calculate_distance(mid_lat, mid_lon, pw[1], pw[0])
-                        G.add_edge(u, mid_id, weight=d_um, length=d_um)
-                        G.add_edge(mid_id, w, weight=d_mw, length=d_mw)
-                    else:
-                        seg = find_edge_containing_point(u, w, mid_pt)
-                        if seg:
-                            a, b = seg
-                            G.remove_edge(a, b)
-                            ax, ay = get_node_coords(a)
-                            bx, by = get_node_coords(b)
-                            d_am = self._calculate_distance(ay, ax, mid_lat, mid_lon)
-                            d_mb = self._calculate_distance(mid_lat, mid_lon, by, bx)
-                            G.add_edge(a, mid_id, weight=d_am, length=d_am)
-                            G.add_edge(mid_id, b, weight=d_mb, length=d_mb)
-                        else:
-                            d_um = self._calculate_distance(pu[1], pu[0], mid_lat, mid_lon)
-                            d_mw = self._calculate_distance(mid_lat, mid_lon, pw[1], pw[0])
-                            G.add_edge(u, mid_id, weight=d_um, length=d_um)
-                            G.add_edge(mid_id, w, weight=d_mw, length=d_mw)
-                mid_id = edge_to_midpoint_id[edge_key]
-                line_vm = LineString([pv, (mid_lon, mid_lat)])
-                if self._line_intersects_obstacles(line_vm, obstacles):
-                    continue
-                if not G.has_edge(v, mid_id):
-                    dist = self._calculate_distance(pv[1], pv[0], mid_lat, mid_lon)
-                    G.add_edge(v, mid_id, weight=dist, length=dist)
-                    added += 1
-        
-        if added > 0:
-            self.logger.info(f"Добавлено {added} рёбер вершина->центр противолежащего ребра")
-        return G
-
-    def _add_centroid_refinement(
-        self,
-        G: nx.Graph,
-        points_arr: np.ndarray,
-        tri,
-        obstacles: Optional[Polygon],
-        max_area_deg2: float,
-    ) -> nx.Graph:
-        """
-        Делит крупные треугольники: добавляет узел в центроид и соединяет с вершинами.
-        Увеличивает вариации движения в разреженных зонах (вода, поля, леса).
-        """
-        def get_node_coords(n):
-            if n < len(points_arr):
-                return points_arr[n][0], points_arr[n][1]
-            d = G.nodes.get(n, {})
-            return d.get("lon", d.get("pos", (0, 0))[0]), d.get("lat", d.get("pos", (0, 0))[1])
-
-        next_node_id = max(G.nodes(), default=-1) + 1
-        added_nodes = 0
-        added_edges = 0
-
-        for simplex in tri.simplices:
-            a, b, c = simplex[0], simplex[1], simplex[2]
-            pa, pb, pc = points_arr[a], points_arr[b], points_arr[c]
-            try:
-                tri_poly = Polygon([pa, pb, pc])
-            except Exception:
-                continue
-            if not tri_poly.is_valid or tri_poly.is_empty:
-                continue
-            area_deg2 = tri_poly.area
-            if area_deg2 < max_area_deg2:
-                continue
-            centroid = tri_poly.centroid
-            cen_lon, cen_lat = centroid.x, centroid.y
-            if self._is_point_in_obstacles(centroid, obstacles):
-                continue
-            cen_id = next_node_id
-            next_node_id += 1
-            G.add_node(cen_id, lat=cen_lat, lon=cen_lon, pos=(cen_lon, cen_lat))
-            added_nodes += 1
-            for v in (a, b, c):
-                pv = get_node_coords(v)
-                line = LineString([(cen_lon, cen_lat), pv])
-                if not self._line_intersects_obstacles(line, obstacles) and not G.has_edge(cen_id, v):
-                    dist = self._calculate_distance(cen_lat, cen_lon, pv[1], pv[0])
-                    G.add_edge(cen_id, v, weight=dist, length=dist)
-                    added_edges += 1
-
-        if added_nodes > 0:
-            self.logger.info(f"Центроидная доработка: +{added_nodes} узлов, +{added_edges} рёбер (площадь>{max_area_deg2:.2e} deg²)")
         return G
 
     def _prepare_obstacles(
