@@ -678,6 +678,10 @@ class DataService:
         'school', 'university', 'college', 'hospital', 'kindergarten', 'civic', 'government',
         'train_station', 'service',
     ))
+    # Объекты энергетики, которые нельзя использовать для размещения станций (подстанции и т.п.)
+    EXCLUDE_POWER_TAGS = frozenset((
+        'substation', 'sub_station', 'plant', 'generator', 'transformer',
+    ))
     # Вес спроса: многоквартирники дают повышенный спрос (больше людей)
     APARTMENT_DEMAND_WEIGHT = 4
 
@@ -725,6 +729,10 @@ class DataService:
                     for _, row in gdf.iterrows():
                         g = row.geometry
                         if g is None or not getattr(g, "is_valid", True):
+                            continue
+                        # Отбрасываем энергообъекты: подстанции и пр. (power=*)
+                        power_tag = str(row.get("power") or "").lower().strip()
+                        if power_tag in self.EXCLUDE_POWER_TAGS:
                             continue
                         if g.geom_type == "Polygon":
                             industrial.append(g)
@@ -839,12 +847,25 @@ class DataService:
         if len(buildings) == 0:
             return gpd.GeoDataFrame()
 
+        # Объединённая геометрия зданий, чтобы не ставить станции прямо "на крыше" действующих объектов
+        buildings_union = None
+        try:
+            geoms = [g for g in buildings.geometry if g is not None and getattr(g, "is_valid", True)]
+            if geoms:
+                buildings_union = unary_union(geoms)
+        except Exception:
+            buildings_union = None
+
         rows = []
         if station_type == "rooftop":
             buildings = self._building_footprint_area_m2(buildings)
             for idx, row in buildings.iterrows():
                 geom = row.geometry
                 if geom is None or not geom.is_valid:
+                    continue
+                # Не используем здания с power=* (подстанции, энергообъекты)
+                power_tag = str(row.get("power") or "").lower().strip()
+                if power_tag in self.EXCLUDE_POWER_TAGS:
                     continue
                 area = row.get("area_m2", 0) or 0
                 if area < min_roof:
@@ -895,6 +916,21 @@ class DataService:
                     c = poly.centroid
                     if not self._point_outside_no_fly(c, no_fly_zones, buffer_deg):
                         continue
+                    # Не используем промзоны, которые являются подстанциями/энергообъектами (power=*)
+                    try:
+                        # У промзон из OSM теги лежат в properties GeoDataFrame; при загрузке выше мы их не сохраняем,
+                        # поэтому фильтруем по геометрии позже через пересечение с подстанциями нельзя без доп. запросов.
+                        # Здесь оставляем проверку только по buildings_union (см. ниже), а power-теги режем в _load_industrial_and_parking_areas.
+                        pass
+                    except Exception:
+                        pass
+                    # Не ставим гаражи/ТО прямо на зданиях (электробудки, корпуса заводов и т.п.)
+                    if buildings_union is not None:
+                        try:
+                            if buildings_union.contains(c) or buildings_union.intersects(c):
+                                continue
+                        except Exception:
+                            pass
                     crs_utm = gpd.GeoSeries([poly], crs="EPSG:4326").estimate_utm_crs()
                     area = gpd.GeoSeries([poly], crs="EPSG:4326").to_crs(crs_utm).iloc[0].area
                     if area < min_ground:
