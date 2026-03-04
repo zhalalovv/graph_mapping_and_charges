@@ -655,17 +655,30 @@ class DataService:
     #   площадь footprint ≥ ROOF_MIN_AREA_M2; здания грузятся по tags={"building": True}.
     # Зарядки (земля), гаражи, ТО: промзоны и парковки из _load_industrial_and_parking_areas:
     #   landuse=industrial | warehouse; building=industrial | warehouse | factory | manufacture;
-    #   amenity=parking; parking=True. Гаражи и ТО — только промзоны (industrial), без парковок.
+    #   amenity=parking; parking=True.
+    #   Гаражи и ТО — только здания в промзонах (industrial), без парковок.
     #
     NO_FLY_BUFFER_DEGREES_PER_M = 0.000009  # ~1 м в градусах на широте ~55
     ROOF_MIN_AREA_M2 = 80.0  # минимальная площадь крыши для крышной зарядки
     GROUND_MIN_AREA_M2 = 100.0  # минимальная площадка для наземной зарядки
-    # Крышные зарядки: МКД + коммерция/офисы (building=* из списка)
+    # Крышные зарядки: только МКД (многоквартирные дома), без коммерции/офисов
+    # Используем тот же набор тегов, что и в _is_apartment.
     ALLOWED_ROOF_BUILDING_TAGS = frozenset((
         'apartments', 'apartment', 'apartment_block', 'multistory', 'block', 'flats',
-        'semidetached_house', 'dormitory', 'hotel',
-        'commercial', 'office', 'retail', 'supermarket', 'civic', 'public', 'service',
+        'semidetached_house',
     ))
+    # Допустимые типы зданий для гаражей/ТО внутри промзон
+    ALLOWED_INDUSTRIAL_BUILDING_TAGS = frozenset((
+        'industrial', 'warehouse', 'factory', 'manufacture', 'garages', 'garage',
+        'service', 'commercial',
+    ))
+    # Ключевые слова тяжёлой промышленности/опасных объектов, которых нужно избегать
+    FORBIDDEN_INDUSTRIAL_KEYWORDS = (
+        'пив', 'brew', 'beer',             # пивкомбинаты / breweries
+        'завод', 'комбинат',              # крупные заводы/комбинаты
+        'судоремонт', 'судостро', 'верф', 'ship', 'dock', 'shipyard',
+        'химволокн', 'химическ', 'цемент', 'совхоз',  # заводы, химзаводы, совхозы
+    )
     # Спрос доставки: только жилые + часть коммерции; пром/склады — только для кандидатов станций, не для спроса
     DEMAND_BUILDING_TAGS = frozenset((
         'house', 'residential', 'apartments', 'apartment', 'apartment_block', 'multistory', 'block', 'flats',
@@ -682,6 +695,8 @@ class DataService:
     EXCLUDE_POWER_TAGS = frozenset((
         'substation', 'sub_station', 'plant', 'generator', 'transformer',
     ))
+    # Буфер вокруг подстанций (м), чтобы гаражи/ТО не ставились рядом
+    POWER_SUBSTATION_BUFFER_M = 30.0
     # Вес спроса: многоквартирники дают повышенный спрос (больше людей)
     APARTMENT_DEMAND_WEIGHT = 4
 
@@ -706,14 +721,95 @@ class DataService:
             self.logger.info(f"Спрос доставки: оставлено {len(out)} зданий из {len(buildings)} (жилые + retail/office, без пром/складов)")
         return out
 
+    def _industrial_polygon_is_forbidden(self, row) -> bool:
+        """True, если у объекта OSM (промзона/здание) в тегах есть ключевые слова заводов/опасных объектов."""
+        text_fields = []
+        for key in ("name", "industrial", "craft", "operator", "brand"):
+            val = row.get(key) if hasattr(row, "get") else None
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                continue
+            text_fields.append(str(val).lower())
+        combined = " ".join(text_fields)
+        if not combined:
+            return False
+        return any(k in combined for k in self.FORBIDDEN_INDUSTRIAL_KEYWORDS)
+
+    def _load_power_substation_geometries(self, bbox_osm, crs_4326):
+        """
+        Загружает из OSM геометрии подстанций и других энергообъектов (power=substation, plant, etc.).
+        bbox_osm: (north, south, east, west). Returns: list of Shapely geometry (4326).
+        """
+        north, south, east, west = bbox_osm
+        geoms = []
+        try:
+            for power_val in self.EXCLUDE_POWER_TAGS:
+                gdf = ox.features_from_bbox(bbox=(north, south, east, west), tags={"power": power_val})
+                if gdf is None or len(gdf) == 0:
+                    continue
+                if gdf.crs is None:
+                    gdf = gdf.set_crs("EPSG:4326")
+                gdf = gdf.to_crs(crs_4326)
+                for _, row in gdf.iterrows():
+                    g = row.geometry
+                    if g is None or not getattr(g, "is_valid", True):
+                        continue
+                    if g.geom_type == "Point":
+                        geoms.append(g)
+                    elif g.geom_type == "Polygon":
+                        geoms.append(g)
+                    elif g.geom_type == "MultiPolygon":
+                        for poly in g.geoms:
+                            if poly.is_valid and not poly.is_empty:
+                                geoms.append(poly)
+        except Exception as e:
+            self.logger.warning(f"Загрузка подстанций OSM: {e}")
+        return geoms
+
+    def get_power_substation_buffer_union(self, buildings):
+        """
+        Возвращает объединённую геометрию буферов (POWER_SUBSTATION_BUFFER_M м) вокруг всех
+        подстанций/энергообъектов: из зданий с power=* и из OSM (power=substation и др.).
+        Используется для жёсткого исключения кандидатов гаража/ТО из этой зоны.
+        Returns: Shapely geometry (union) или None.
+        """
+        if buildings is None or len(buildings) == 0:
+            return None
+        try:
+            buildings = buildings.to_crs("EPSG:4326")
+            power_geoms = []
+            buffer_deg = self.POWER_SUBSTATION_BUFFER_M * self.NO_FLY_BUFFER_DEGREES_PER_M
+            for _, row in buildings.iterrows():
+                geom = row.geometry
+                if geom is None or not getattr(geom, "is_valid", True):
+                    continue
+                if str(row.get("power") or "").lower().strip() in self.EXCLUDE_POWER_TAGS:
+                    try:
+                        power_geoms.append(geom.buffer(buffer_deg))
+                    except Exception:
+                        continue
+            bbox_osm = (buildings.total_bounds[3], buildings.total_bounds[1], buildings.total_bounds[2], buildings.total_bounds[0])
+            for g in self._load_power_substation_geometries(bbox_osm, "EPSG:4326"):
+                try:
+                    power_geoms.append(g.buffer(buffer_deg))
+                except Exception:
+                    continue
+            if not power_geoms:
+                return None
+            return unary_union(power_geoms)
+        except Exception as e:
+            self.logger.warning(f"get_power_substation_buffer_union: {e}")
+            return None
+
     def _load_industrial_and_parking_areas(self, bbox_osm, crs_4326):
         """
         Загружает полигоны промзон и парковок/площадок из OSM по bbox.
         bbox_osm: (north, south, east, west).
-        Returns: dict with 'industrial': list of Shapely polygons (4326), 'parking': list of (centroid Point or polygon).
+        Returns: dict with 'industrial': list of Shapely polygons (4326), 'parking': list of (centroid Point or polygon),
+                 'industrial_forbidden': list of polygons территории заводов/опасных объектов (не ставить ТО/гараж).
         """
         north, south, east, west = bbox_osm
         industrial = []
+        industrial_forbidden = []
         parking = []
         try:
             # Промзоны: landuse=industrial, warehouse; здания industrial/warehouse
@@ -734,12 +830,19 @@ class DataService:
                         power_tag = str(row.get("power") or "").lower().strip()
                         if power_tag in self.EXCLUDE_POWER_TAGS:
                             continue
+                        is_forbidden = self._industrial_polygon_is_forbidden(row)
                         if g.geom_type == "Polygon":
-                            industrial.append(g)
+                            if is_forbidden:
+                                industrial_forbidden.append(g)
+                            else:
+                                industrial.append(g)
                         elif g.geom_type == "MultiPolygon":
                             for poly in g.geoms:
                                 if poly.is_valid and not poly.is_empty:
-                                    industrial.append(poly)
+                                    if is_forbidden:
+                                        industrial_forbidden.append(poly)
+                                    else:
+                                        industrial.append(poly)
         except Exception as e:
             self.logger.warning(f"Загрузка промзон OSM: {e}")
         try:
@@ -768,7 +871,7 @@ class DataService:
                                 pass
         except Exception as e:
             self.logger.warning(f"Загрузка парковок OSM: {e}")
-        return {"industrial": industrial, "parking": parking}
+        return {"industrial": industrial, "parking": parking, "industrial_forbidden": industrial_forbidden}
 
     def _building_footprint_area_m2(self, buildings: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         """Добавляет колонку area_m2 — площадь footprint здания в м² (в UTM)."""
@@ -856,6 +959,34 @@ class DataService:
         except Exception:
             buildings_union = None
 
+        # Буфер вокруг подстанций/энергообъектов (power=*), чтобы не ставить гаражи/ТО ближе заданного расстояния.
+        # Учитываем и здания с power=*, и отдельные объекты power=* из OSM (подстанции часто не в слое зданий).
+        power_buffer_union = None
+        try:
+            power_geoms = []
+            buffer_deg = self.POWER_SUBSTATION_BUFFER_M * self.NO_FLY_BUFFER_DEGREES_PER_M
+            for _idx, row in buildings.iterrows():
+                geom = row.geometry
+                if geom is None or not getattr(geom, "is_valid", True):
+                    continue
+                power_tag = str(row.get("power") or "").lower().strip()
+                if power_tag in self.EXCLUDE_POWER_TAGS:
+                    try:
+                        power_geoms.append(geom.buffer(buffer_deg))
+                    except Exception:
+                        continue
+            # Подстанции из OSM (power=substation и др.) — часто отдельные объекты, не в buildings
+            bbox_osm = (buildings.total_bounds[3], buildings.total_bounds[1], buildings.total_bounds[2], buildings.total_bounds[0])
+            for g in self._load_power_substation_geometries(bbox_osm, "EPSG:4326"):
+                try:
+                    power_geoms.append(g.buffer(buffer_deg))
+                except Exception:
+                    continue
+            if power_geoms:
+                power_buffer_union = unary_union(power_geoms)
+        except Exception:
+            power_buffer_union = None
+
         rows = []
         if station_type == "rooftop":
             buildings = self._building_footprint_area_m2(buildings)
@@ -884,7 +1015,7 @@ class DataService:
                     "area_m2": area,
                     "source": "building",
                 })
-        elif station_type in ("ground", "garage", "to"):
+        elif station_type == "ground":
             bbox = (buildings.total_bounds[3], buildings.total_bounds[1], buildings.total_bounds[2], buildings.total_bounds[0])
             zones = self._load_industrial_and_parking_areas(bbox, "EPSG:4326")
             # Наземные: центроиды парковок и промзон (площадка ≥ min_ground)
@@ -937,19 +1068,92 @@ class DataService:
                         continue
                     rows.append({
                         "geometry": c,
-                        "station_type": "ground" if station_type == "ground" else "garage",
+                        "station_type": "ground",
                         "area_m2": area,
                         "source": "industrial",
                     })
                 except Exception:
                     continue
-            if station_type == "garage":
-                rows = [r for r in rows if r.get("source") == "industrial"]
-            elif station_type == "to":
-                # ТО только в промышленной зоне
-                rows = [r for r in rows if r.get("source") == "industrial"]
-                for r in rows:
-                    r["station_type"] = "to"
+        elif station_type in ("garage", "to"):
+            # Гаражи/ТО: здания внутри промзон (industrial), без парковок и тяжёлых/опасных объектов.
+            # Территории заводов (industrial_forbidden) исключаем — не ставим ТО/гараж на заводах.
+            bbox = (buildings.total_bounds[3], buildings.total_bounds[1], buildings.total_bounds[2], buildings.total_bounds[0])
+            zones = self._load_industrial_and_parking_areas(bbox, "EPSG:4326")
+            industrial_polys = zones.get("industrial") or []
+            forbidden_polys = zones.get("industrial_forbidden") or []
+            if industrial_polys:
+                try:
+                    industrial_union = unary_union([g for g in industrial_polys if g is not None and getattr(g, "is_valid", True)])
+                except Exception:
+                    industrial_union = None
+            else:
+                industrial_union = None
+            if forbidden_polys:
+                try:
+                    industrial_forbidden_union = unary_union([g for g in forbidden_polys if g is not None and getattr(g, "is_valid", True)])
+                except Exception:
+                    industrial_forbidden_union = None
+            else:
+                industrial_forbidden_union = None
+
+            buildings_industrial = self._building_footprint_area_m2(buildings)
+            for idx, row in buildings_industrial.iterrows():
+                geom = row.geometry
+                if geom is None or not geom.is_valid:
+                    continue
+                c = geom.centroid
+                # Здание должно лежать внутри промзоны
+                if industrial_union is not None:
+                    try:
+                        if not industrial_union.contains(c) and not industrial_union.touches(c):
+                            continue
+                    except Exception:
+                        pass
+                # Не ставим ТО/гараж на территории завода (заводские полигоны из OSM)
+                if industrial_forbidden_union is not None:
+                    try:
+                        if industrial_forbidden_union.contains(c) or industrial_forbidden_union.intersects(c):
+                            continue
+                    except Exception:
+                        pass
+                # Здание с power=*, в том числе подстанции, и зона вокруг них (10 м) исключаем
+                power_tag = str(row.get("power") or "").lower().strip()
+                if power_tag in self.EXCLUDE_POWER_TAGS:
+                    continue
+                if power_buffer_union is not None:
+                    try:
+                        if power_buffer_union.contains(c) or power_buffer_union.intersects(c):
+                            continue
+                    except Exception:
+                        pass
+                # Фильтр по типу здания
+                tag = row.get("building")
+                tag_str = str(tag).lower().strip() if tag is not None and not (isinstance(tag, float) and pd.isna(tag)) else ""
+                if tag_str and tag_str not in self.ALLOWED_INDUSTRIAL_BUILDING_TAGS:
+                    continue
+                # Избегаем опасных/крупных объектов по ключевым словам в name/industrial/craft/amenity
+                text_fields = []
+                for key in ("name", "industrial", "craft", "amenity", "man_made", "operator", "brand"):
+                    val = row.get(key) if hasattr(row, "get") else None
+                    if val is None or (isinstance(val, float) and pd.isna(val)):
+                        continue
+                    text_fields.append(str(val).lower())
+                combined = " ".join(text_fields)
+                if combined:
+                    if any(k in combined for k in self.FORBIDDEN_INDUSTRIAL_KEYWORDS):
+                        continue
+                # Площадь площадки/здания
+                area = row.get("area_m2", 0) or 0
+                if area < min_ground:
+                    continue
+                if not self._point_outside_no_fly(c, no_fly_zones, buffer_deg):
+                    continue
+                rows.append({
+                    "geometry": c,
+                    "station_type": "garage" if station_type == "garage" else "to",
+                    "area_m2": area,
+                    "source": "industrial_building",
+                })
         if not rows:
             return gpd.GeoDataFrame()
         gdf = gpd.GeoDataFrame(rows, crs="EPSG:4326")

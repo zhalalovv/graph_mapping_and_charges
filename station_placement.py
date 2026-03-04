@@ -553,8 +553,35 @@ class StationPlacement:
                 if d < best_dist[j]:
                     best_dist[j] = d
                     nearest[j] = len(chosen) - 1
-
+        # Пост-фильтр: убираем "лишние" гаражи, которые почти не обслуживают спрос.
+        # Считаем, какой вес спроса реально обслуживает каждый выбранный гараж
+        # (точки спроса, для которых он является ближайшим и в радиусе radius_km).
         rows = []
+        total_weight = float(weights.sum()) if len(weights) > 0 else 0.0
+        served_weight = np.zeros(len(chosen), dtype=float) if chosen else np.array([])
+        if chosen and total_weight > 0:
+            for j in range(len(dem_pts)):
+                idx_pos = nearest[j]
+                if 0 <= idx_pos < len(chosen) and best_dist[j] <= radius_km:
+                    served_weight[idx_pos] += float(weights[j])
+            if len(chosen) > 1:
+                max_served = float(served_weight.max()) if served_weight.size > 0 else 0.0
+                keep_positions = []
+                # Минимальная доля спроса для "осмысленного" гаража (от общего веса)
+                min_share_total = 0.05  # 5% от всего спроса
+                for pos in range(len(chosen)):
+                    share_total = (served_weight[pos] / total_weight) if total_weight > 0 else 0.0
+                    share_rel = (served_weight[pos] / max_served) if max_served > 0 else 0.0
+                    # Оставляем гараж, если он покрывает заметную часть спроса сам по себе
+                    # или хотя бы не намного хуже лучшего (чтобы не удалить все).
+                    if share_total >= min_share_total or share_rel >= 0.3:
+                        keep_positions.append(pos)
+                if not keep_positions:
+                    # Если порог слишком строгий и никого не оставили — оставляем лучший по покрытию.
+                    best_pos = int(np.argmax(served_weight)) if served_weight.size > 0 else 0
+                    keep_positions = [best_pos]
+                chosen = [chosen[pos] for pos in keep_positions]
+
         for idx in chosen:
             row = garage_candidates.iloc[idx].copy()
             row["station_type"] = "garage"
@@ -752,8 +779,8 @@ def run_full_pipeline(
     dbscan_min_samples: int = 15,
     use_all_buildings: bool = False,
     max_charge_stations: Optional[int] = None,
-    num_garages: int = 3,
-    num_to: int = 2,
+    num_garages: int = 1,
+    num_to: int = 1,
 ) -> Dict[str, Any]:
     """
     Запускает полный пайплайн: данные города → спрос (DBSCAN или сетка) → зарядки → гаражи/ТО → метрики.
@@ -780,19 +807,18 @@ def run_full_pipeline(
     if demand is None or len(demand) == 0:
         return {"error": "Нет точек спроса", "demand": None, "charge_stations": None, "garages": None, "to_stations": None, "trunk_graph": None, "metrics": {}}
 
-    # Кандидаты: крыши + земля для зарядок; отдельно гаражи и ТО (промзоны)
+    # Кандидаты: крыши МКД для зарядок типа А; отдельно гаражи и ТО (промзоны)
     candidates_rooftop = data_service.get_station_candidates(
         buildings, city_boundary, no_fly_zones, road_graph, station_type="rooftop"
     )
-    candidates_ground = data_service.get_station_candidates(
-        buildings, city_boundary, no_fly_zones, road_graph, station_type="ground"
+    # Для станций типа А (основные зарядки) используем только крыши МКД.
+    # Наземные кандидаты (парковки, промзоны) не участвуют в размещении станций типа А,
+    # чтобы исключить размещение на парковках.
+    charge_candidates_full = (
+        candidates_rooftop
+        if candidates_rooftop is not None and len(candidates_rooftop) > 0
+        else gpd.GeoDataFrame()
     )
-    parts = []
-    if candidates_rooftop is not None and len(candidates_rooftop) > 0:
-        parts.append(candidates_rooftop)
-    if candidates_ground is not None and len(candidates_ground) > 0:
-        parts.append(candidates_ground)
-    charge_candidates_full = gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), crs=(parts[0].crs if parts else "EPSG:4326")) if parts else gpd.GeoDataFrame()
 
     # При спросе по DBSCAN: кандидаты зарядки строим относительно кластеров (ближайшая крыша/площадка к каждому кластеру)
     if demand_method == "dbscan" and charge_candidates_full is not None and len(charge_candidates_full) > 0:
@@ -825,16 +851,75 @@ def run_full_pipeline(
     if to_candidates is None or len(to_candidates) == 0:
         to_candidates = gpd.GeoDataFrame()
 
-    # Заглушки гаражи/ТО для trunk (если ещё не размещены — используем первых кандидатов)
-    garage_placeholder = garage_candidates.iloc[: max(1, num_garages)].copy() if garage_candidates is not None and len(garage_candidates) > 0 else gpd.GeoDataFrame()
-    to_placeholder = to_candidates.iloc[: max(1, num_to)].copy() if to_candidates is not None and len(to_candidates) > 0 else gpd.GeoDataFrame()
+    # Жёстко убираем из кандидатов все точки внутри буфера подстанций (гаражи и ТО не должны там стоять)
+    power_buffer_union = data_service.get_power_substation_buffer_union(buildings)
+    if power_buffer_union is not None:
+        def _drop_inside_power_buffer(cand_gdf):
+            if cand_gdf is None or len(cand_gdf) == 0:
+                return cand_gdf
+            keep = []
+            for idx, row in cand_gdf.iterrows():
+                pt = getattr(row.geometry, "centroid", row.geometry)
+                if pt is None:
+                    keep.append(True)
+                    continue
+                try:
+                    keep.append(not (power_buffer_union.contains(pt) or power_buffer_union.intersects(pt)))
+                except Exception:
+                    keep.append(True)
+            if not any(keep):
+                return gpd.GeoDataFrame(crs=cand_gdf.crs)
+            return cand_gdf.iloc[[i for i, k in enumerate(keep) if k]].copy()
+
+        garage_candidates = _drop_inside_power_buffer(garage_candidates)
+        to_candidates = _drop_inside_power_buffer(to_candidates)
+
+    # Заглушки гаражи/ТО для trunk (если num_garages/num_to > 0 — берём первых кандидатов; при 0 — пусто)
+    garage_placeholder = (garage_candidates.iloc[:num_garages].copy() if num_garages > 0 and garage_candidates is not None and len(garage_candidates) > 0 else gpd.GeoDataFrame())
+    to_placeholder = (to_candidates.iloc[:num_to].copy() if num_to > 0 and to_candidates is not None and len(to_candidates) > 0 else gpd.GeoDataFrame())
 
     # Шаг 3: trunk (с заглушками)
     trunk = placement.build_trunk_graph(charge_stations, garage_placeholder, to_placeholder, no_fly_zones, max_edge_km=R_GARAGE_TO_KM)
 
     # Шаг 4–5: размещаем гаражи и ТО по правилам
     garages = placement.place_garages(demand, garage_candidates, k=num_garages, radius_km=R_GARAGE_TO_KM)
-    to_stations = placement.place_to_stations(trunk, to_candidates, demand, k=num_to)
+
+    # Чтобы станция ТО не попадала в то же здание/точку, что и гараж,
+    # отфильтруем кандидатов ТО, которые слишком близко к уже выбранным гаражам.
+    filtered_to_candidates = to_candidates
+    if (
+        to_candidates is not None
+        and len(to_candidates) > 0
+        and garages is not None
+        and len(garages) > 0
+    ):
+        try:
+            to_pts = _points_array(to_candidates)
+            gar_pts = _points_array(garages)
+            if len(to_pts) > 0 and len(gar_pts) > 0:
+                keep_indices = []
+                # Минимальное расстояние между станцией ТО и гаражом (км)
+                min_sep_km = 0.2  # ~200 м, чтобы точно не одно и то же здание
+                for i in range(len(to_pts)):
+                    lon_t, lat_t = to_pts[i, 0], to_pts[i, 1]
+                    too_close = False
+                    for j in range(len(gar_pts)):
+                        lon_g, lat_g = gar_pts[j, 0], gar_pts[j, 1]
+                        d_km = haversine_km(lat_t, lon_t, lat_g, lon_g)
+                        if d_km < min_sep_km:
+                            too_close = True
+                            break
+                    if not too_close:
+                        keep_indices.append(i)
+                if keep_indices:
+                    filtered_to_candidates = to_candidates.iloc[keep_indices].copy()
+                else:
+                    # Если всех отфильтровали — оставляем исходных кандидатов, чтобы не потерять ТО вообще.
+                    filtered_to_candidates = to_candidates
+        except Exception:
+            filtered_to_candidates = to_candidates
+
+    to_stations = placement.place_to_stations(trunk, filtered_to_candidates, demand, k=num_to)
 
     # Пересобираем trunk с уже выбранными гаражами и ТО
     trunk = placement.build_trunk_graph(charge_stations, garages, to_stations, no_fly_zones, max_edge_km=R_GARAGE_TO_KM)

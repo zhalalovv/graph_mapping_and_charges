@@ -327,8 +327,8 @@ def get_stations_placement(
     dbscan_min_samples: int = Query(15, description="Мин. точек в кластере DBSCAN"),
     use_all_buildings: bool = Query(False, description="Кластеризация по всем зданиям вне беспилотных зон"),
     max_charge_stations: Optional[int] = Query(None, description="Макс. число зарядок (по умолчанию — до покрытия)"),
-    num_garages: int = Query(3, description="Число гаражей"),
-    num_to: int = Query(2, description="Число станций ТО"),
+    num_garages: int = Query(1, ge=0, description="Число гаражей (0 = не размещать)"),
+    num_to: int = Query(1, ge=0, description="Число станций ТО (0 = не размещать, 1 = одна станция)"),
 ):
     """
     Размещение станций: спрос по DBSCAN (по умолчанию) или по сетке.
