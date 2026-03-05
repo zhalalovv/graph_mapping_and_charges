@@ -200,6 +200,15 @@
                 <span><span class="swatch" style="background:#f97316"></span> 30–50 м</span>
                 <span><span class="swatch" style="background:#ef4444"></span> &gt;50 м</span>
             </div>
+            <button
+                class="floating-btn btn-secondary"
+                id="toggleBuildingsBtn"
+                style="width:100%; margin-top:8px"
+                onclick="toggleBuildings()"
+                title="Включить/выключить отображение зданий по высоте"
+            >
+                <span id="buildingsLabel">Скрыть здания</span>
+            </button>
         </div>
         <div class="flight-levels-panel" style="margin-top:12px; border-top:1px solid #e5e7eb; padding-top:12px">
             <h3 style="margin:0 0 8px">Станции (зарядка, гаражи, ТО)</h3>
@@ -235,6 +244,7 @@
         let demandLayer, chargeStationsLayer, garagesLayer, toStationsLayer, trunkEdgesLayer;
         let chargeRadiusLayer, garageRadiusLayer, toRadiusLayer;
         let clusterHullsVisible = true;
+        let buildingsVisible = true;
         
         // Список популярных городов
         const CITIES = [
@@ -324,8 +334,16 @@
                         const p = feature.properties || {};
                         const h = p.height_m || '—';
                         const fl = p.flight_level || '—';
+                        let areaText = '—';
+                        if (p.area_m2 !== undefined && p.area_m2 !== null) {
+                            const areaVal = Number(p.area_m2);
+                            if (!Number.isNaN(areaVal)) {
+                                areaText = areaVal.toLocaleString('ru-RU', { maximumFractionDigits: 0 }) + ' м²';
+                            }
+                        }
                         layer.bindPopup(`
                             <strong>Высота:</strong> ${h} м<br>
+                            <strong>Площадь:</strong> ${areaText}<br>
                             <strong>Рекомендуемый эшелон:</strong> ${fl}
                         `);
                     }
@@ -333,6 +351,8 @@
                 
                 buildingsLayer = L.geoJSON(geojson, layerOptions);
                 buildingsLayer.addTo(map);
+                buildingsVisible = true;
+                updateBuildingsButtonLabel();
                 console.log('✓ Здания по высоте: ' + data.features.length);
             } catch (error) {
                 console.error('Ошибка загрузки зданий с высотами:', error);
@@ -538,8 +558,8 @@
                 url.searchParams.set('network_type', 'drive');
                 url.searchParams.set('simplify', 'true');
                 url.searchParams.set('demand_cell_m', '250');
-                url.searchParams.set('num_garages', '3');
-                url.searchParams.set('num_to', '2');
+                url.searchParams.set('num_garages', '1');
+                url.searchParams.set('num_to', '1');
                 const resp = await fetch(url);
                 if (!resp.ok) {
                     const err = await resp.json().catch(() => ({}));
@@ -681,6 +701,23 @@
             applyRadiusVisibility();
         }
 
+        function updateBuildingsButtonLabel() {
+            const el = document.getElementById('buildingsLabel');
+            if (!el) return;
+            el.textContent = buildingsVisible ? 'Скрыть здания' : 'Показать здания';
+        }
+
+        function toggleBuildings() {
+            if (!map || !buildingsLayer) return;
+            buildingsVisible = !buildingsVisible;
+            if (buildingsVisible) {
+                buildingsLayer.addTo(map);
+            } else {
+                map.removeLayer(buildingsLayer);
+            }
+            updateBuildingsButtonLabel();
+        }
+
         function updateClusterHullsButtonLabel() {
             const el = document.getElementById('clusterHullsLabel');
             if (!el) return;
@@ -688,12 +725,22 @@
         }
 
         function toggleClusterHulls() {
-            if (!map || !clusterHullsLayer) return;
+            if (!map) return;
             clusterHullsVisible = !clusterHullsVisible;
             if (clusterHullsVisible) {
-                clusterHullsLayer.addTo(map);
+                if (clusterHullsLayer) {
+                    clusterHullsLayer.addTo(map);
+                }
+                if (clustersLayer) {
+                    clustersLayer.addTo(map);
+                }
             } else {
-                map.removeLayer(clusterHullsLayer);
+                if (clusterHullsLayer) {
+                    map.removeLayer(clusterHullsLayer);
+                }
+                if (clustersLayer) {
+                    map.removeLayer(clustersLayer);
+                }
             }
             updateClusterHullsButtonLabel();
         }

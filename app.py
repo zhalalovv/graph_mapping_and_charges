@@ -185,8 +185,8 @@ def export_buildings_with_heights(
     simplify: bool = Query(True, description="Упрощение"),
 ):
     """
-    Выгрузка зданий с высотами и эшелонами полётов.
-    GeoJSON с полигонами зданий и properties: height_m, flight_level (рекомендуемый эшелон).
+    Выгрузка зданий с высотами, площадями и эшелонами полётов.
+    GeoJSON с полигонами зданий и properties: height_m, area_m2, flight_level (рекомендуемый эшелон).
     """
     try:
         data = data_service.get_city_data(city, network_type=network_type, simplify=simplify)
@@ -199,9 +199,27 @@ def export_buildings_with_heights(
                 "flight_levels": flight_levels,
                 "building_height_stats": data.get("building_height_stats", {}),
             })
+
         if "height_m" not in buildings.columns:
             buildings = data_service._compute_building_heights(buildings)
-        # GeoJSON: полигоны зданий + height_m, рекомендованный flight_level
+
+        # Площадь зданий в м² (по возможности в метрической проекции)
+        if "area_m2" not in buildings.columns:
+            try:
+                b_proj = buildings
+                if b_proj.crs is None:
+                    b_proj = b_proj.set_crs("EPSG:4326", allow_override=True)
+                if b_proj.crs and b_proj.crs.is_geographic:
+                    b_proj = b_proj.to_crs(epsg=3857)
+                areas = b_proj.geometry.area.astype(float)
+                buildings["area_m2"] = areas
+            except Exception:
+                try:
+                    buildings["area_m2"] = buildings.geometry.area.astype(float)
+                except Exception:
+                    buildings["area_m2"] = None
+
+        # GeoJSON: полигоны зданий + height_m, area_m2, рекомендованный flight_level
         levels_m = [f["altitude_m"] for f in flight_levels] if flight_levels else [40, 65, 90, 115]
         features = []
         for idx, row in buildings.iterrows():
@@ -209,6 +227,11 @@ def export_buildings_with_heights(
             if geom is None or not getattr(geom, "is_valid", True):
                 continue
             h = float(row.get("height_m", 10))
+            a_raw = row.get("area_m2", None)
+            try:
+                a = float(a_raw) if a_raw is not None else None
+            except (TypeError, ValueError):
+                a = None
             # Рекомендуемый эшелон: первый, где altitude > h + 10м
             rec_level = 1
             for i, alt in enumerate(levels_m):
@@ -218,7 +241,11 @@ def export_buildings_with_heights(
             feat = {
                 "type": "Feature",
                 "geometry": json.loads(gpd.GeoSeries([geom]).to_json())["features"][0]["geometry"],
-                "properties": {"height_m": round(h, 1), "flight_level": rec_level},
+                "properties": {
+                    "height_m": round(h, 1),
+                    "area_m2": round(a, 1) if a is not None else None,
+                    "flight_level": rec_level,
+                },
             }
             features.append(feat)
         return JSONResponse({
@@ -389,6 +416,10 @@ def get_stations_placement(
                     })
         trunk_fc = round_coords({"type": "FeatureCollection", "features": trunk_edges})
 
+        # Ветки от станций типа Б к станциям типа А (связь, не магистраль)
+        branch_edges = result.get("branch_edges") or []
+        branch_fc = round_coords({"type": "FeatureCollection", "features": branch_edges})
+
         # Граница города для карты
         city_boundary_geojson = None
         if result.get("city_boundary") is not None:
@@ -404,6 +435,7 @@ def get_stations_placement(
             "garages": round_coords(garages_geojson),
             "to_stations": round_coords(to_geojson),
             "trunk_edges": trunk_fc,
+            "branch_edges": branch_fc,
             "metrics": result.get("metrics", {}),
             "params": {
                 "R_charge_km": R_CHARGE_KM,
