@@ -216,6 +216,7 @@
                 R_charge = 1.6 км, R_garage/TO = 3.2 км (×1/4 от базовых)
             </p>
             <button class="floating-btn" style="width:100%" onclick="loadStationsPlacement()">Разместить станции</button>
+            <button class="floating-btn btn-secondary" style="width:100%; margin-top:6px" onclick="loadSavedPlacement()" title="Загрузить последнее сохранённое размещение (после перезапуска сервера)">Загрузить сохранённое</button>
             <div id="radiusVisibilityPanel" style="margin-top:10px; display:none; padding:8px; background:#f8fafc; border-radius:8px; border:1px solid #e2e8f0">
                 <div style="font-size:13px; font-weight:600; color:#374151; margin-bottom:6px">Радиус обслуживания</div>
                 <label style="display:flex; align-items:center; gap:6px; margin-bottom:4px; cursor:pointer; font-size:13px">
@@ -543,38 +544,11 @@
             ['radiusCharge','radiusGarage','radiusTO'].forEach(id => { const c = document.getElementById(id); if (c) c.checked = false; });
         }
 
-        async function loadStationsPlacement() {
-            const city = getCityQuery();
-            if (!city) {
-                alert('Сначала выберите город и нажмите «Загрузить»');
-                return;
-            }
-            const statusEl = document.getElementById('status');
-            statusEl.textContent = 'Расчёт размещения станций...';
-            removeStationLayers();
-            try {
-                const url = new URL('/api/stations/placement', window.location.origin);
-                url.searchParams.set('city', city);
-                url.searchParams.set('network_type', 'drive');
-                url.searchParams.set('simplify', 'true');
-                url.searchParams.set('demand_cell_m', '250');
-                url.searchParams.set('num_garages', '1');
-                url.searchParams.set('num_to', '1');
-                const resp = await fetch(url);
-                if (!resp.ok) {
-                    const err = await resp.json().catch(() => ({}));
-                    throw new Error(err.error || err.detail || 'Ошибка API');
-                }
-                const data = await resp.json();
-                if (data.error) {
-                    throw new Error(data.error);
-                }
-                ensureMap();
-                const opts = { pointToLayer: (f, latlng) => L.circleMarker(latlng, { radius: 6, fillOpacity: 0.9 }) };
-                const R_CHARGE_M = 1600;   // 1.6 км (в 4 раза меньше базового 6.4 км)
-                const R_GARAGE_TO_M = 3200; // 3.2 км (в 4 раза меньше базового 12.8 км)
-
-                if (data.demand && data.demand.features && data.demand.features.length) {
+        function applyPlacementData(data) {
+            ensureMap();
+            const R_CHARGE_M = 1600;
+            const R_GARAGE_TO_M = 3200;
+            if (data.demand && data.demand.features && data.demand.features.length) {
                     demandLayer = L.geoJSON(data.demand, {
                         style: { color: '#94a3b8', fillColor: '#94a3b8', weight: 1, radius: 4 },
                         pointToLayer: (f, latlng) => L.circleMarker(latlng, { radius: 4, fillColor: '#94a3b8', color: '#64748b', weight: 1, fillOpacity: 0.7 }),
@@ -675,9 +649,69 @@
                     ].join('<br>');
                     m.style.display = 'block';
                 }
-                statusEl.textContent = '✓ Станции размещены';
                 const panel = document.getElementById('radiusVisibilityPanel');
                 if (panel) { panel.style.display = 'block'; applyRadiusVisibility(); }
+        }
+
+        async function loadStationsPlacement() {
+            const city = getCityQuery();
+            if (!city) {
+                alert('Сначала выберите город и нажмите «Загрузить»');
+                return;
+            }
+            const statusEl = document.getElementById('status');
+            statusEl.textContent = 'Расчёт размещения станций...';
+            removeStationLayers();
+            try {
+                const url = new URL('/api/stations/placement', window.location.origin);
+                url.searchParams.set('city', city);
+                url.searchParams.set('network_type', 'drive');
+                url.searchParams.set('simplify', 'true');
+                url.searchParams.set('demand_cell_m', '250');
+                url.searchParams.set('num_garages', '1');
+                url.searchParams.set('num_to', '1');
+                const resp = await fetch(url);
+                if (!resp.ok) {
+                    const err = await resp.json().catch(() => ({}));
+                    throw new Error(err.error || err.detail || 'Ошибка API');
+                }
+                const data = await resp.json();
+                if (data.error) throw new Error(data.error);
+                applyPlacementData(data);
+                statusEl.textContent = '✓ Станции размещены';
+            } catch (e) {
+                console.error(e);
+                document.getElementById('status').textContent = '✗ Ошибка: ' + e.message;
+            }
+        }
+
+        async function loadSavedPlacement() {
+            const city = getCityQuery();
+            if (!city) {
+                alert('Сначала выберите город и нажмите «Загрузить»');
+                return;
+            }
+            const statusEl = document.getElementById('status');
+            statusEl.textContent = 'Загрузка сохранённого размещения...';
+            removeStationLayers();
+            try {
+                const url = new URL('/api/stations/placement', window.location.origin);
+                url.searchParams.set('city', city);
+                url.searchParams.set('load_saved', 'true');
+                const resp = await fetch(url);
+                if (resp.status === 404) {
+                    const err = await resp.json().catch(() => ({}));
+                    alert(err.error || 'Нет сохранённого размещения для этого города. Нажмите «Разместить станции».');
+                    statusEl.textContent = '';
+                    return;
+                }
+                if (!resp.ok) {
+                    const err = await resp.json().catch(() => ({}));
+                    throw new Error(err.error || err.detail || 'Ошибка API');
+                }
+                const data = await resp.json();
+                applyPlacementData(data);
+                statusEl.textContent = '✓ Загружено сохранённое размещение';
             } catch (e) {
                 console.error(e);
                 document.getElementById('status').textContent = '✗ Ошибка: ' + e.message;

@@ -1,6 +1,8 @@
 import os
+import re
 from typing import Optional
 import logging
+import json
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -9,7 +11,6 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from data_service import DataService
 from station_placement import run_full_pipeline, R_CHARGE_KM, R_GARAGE_TO_KM, D_MAX_KM
-import json
 import geopandas as gpd
 import osmnx as ox
 
@@ -27,6 +28,46 @@ app.add_middleware(
 
 data_service = DataService()
 logger = logging.getLogger(__name__)
+
+# Каталог для сохранения размещения станций (переживает перезапуск сервера)
+PLACEMENT_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "placement_cache")
+
+
+def _placement_slug(city: str) -> str:
+    """Нормализует название города в имя файла."""
+    s = city.strip().lower()
+    s = re.sub(r"[^\w\s-]", "", s)
+    s = re.sub(r"[-\s]+", "_", s)
+    return s or "default"
+
+
+def _placement_cache_path(city: str) -> str:
+    os.makedirs(PLACEMENT_CACHE_DIR, exist_ok=True)
+    return os.path.join(PLACEMENT_CACHE_DIR, f"{_placement_slug(city)}.json")
+
+
+def save_placement(city: str, data: dict) -> None:
+    """Сохраняет результат размещения на диск."""
+    try:
+        path = _placement_cache_path(city)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=0)
+        logger.info("Сохранено размещение: %s", path)
+    except Exception as e:
+        logger.warning("Не удалось сохранить размещение: %s", e)
+
+
+def load_placement(city: str) -> Optional[dict]:
+    """Загружает сохранённое размещение с диска. None если файла нет."""
+    try:
+        path = _placement_cache_path(city)
+        if not os.path.isfile(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning("Не удалось загрузить размещение: %s", e)
+        return None
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -346,6 +387,7 @@ def get_city_map(
 @app.get("/api/stations/placement")
 def get_stations_placement(
     city: str = Query(..., description="Название города"),
+    load_saved: bool = Query(False, description="Загрузить сохранённое размещение с диска (без пересчёта)"),
     network_type: str = Query("drive", description="Тип сети OSM"),
     simplify: bool = Query(True, description="Упрощение"),
     demand_method: str = Query("dbscan", description="Метод спроса: dbscan или grid"),
@@ -359,9 +401,19 @@ def get_stations_placement(
 ):
     """
     Размещение станций: спрос по DBSCAN (по умолчанию) или по сетке.
-    Возвращает GeoJSON: точки спроса (кластеры), зарядки, гаражи, ТО, рёбра магистрали, метрики.
+    При load_saved=True возвращает последнее сохранённое размещение для города (без пересчёта).
+    Иначе считает размещение и сохраняет его на диск (переживает перезапуск сервера).
     """
     try:
+        if load_saved:
+            cached = load_placement(city)
+            if cached is not None:
+                return JSONResponse(cached)
+            return JSONResponse(
+                {"error": "Нет сохранённого размещения для этого города. Нажмите «Разместить станции»."},
+                status_code=404,
+            )
+
         result = run_full_pipeline(
             data_service,
             city,
@@ -432,7 +484,7 @@ def get_stations_placement(
             except Exception:
                 pass
 
-        return JSONResponse({
+        response_data = {
             "demand": round_coords(demand_geojson),
             "charge_stations": round_coords(charge_geojson),
             "garages": round_coords(garages_geojson),
@@ -447,7 +499,9 @@ def get_stations_placement(
                 "D_max_km": D_MAX_KM,
             },
             "city_boundary": city_boundary_geojson,
-        })
+        }
+        save_placement(city, response_data)
+        return JSONResponse(response_data)
     except Exception as e:
         import traceback
         traceback.print_exc()
