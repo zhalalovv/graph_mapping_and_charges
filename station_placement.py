@@ -1059,7 +1059,7 @@ def run_full_pipeline(
         core_dense_radius_factor=5.0,
         core_radius_factor_a=0.0,
         core_weight_quantile_a=0.0,
-        min_center_distance_factor_b=1.0,
+        min_center_distance_factor_b=0.75,   # Б плотнее — дозаполняют слабо заполненные кластеры
     )
 
     # Кандидаты гаражи и ТО (промзоны)
