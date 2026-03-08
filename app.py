@@ -419,6 +419,9 @@ def get_stations_placement(
         # Ветки от станций типа Б к станциям типа А (связь, не магистраль)
         branch_edges = result.get("branch_edges") or []
         branch_fc = round_coords({"type": "FeatureCollection", "features": branch_edges})
+        # Локальные рёбра между вспомогательными станциями (Б↔Б)
+        local_edges = result.get("local_edges") or []
+        local_fc = round_coords({"type": "FeatureCollection", "features": local_edges})
 
         # Граница города для карты
         city_boundary_geojson = None
@@ -436,6 +439,7 @@ def get_stations_placement(
             "to_stations": round_coords(to_geojson),
             "trunk_edges": trunk_fc,
             "branch_edges": branch_fc,
+            "local_edges": local_fc,
             "metrics": result.get("metrics", {}),
             "params": {
                 "R_charge_km": R_CHARGE_KM,

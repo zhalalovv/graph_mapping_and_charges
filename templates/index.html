@@ -241,7 +241,7 @@
 
     <script>
         let map, boundaryLayer, noFlyZonesLayer, buildingsLayer, clustersLayer, clusterHullsLayer;
-        let demandLayer, chargeStationsLayer, garagesLayer, toStationsLayer, trunkEdgesLayer;
+        let demandLayer, chargeStationsLayer, garagesLayer, toStationsLayer, trunkEdgesLayer, branchEdgesLayer, localEdgesLayer;
         let chargeRadiusLayer, garageRadiusLayer, toRadiusLayer;
         let clusterHullsVisible = true;
         let buildingsVisible = true;
@@ -531,10 +531,10 @@
 
         function removeStationLayers() {
             for (const l of [demandLayer, chargeStationsLayer, garagesLayer, toStationsLayer, trunkEdgesLayer,
-                chargeRadiusLayer, garageRadiusLayer, toRadiusLayer]) {
+                branchEdgesLayer, localEdgesLayer, chargeRadiusLayer, garageRadiusLayer, toRadiusLayer]) {
                 if (l && map && map.hasLayer && map.hasLayer(l)) map.removeLayer(l);
             }
-            demandLayer = chargeStationsLayer = garagesLayer = toStationsLayer = trunkEdgesLayer = null;
+            demandLayer = chargeStationsLayer = garagesLayer = toStationsLayer = trunkEdgesLayer = branchEdgesLayer = localEdgesLayer = null;
             chargeRadiusLayer = garageRadiusLayer = toRadiusLayer = null;
             const m = document.getElementById('stationsMetrics');
             if (m) { m.style.display = 'none'; m.innerHTML = ''; }
@@ -609,7 +609,7 @@
                         },
                         onEachFeature: (f, layer) => {
                             const typeA = (f.properties && f.properties.station_type === 'charge_a');
-                            layer.bindPopup(typeA ? 'Зарядка тип А (основное покрытие)<br>R = 1.6 км' : 'Доп. зарядка (развозка)<br>R = 1.6 км');
+                            layer.bindPopup(typeA ? 'Зарядка тип А (основное покрытие)<br>R = 1.6 км' : 'Вспомогательная зарядка (тип Б)<br>Покрытие остального спроса, связь с тип А, не магистраль<br>R = 1.6 км');
                         }
                     }).addTo(map);
                 }
@@ -656,6 +656,13 @@
                         style: { color: '#6366f1', weight: 3, opacity: 0.8 }
                     }).addTo(map);
                 }
+                const localPathsStyle = { color: '#0d9488', weight: 2, opacity: 0.85 };
+                if (data.branch_edges && data.branch_edges.features && data.branch_edges.features.length) {
+                    branchEdgesLayer = L.geoJSON(data.branch_edges, { style: localPathsStyle }).addTo(map);
+                }
+                if (data.local_edges && data.local_edges.features && data.local_edges.features.length) {
+                    localEdgesLayer = L.geoJSON(data.local_edges, { style: localPathsStyle }).addTo(map);
+                }
                 const m = document.getElementById('stationsMetrics');
                 if (m && data.metrics) {
                     const charge = data.metrics.charge || {};
@@ -663,7 +670,7 @@
                     const extra = charge.placed_extra != null ? charge.placed_extra : '—';
                     m.innerHTML = [
                         'Покрытие спроса: ' + (data.metrics.coverage_ratio != null ? (data.metrics.coverage_ratio * 100).toFixed(1) + '%' : (charge.coverage_ratio != null ? (charge.coverage_ratio * 100).toFixed(1) + '%' : '—')),
-                        'Зарядок тип А: ' + typeA + ', доп.: ' + extra,
+                        'Зарядок тип А: ' + typeA + ', вспом. (Б): ' + extra,
                         'Связность магистрали: ' + (data.metrics.trunk_connected ? 'да' : 'нет')
                     ].join('<br>');
                     m.style.display = 'block';
