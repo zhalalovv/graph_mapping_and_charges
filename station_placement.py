@@ -86,8 +86,6 @@ def km_to_deg_approx(km: float, lat_center: float) -> float:
     deg_lat = km / 111.0
     deg_lon = km / (111.0 * max(0.2, np.cos(np.radians(lat_center))))
     return max(deg_lat, deg_lon)
-
-
 class StationPlacement:
     def __init__(self, data_service, logger=None):
         self.data_service = data_service
@@ -352,6 +350,15 @@ class StationPlacement:
                         d_km = haversine_km(lat_c, lon_c, dem_pts[j, 1], dem_pts[j, 0])
                         if d_km <= radius_km:
                             new_weight += weights[j]
+                    # Для станций типа Б даём приоритет крышам МКД:
+                    # кандидаты с source == "building" получают небольшой бонус к "выигрышу" по спросу.
+                    if (
+                        station_type == "charge_b"
+                        and "source" in candidates.columns
+                        and candidates.iloc[i].get("source") == "building"
+                        and new_weight > 0
+                    ):
+                        new_weight *= 1.2
                     if new_weight <= 0:
                         continue
                     if new_weight > best_new_weight:
@@ -513,6 +520,7 @@ class StationPlacement:
         return G
 
     def build_branch_edges(
+        self,
         self,
         charge_stations: gpd.GeoDataFrame,
         garage_points: Optional[gpd.GeoDataFrame] = None,
@@ -1012,9 +1020,9 @@ def run_full_pipeline(
         dbscan_min_samples=dbscan_min_samples,
         use_all_buildings=use_all_buildings,
         no_fly_zones=no_fly_zones,
-        # Для максимальной скорости размещения точек спроса используем только центроиды кластеров / ячейки,
-        # без дополнительного заполнения кластеров сеткой.
-        fill_clusters=False,
+        # При method="dbscan" дополнительно заполняем полигоны кластеров сеткой точек спроса,
+        # чтобы размещение станций стремилось закрывать весь кластер.
+        fill_clusters=(demand_method == "dbscan"),
         cluster_fill_step_m=None,
     )
     if demand is None or len(demand) == 0:
