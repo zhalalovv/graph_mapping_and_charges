@@ -1174,6 +1174,11 @@ class DataService:
         use_all_buildings: bool = False,
         no_fly_zones: Optional[Union[gpd.GeoDataFrame, List]] = None,
         min_buildings_for_zone: int = 2,
+        # При method="dbscan": дополнительно заполнять полигоны кластеров сеткой точек спроса,
+        # чтобы размещение станций стремилось покрыть ВСЮ область кластера, а не только центроид.
+        fill_clusters: bool = False,
+        # Шаг сетки внутри кластера (в метрах). По умолчанию = dbscan_eps_m.
+        cluster_fill_step_m: Optional[float] = None,
     ):
         """
         Шаг B: точки спроса для размещения — только по зданиям (центроиды), дороги не используются.
@@ -1274,6 +1279,15 @@ class DataService:
                 if n_noise > 0:
                     self.logger.info(f"Точки-шум (одиночки/выбросы): {n_noise} — не образуют зону спроса")
                 inv = Transformer.from_crs(crs_utm, "EPSG:4326", always_xy=True)
+                # Шаг сетки внутри кластера (в метрах) для fill_clusters.
+                # По умолчанию делаем сетку существенно реже eps, чтобы не взрывать число точек.
+                if cluster_fill_step_m is not None:
+                    fill_step_m = float(cluster_fill_step_m)
+                else:
+                    # Минимум 400 м, но не меньше, чем 2 * eps.
+                    fill_step_m = max(400.0, float(eps_m) * 2.0)
+                if fill_step_m <= 0:
+                    fill_step_m = max(400.0, float(eps_m) * 2.0)
                 from shapely.ops import transform as sh_transform
                 for lid in cluster_ids:
                     mask = labels == lid
@@ -1284,8 +1298,18 @@ class DataService:
                     weight = float(base_weights[mask].sum())
                     cx, cy = cluster_pts.mean(axis=0)
                     lon, lat = inv.transform(cx, cy)
-                    rows.append({"geometry": Point(lon, lat), "weight": int(round(weight))})
-                    if return_hulls and hull_rows is not None and len(cluster_pts) >= 1:
+                    # Базовая точка спроса — центроид кластера (не заполнитель).
+                    rows.append(
+                        {
+                            "geometry": Point(lon, lat),
+                            "weight": int(round(weight)),
+                            "is_cluster_fill": False,
+                        }
+                    )
+
+                    # Для dbscan можем дополнительно построить область кластера
+                    # и, при необходимости, "заполнить" её сеткой точек спроса.
+                    if len(cluster_pts) >= 1:
                         try:
                             circles_utm = [Point(float(x), float(y)).buffer(eps_m) for x, y in cluster_pts]
                             region_utm = unary_union(circles_utm)
@@ -1294,7 +1318,13 @@ class DataService:
                             region_utm = region_utm.simplify(2.0)
                             region_4326 = sh_transform(lambda x, y: inv.transform(x, y), region_utm)
                             # Обрезаем область кластера по границе города
-                            if city_boundary is not None and hasattr(city_boundary, "is_valid") and getattr(city_boundary, "is_valid", True) and region_4326.is_valid and not region_4326.is_empty:
+                            if (
+                                city_boundary is not None
+                                and hasattr(city_boundary, "is_valid")
+                                and getattr(city_boundary, "is_valid", True)
+                                and region_4326.is_valid
+                                and not region_4326.is_empty
+                            ):
                                 try:
                                     clipped = region_4326.intersection(city_boundary)
                                     if clipped is not None and not clipped.is_empty and clipped.is_valid:
@@ -1302,7 +1332,12 @@ class DataService:
                                 except Exception:
                                     pass
                             # Исключаем беспилотные зоны из полигона зоны спроса (не выделяем no_fly в зонах спроса)
-                            if no_fly_union is not None and not no_fly_union.is_empty and region_4326.is_valid and not region_4326.is_empty:
+                            if (
+                                no_fly_union is not None
+                                and not no_fly_union.is_empty
+                                and region_4326.is_valid
+                                and not region_4326.is_empty
+                            ):
                                 try:
                                     region_4326 = region_4326.difference(no_fly_union)
                                     if region_4326.is_empty:
@@ -1310,7 +1345,61 @@ class DataService:
                                 except Exception:
                                     pass
                             if region_4326.is_valid and not region_4326.is_empty:
-                                hull_rows.append({"geometry": region_4326, "weight": int(round(weight)), "cluster_id": len(hull_rows)})
+                                # Сохраняем полигон кластера для фронтенда, если требуется
+                                if return_hulls and hull_rows is not None:
+                                    hull_rows.append(
+                                        {
+                                            "geometry": region_4326,
+                                            "weight": int(round(weight)),
+                                            "cluster_id": len(hull_rows),
+                                        }
+                                    )
+                                # Дополнительное заполнение кластера сеткой точек спроса,
+                                # чтобы алгоритм размещения стремился покрыть весь полигон.
+                                if fill_clusters:
+                                    try:
+                                        minx, miny, maxx, maxy = region_4326.bounds
+                                        if maxx > minx and maxy > miny:
+                                            # Приблизительное преобразование метров в градусы.
+                                            # 1° широты ≈ 111 км, долгота ≈ 111 * cos(lat).
+                                            lat_center = (miny + maxy) / 2.0
+                                            step_km = fill_step_m / 1000.0
+                                            if step_km <= 0:
+                                                step_km = eps_m / 1000.0
+                                            deg_lat = step_km / 111.0
+                                            deg_lon = step_km / (
+                                                111.0 * max(0.2, np.cos(np.radians(lat_center)))
+                                            )
+                                            step_x = max(deg_lon, 1e-5)
+                                            step_y = max(deg_lat, 1e-5)
+                                            # Жёсткий лимит на число точек-заполнителей в одном кластере,
+                                            # чтобы не взорвать размер выборки и время размещения.
+                                            max_fill_points = 500
+                                            fill_count = 0
+                                            x = float(minx)
+                                            while x <= maxx:
+                                                y = float(miny)
+                                                while y <= maxy:
+                                                    p = Point(x, y)
+                                                    if region_4326.contains(p):
+                                                        rows.append(
+                                                            {
+                                                                "geometry": p,
+                                                                "weight": 1,
+                                                                "is_cluster_fill": True,
+                                                            }
+                                                        )
+                                                        fill_count += 1
+                                                        if fill_count >= max_fill_points:
+                                                            break
+                                                    y += step_y
+                                                    if fill_count >= max_fill_points:
+                                                        break
+                                                x += step_x
+                                                if fill_count >= max_fill_points:
+                                                    break
+                                    except Exception as e_fill:
+                                        self.logger.debug(f"fill_clusters for cluster {lid}: {e_fill}")
                         except Exception as e:
                             self.logger.debug(f"Область кластера {lid}: {e}")
             except Exception:

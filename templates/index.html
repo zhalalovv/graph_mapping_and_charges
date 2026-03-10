@@ -549,12 +549,26 @@
             const R_CHARGE_M = 1600;
             const R_GARAGE_TO_M = 3200;
             if (data.demand && data.demand.features && data.demand.features.length) {
-                    demandLayer = L.geoJSON(data.demand, {
-                        style: { color: '#94a3b8', fillColor: '#94a3b8', weight: 1, radius: 4 },
-                        pointToLayer: (f, latlng) => L.circleMarker(latlng, { radius: 4, fillColor: '#94a3b8', color: '#64748b', weight: 1, fillOpacity: 0.7 }),
-                        onEachFeature: (f, layer) => { if (f.properties && f.properties.weight) layer.bindPopup('Спрос: ' + f.properties.weight); }
-                    }).addTo(map);
-                }
+                demandLayer = L.geoJSON(data.demand, {
+                    // Скрываем технические точки-заполнители кластеров (is_cluster_fill = true),
+                    // чтобы в UI отображались только "основные" точки спроса.
+                    filter: (f) => !(f.properties && f.properties.is_cluster_fill),
+                    style: { color: '#94a3b8', fillColor: '#94a3b8', weight: 1, radius: 4 },
+                    pointToLayer: (f, latlng) =>
+                        L.circleMarker(latlng, {
+                            radius: 4,
+                            fillColor: '#94a3b8',
+                            color: '#64748b',
+                            weight: 1,
+                            fillOpacity: 0.7
+                        }),
+                    onEachFeature: (f, layer) => {
+                        if (f.properties && f.properties.weight != null) {
+                            layer.bindPopup('Спрос: ' + f.properties.weight);
+                        }
+                    }
+                }).addTo(map);
+            }
                 if (data.charge_stations && data.charge_stations.features && data.charge_stations.features.length) {
                     chargeRadiusLayer = L.layerGroup();
                     data.charge_stations.features.forEach(f => {

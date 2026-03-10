@@ -106,6 +106,11 @@ class StationPlacement:
         dbscan_min_samples: int = 15,
         use_all_buildings: bool = False,
         no_fly_zones=None,
+        # При method="dbscan": дополнительно заполнять полигоны кластеров сеткой точек спроса,
+        # чтобы размещение станций стремилось покрыть всю область кластера.
+        fill_clusters: bool = False,
+        # Пользовательский шаг сетки для заполнения кластеров (в метрах); по умолчанию = dbscan_eps_m.
+        cluster_fill_step_m: Optional[float] = None,
     ) -> gpd.GeoDataFrame:
         """Точки спроса: DBSCAN-кластеры или сеточные ячейки с весом. При use_all_buildings=True — по всем зданиям вне беспилотных зон."""
         return self.data_service.get_demand_points_weighted(
@@ -118,6 +123,8 @@ class StationPlacement:
             dbscan_min_samples=dbscan_min_samples,
             use_all_buildings=use_all_buildings,
             no_fly_zones=no_fly_zones,
+            fill_clusters=fill_clusters,
+            cluster_fill_step_m=cluster_fill_step_m,
         )
 
     # --- Кандидаты зарядок относительно кластеров DBSCAN ---
@@ -1005,6 +1012,10 @@ def run_full_pipeline(
         dbscan_min_samples=dbscan_min_samples,
         use_all_buildings=use_all_buildings,
         no_fly_zones=no_fly_zones,
+        # Для максимальной скорости размещения точек спроса используем только центроиды кластеров / ячейки,
+        # без дополнительного заполнения кластеров сеткой.
+        fill_clusters=False,
+        cluster_fill_step_m=None,
     )
     if demand is None or len(demand) == 0:
         return {"error": "Нет точек спроса", "demand": None, "charge_stations": None, "garages": None, "to_stations": None, "trunk_graph": None, "metrics": {}}
