@@ -22,8 +22,11 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 import networkx as nx
-from shapely.geometry import Point
+from shapely.geometry import Point, LineString
 from scipy.spatial import cKDTree
+from concurrent.futures import ThreadPoolExecutor
+
+from graph_service import GraphService
 
 # Радиус Земли в км
 EARTH_R_KM = 6371.0
@@ -86,6 +89,8 @@ def km_to_deg_approx(km: float, lat_center: float) -> float:
     deg_lat = km / 111.0
     deg_lon = km / (111.0 * max(0.2, np.cos(np.radians(lat_center))))
     return max(deg_lat, deg_lon)
+
+
 class StationPlacement:
     def __init__(self, data_service, logger=None):
         self.data_service = data_service
@@ -222,6 +227,8 @@ class StationPlacement:
         # Стохастичность: random_state=None -> каждый запуск чуть разный;
         # при фиксированном random_state результат воспроизводим.
         random_state: Optional[int] = None,
+        parallel: bool = False,
+        parallel_workers: Optional[int] = None,
     ) -> Tuple[gpd.GeoDataFrame, Dict[str, Any]]:
         """
         Два типа зарядок:
@@ -315,6 +322,48 @@ class StationPlacement:
                     return True
             return False
 
+        def _score_candidate(
+            i: int,
+            station_type: str,
+            ignore_covered_in_score: bool,
+        ) -> Tuple[int, float]:
+            if i in selected_indices:
+                return i, 0.0
+            # Станции типа А — только крыши МКД (source == "building"); тип Б — любые кандидаты
+            if station_type == "charge_a" and "source" in candidates.columns:
+                if candidates.iloc[i].get("source") != "building":
+                    return i, 0.0
+            lon_c, lat_c = cand_pts[i, 0], cand_pts[i, 1]
+            # Для станций типа А жёстко ограничиваемся ядром: далеко в сёла не уходим.
+            if station_type == "charge_a" and max_core_dist_a_km > 0.0:
+                d_core = haversine_km(lat_c, lon_c, core_lat, core_lon)
+                if d_core > max_core_dist_a_km:
+                    return i, 0.0
+            # Геометрическое ограничение: станции не должны "впадать" друг в друга.
+            if _too_close_to_existing(i, station_type):
+                return i, 0.0
+            new_weight = 0.0
+            for j in range(n_demand):
+                # Фаза А: учитываем только «ядро» спроса (is_core_demand),
+                # фаза Б: весь оставшийся спрос.
+                if station_type == "charge_a" and not is_core_demand[j]:
+                    continue
+                if not ignore_covered_in_score and covered[j]:
+                    continue
+                d_km = haversine_km(lat_c, lon_c, dem_pts[j, 1], dem_pts[j, 0])
+                if d_km <= radius_km:
+                    new_weight += weights[j]
+            # Для станций типа Б даём приоритет крышам МКД:
+            # кандидаты с source == "building" получают небольшой бонус к "выигрышу" по спросу.
+            if (
+                station_type == "charge_b"
+                and "source" in candidates.columns
+                and candidates.iloc[i].get("source") == "building"
+                and new_weight > 0
+            ):
+                new_weight *= 1.2
+            return i, new_weight
+
         def run_phase(station_type: str, stop_at_ratio: float, ignore_covered_in_score: bool = False) -> None:
             nonlocal covered, selected, selected_indices
             while True:
@@ -322,54 +371,36 @@ class StationPlacement:
                 best_new_weight = 0.0
                 # Для стохастики храним несколько почти лучших кандидатов
                 top_indices: List[int] = []
-                for i in range(len(cand_pts)):
-                    if i in selected_indices:
-                        continue
-                    # Станции типа А — только крыши МКД (source == "building"); тип Б — любые кандидаты
-                    if station_type == "charge_a" and "source" in candidates.columns:
-                        if candidates.iloc[i].get("source") != "building":
+                indices = list(range(len(cand_pts)))
+
+                if parallel and len(indices) > 0:
+                    max_workers = parallel_workers or None
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        for i, new_weight in executor.map(
+                            lambda idx: _score_candidate(idx, station_type, ignore_covered_in_score),
+                            indices,
+                        ):
+                            if new_weight <= 0:
+                                continue
+                            if new_weight > best_new_weight:
+                                best_new_weight = new_weight
+                                best_idx = i
+                                top_indices = [i]
+                            else:
+                                if best_new_weight > 0 and new_weight >= 0.95 * best_new_weight:
+                                    top_indices.append(i)
+                else:
+                    for i in indices:
+                        i, new_weight = _score_candidate(i, station_type, ignore_covered_in_score)
+                        if new_weight <= 0:
                             continue
-                    lon_c, lat_c = cand_pts[i, 0], cand_pts[i, 1]
-                    # Для станций типа А жёстко ограничиваемся ядром: далеко в сёла не уходим.
-                    if station_type == "charge_a" and max_core_dist_a_km > 0.0:
-                        d_core = haversine_km(lat_c, lon_c, core_lat, core_lon)
-                        if d_core > max_core_dist_a_km:
-                            continue
-                    # Геометрическое ограничение: станции не должны "впадать" друг в друга.
-                    # Разрешаем только такие кандидаты, которые достаточно далеко от уже выбранных.
-                    if _too_close_to_existing(i, station_type):
-                        continue
-                    new_weight = 0.0
-                    for j in range(n_demand):
-                        # Фаза А: учитываем только «ядро» спроса (is_core_demand),
-                        # фаза Б: весь оставшийся спрос.
-                        if station_type == "charge_a" and not is_core_demand[j]:
-                            continue
-                        if not ignore_covered_in_score and covered[j]:
-                            continue
-                        d_km = haversine_km(lat_c, lon_c, dem_pts[j, 1], dem_pts[j, 0])
-                        if d_km <= radius_km:
-                            new_weight += weights[j]
-                    # Для станций типа Б даём приоритет крышам МКД:
-                    # кандидаты с source == "building" получают небольшой бонус к "выигрышу" по спросу.
-                    if (
-                        station_type == "charge_b"
-                        and "source" in candidates.columns
-                        and candidates.iloc[i].get("source") == "building"
-                        and new_weight > 0
-                    ):
-                        new_weight *= 1.2
-                    if new_weight <= 0:
-                        continue
-                    if new_weight > best_new_weight:
-                        best_new_weight = new_weight
-                        best_idx = i
-                        top_indices = [i]
-                    else:
-                        # Кандидаты, которые дают почти такой же прирост (например, не хуже 95% от лучшего),
-                        # тоже добавляем в список для случайного выбора.
-                        if best_new_weight > 0 and new_weight >= 0.95 * best_new_weight:
-                            top_indices.append(i)
+                        if new_weight > best_new_weight:
+                            best_new_weight = new_weight
+                            best_idx = i
+                            top_indices = [i]
+                        else:
+                            if best_new_weight > 0 and new_weight >= 0.95 * best_new_weight:
+                                top_indices.append(i)
                 if best_new_weight <= 0:
                     break
                 # Если есть несколько почти эквивалентных по весу кандидатов — выбираем случайно один из них.
@@ -435,6 +466,7 @@ class StationPlacement:
         garage_points: gpd.GeoDataFrame,
         to_points: gpd.GeoDataFrame,
         no_fly_zones,
+        nav_graph: Optional[nx.Graph] = None,
         *,
         max_edge_km: float = R_GARAGE_TO_KM,
         max_neighbors_a: int = 4,
@@ -465,6 +497,136 @@ class StationPlacement:
         if len(a_list) < 2:
             return G
 
+        # Навигационный граф для построения маршрутов A* (обходит no_fly_zones).
+        # Если не передан, рёбра будут прямыми (как раньше).
+        nav_tree = None
+        nav_coords = None
+        nav_ids: List[Any] = []
+        graph_service: Optional[GraphService] = None
+
+        if nav_graph is not None and nav_graph.number_of_nodes() > 0:
+            graph_service = GraphService()
+            tmp_coords = []
+            tmp_ids = []
+            for nid, data in nav_graph.nodes(data=True):
+                # Пытаемся извлечь координаты узла (x,y или lon,lat или pos)
+                coord = None
+                if "x" in data and "y" in data:
+                    coord = (float(data["x"]), float(data["y"]))
+                elif "lon" in data and "lat" in data:
+                    coord = (float(data["lon"]), float(data["lat"]))
+                else:
+                    pos = data.get("pos")
+                    if pos is not None and len(pos) >= 2:
+                        coord = (float(pos[0]), float(pos[1]))
+                if coord is None:
+                    continue
+                tmp_ids.append(nid)
+                tmp_coords.append(coord)
+            if tmp_coords:
+                nav_coords = np.array(tmp_coords)
+                nav_ids = tmp_ids
+                nav_tree = cKDTree(nav_coords)
+
+        def _nearest_nav_node(lon: float, lat: float):
+            if nav_tree is None or nav_coords is None or not nav_ids:
+                return None
+            d, idx = nav_tree.query([lon, lat], k=1)
+            try:
+                idx_int = int(idx)
+            except Exception:
+                idx_int = int(np.atleast_1d(idx)[0])
+            return nav_ids[idx_int]
+
+        def _node_lonlat(nid) -> Optional[Tuple[float, float]]:
+            if nav_graph is None:
+                return None
+            data = nav_graph.nodes.get(nid, {})
+            if "x" in data and "y" in data:
+                return float(data["x"]), float(data["y"])
+            if "lon" in data and "lat" in data:
+                return float(data["lon"]), float(data["lat"])
+            pos = data.get("pos")
+            if pos is not None and len(pos) >= 2:
+                return float(pos[0]), float(pos[1])
+            return None
+
+        def _astar_route(
+            lon1: float,
+            lat1: float,
+            lon2: float,
+            lat2: float,
+        ) -> Optional[Tuple[float, List[Tuple[float, float]]]]:
+            """
+            Маршрут A* в навигационном графе между ближайшими к (lon1,lat1) и (lon2,lat2) узлами.
+            Возвращает (длина_км, список (lon,lat)). При ошибке — None.
+            """
+            if nav_graph is None or nav_tree is None:
+                return None
+            start = _nearest_nav_node(lon1, lat1)
+            goal = _nearest_nav_node(lon2, lat2)
+            if start is None or goal is None:
+                return None
+
+            # Предвычисляем координаты узлов по мере необходимости
+            coord_cache: Dict[Any, Tuple[float, float]] = {}
+
+            def _coord(n):
+                if n in coord_cache:
+                    return coord_cache[n]
+                c = _node_lonlat(n)
+                if c is None:
+                    return None
+                coord_cache[n] = c
+                return c
+
+            # Эвристика A*: геодезическое расстояние (км) между нодами
+            def heuristic(u, v):
+                cu = _coord(u)
+                cv = _coord(v)
+                if cu is None or cv is None:
+                    return 0.0
+                lon_u, lat_u = cu
+                lon_v, lat_v = cv
+                return haversine_km(lat_u, lon_u, lat_v, lon_v)
+
+            try:
+                path = nx.astar_path(nav_graph, start, goal, heuristic=heuristic, weight="weight")
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                return None
+
+            coords_path: List[Tuple[float, float]] = []
+            total_len = 0.0
+            prev = None
+            for n in path:
+                c = _coord(n)
+                if c is None:
+                    continue
+                lon_n, lat_n = c
+                coords_path.append((lon_n, lat_n))
+                if prev is not None:
+                    # Используем вес ребра, если есть, иначе — гаверсин.
+                    try:
+                        data = nav_graph.get_edge_data(prev, n, default=None)
+                    except Exception:
+                        data = None
+                    if isinstance(data, dict) and data:
+                        # Обычный граф или MultiGraph (берём первое под-ребро)
+                        edge_attrs = data
+                        # Для MultiGraph get_edge_data возвращает словарь под-ребер
+                        if any(isinstance(k, (int, str)) and isinstance(v, dict) for k, v in data.items()):
+                            edge_attrs = next(iter(data.values()))
+                        w = edge_attrs.get("weight") or edge_attrs.get("length") or 0.0
+                        total_len += float(w)
+                    else:
+                        lon_p, lat_p = _coord(prev)
+                        total_len += haversine_km(lat_p, lon_p, lat_n, lon_n)
+                prev = n
+
+            if len(coords_path) < 2:
+                return None
+            return total_len, coords_path
+
         # Рёбра только А–А: каждая станция А соединяется с макс. max_neighbors_a ближайшими А в пределах max_edge_km
         a_pts = np.array([[lon, lat] for _, lon, lat in a_list])
         a_ids = [nid for nid, _, _ in a_list]
@@ -478,14 +640,46 @@ class StationPlacement:
             for j in range(len(a_list)):
                 if j == i:
                     continue
-                d_km = haversine_km(lat_i, lon_i, a_pts[j, 1], a_pts[j, 0])
-                if d_km <= max_edge_km:
-                    candidates.append((d_km, j))
+                d_km_straight = haversine_km(lat_i, lon_i, a_pts[j, 1], a_pts[j, 0])
+                if d_km_straight <= max_edge_km:
+                    candidates.append((d_km_straight, j))
             candidates.sort(key=lambda x: x[0])
-            for d_km, j in candidates[:k]:
+            for d_km_straight, j in candidates[:k]:
                 nid_j = a_ids[j]
-                if not G.has_edge(nid_i, nid_j):
-                    G.add_edge(nid_i, nid_j, weight=d_km, length=d_km)
+                if G.has_edge(nid_i, nid_j):
+                    continue
+
+                # Если есть навигационный граф, строим маршрут A*,
+                # иначе используем прямой отрезок как раньше.
+                if nav_graph is not None:
+                    route = _astar_route(
+                        lon1=a_pts[i, 0],
+                        lat1=a_pts[i, 1],
+                        lon2=a_pts[j, 0],
+                        lat2=a_pts[j, 1],
+                    )
+                else:
+                    route = None
+
+                if route is not None:
+                    d_km_route, coords_route = route
+                    if d_km_route <= 0:
+                        continue
+                    G.add_edge(
+                        nid_i,
+                        nid_j,
+                        weight=d_km_route,
+                        length=d_km_route,
+                        geometry_coords=coords_route,
+                    )
+                else:
+                    # Фоллбэк: прямое ребро
+                    G.add_edge(
+                        nid_i,
+                        nid_j,
+                        weight=d_km_straight,
+                        length=d_km_straight,
+                    )
         # Связность: объединяем компоненты зарядок А
         charge_nodes_ids = [n for n, d in G.nodes(data=True) if d.get("node_type") == "charge"]
         if len(charge_nodes_ids) > 1:
@@ -521,10 +715,11 @@ class StationPlacement:
 
     def build_branch_edges(
         self,
-        self,
         charge_stations: gpd.GeoDataFrame,
         garage_points: Optional[gpd.GeoDataFrame] = None,
         to_points: Optional[gpd.GeoDataFrame] = None,
+        no_fly_zones=None,
+        nav_graph: Optional[nx.Graph] = None,
         *,
         k_nearest: int = 3,
         max_branch_km: float = R_GARAGE_TO_KM,
@@ -535,6 +730,129 @@ class StationPlacement:
         """
         if charge_stations is None or len(charge_stations) == 0:
             return []
+
+        # Навигационный граф для построения маршрутов A* (обходит no_fly_zones).
+        # Если не передан, рёбра будут прямыми, но не над бесполётными зонами (как раньше).
+        nav_tree = None
+        nav_coords = None
+        nav_ids: List[Any] = []
+
+        if nav_graph is not None and nav_graph.number_of_nodes() > 0:
+            tmp_coords = []
+            tmp_ids = []
+            for nid, data in nav_graph.nodes(data=True):
+                coord = None
+                if "x" in data and "y" in data:
+                    coord = (float(data["x"]), float(data["y"]))
+                elif "lon" in data and "lat" in data:
+                    coord = (float(data["lon"]), float(data["lat"]))
+                else:
+                    pos = data.get("pos")
+                    if pos is not None and len(pos) >= 2:
+                        coord = (float(pos[0]), float(pos[1]))
+                if coord is None:
+                    continue
+                tmp_ids.append(nid)
+                tmp_coords.append(coord)
+            if tmp_coords:
+                nav_coords = np.array(tmp_coords)
+                nav_ids = tmp_ids
+                nav_tree = cKDTree(nav_coords)
+
+        def _nearest_nav_node(lon: float, lat: float):
+            if nav_tree is None or nav_coords is None or not nav_ids:
+                return None
+            d, idx = nav_tree.query([lon, lat], k=1)
+            try:
+                idx_int = int(idx)
+            except Exception:
+                idx_int = int(np.atleast_1d(idx)[0])
+            return nav_ids[idx_int]
+
+        def _node_lonlat(nid) -> Optional[Tuple[float, float]]:
+            if nav_graph is None:
+                return None
+            data = nav_graph.nodes.get(nid, {})
+            if "x" in data and "y" in data:
+                return float(data["x"]), float(data["y"])
+            if "lon" in data and "lat" in data:
+                return float(data["lon"]), float(data["lat"])
+            pos = data.get("pos")
+            if pos is not None and len(pos) >= 2:
+                return float(pos[0]), float(pos[1])
+            return None
+
+        def _astar_route(
+            lon1: float,
+            lat1: float,
+            lon2: float,
+            lat2: float,
+        ) -> Optional[Tuple[float, List[Tuple[float, float]]]]:
+            """
+            Маршрут A* в навигационном графе между ближайшими к (lon1,lat1) и (lon2,lat2) узлами.
+            Возвращает (длина_км, список (lon,lat)). При ошибке — None.
+            """
+            if nav_graph is None or nav_tree is None:
+                return None
+            start = _nearest_nav_node(lon1, lat1)
+            goal = _nearest_nav_node(lon2, lat2)
+            if start is None or goal is None:
+                return None
+
+            coord_cache: Dict[Any, Tuple[float, float]] = {}
+
+            def _coord(n):
+                if n in coord_cache:
+                    return coord_cache[n]
+                c = _node_lonlat(n)
+                if c is None:
+                    return None
+                coord_cache[n] = c
+                return c
+
+            def heuristic(u, v):
+                cu = _coord(u)
+                cv = _coord(v)
+                if cu is None or cv is None:
+                    return 0.0
+                lon_u, lat_u = cu
+                lon_v, lat_v = cv
+                return haversine_km(lat_u, lon_u, lat_v, lon_v)
+
+            try:
+                path = nx.astar_path(nav_graph, start, goal, heuristic=heuristic, weight="weight")
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                return None
+
+            coords_path: List[Tuple[float, float]] = []
+            total_len = 0.0
+            prev = None
+            for n in path:
+                c = _coord(n)
+                if c is None:
+                    continue
+                lon_n, lat_n = c
+                coords_path.append((lon_n, lat_n))
+                if prev is not None:
+                    try:
+                        data = nav_graph.get_edge_data(prev, n, default=None)
+                    except Exception:
+                        data = None
+                    if isinstance(data, dict) and data:
+                        edge_attrs = data
+                        if any(isinstance(k, (int, str)) and isinstance(v, dict) for k, v in data.items()):
+                            edge_attrs = next(iter(data.values()))
+                        w = edge_attrs.get("weight") or edge_attrs.get("length") or 0.0
+                        total_len += float(w)
+                    else:
+                        lon_p, lat_p = _coord(prev)
+                        total_len += haversine_km(lat_p, lon_p, lat_n, lon_n)
+                prev = n
+
+            if len(coords_path) < 2:
+                return None
+            return total_len, coords_path
+
         type_a = charge_stations["station_type"] == "charge_a" if "station_type" in charge_stations.columns else pd.Series([True] * len(charge_stations))
         type_b = charge_stations["station_type"] == "charge_b" if "station_type" in charge_stations.columns else pd.Series([False] * len(charge_stations))
         a_indices = [i for i in charge_stations.index[type_a]]
@@ -568,22 +886,65 @@ class StationPlacement:
                     candidates.append((d_km, lon_t, lat_t, tid))
             candidates.sort(key=lambda x: x[0])
             for d_km, lon_t, lat_t, tid in candidates[:k]:
-                features.append({
-                    "type": "Feature",
-                    "geometry": {"type": "LineString", "coordinates": [[lon_b, lat_b], [lon_t, lat_t]]},
-                    "properties": {
-                        "edge_type": "branch",
-                        "source_id": str(idx_b),
-                        "target_id": tid,
-                        "weight_km": round(d_km, 4),
-                    },
-                })
+                # Если есть навигационный граф, строим маршрут A*,
+                # иначе используем прямой отрезок, как раньше (с учётом бесполётных зон).
+                route = None
+                if nav_graph is not None:
+                    route = _astar_route(
+                        lon1=lon_b,
+                        lat1=lat_b,
+                        lon2=lon_t,
+                        lat2=lat_t,
+                    )
+
+                if route is not None:
+                    d_km_route, coords_route = route
+                    if d_km_route <= 0:
+                        continue
+                    features.append({
+                        "type": "Feature",
+                        "geometry": {"type": "LineString", "coordinates": coords_route},
+                        "properties": {
+                            "edge_type": "branch",
+                            "source_id": str(idx_b),
+                            "target_id": tid,
+                            "weight_km": round(d_km_route, 4),
+                        },
+                    })
+                else:
+                    # Фоллбэк: прямое ребро, не над бесполётными зонами
+                    obstacles = None
+                    if no_fly_zones is not None:
+                        try:
+                            graph_service = GraphService()
+                            obstacles = graph_service._prepare_obstacles(None, no_fly_zones, buffer_distance=0.0)
+                        except Exception:
+                            obstacles = None
+                    if obstacles is not None:
+                        try:
+                            line = LineString([[lon_b, lat_b], [lon_t, lat_t]])
+                            if obstacles.intersects(line) or obstacles.contains(line):
+                                continue
+                        except Exception:
+                            pass
+                    features.append({
+                        "type": "Feature",
+                        "geometry": {"type": "LineString", "coordinates": [[lon_b, lat_b], [lon_t, lat_t]]},
+                        "properties": {
+                            "edge_type": "branch",
+                            "source_id": str(idx_b),
+                            "target_id": tid,
+                            "weight_km": round(d_km, 4),
+                        },
+                    })
         self.logger.info(f"Ветки Б→А/гараж/ТО (макс. {k} на станцию): {len(features)} рёбер")
         return features
 
     def build_local_edges(
         self,
         charge_stations: gpd.GeoDataFrame,
+        no_fly_zones=None,
+        nav_graph: Optional[nx.Graph] = None,
         *,
         max_edge_km: float = R_GARAGE_TO_KM,
         max_neighbors_b: int = 2,
@@ -594,6 +955,129 @@ class StationPlacement:
         """
         if charge_stations is None or len(charge_stations) == 0:
             return []
+
+        # Навигационный граф для построения маршрутов A* (обходит no_fly_zones).
+        # Если не передан, рёбра будут прямыми, но не над бесполётными зонами (как раньше).
+        nav_tree = None
+        nav_coords = None
+        nav_ids: List[Any] = []
+
+        if nav_graph is not None and nav_graph.number_of_nodes() > 0:
+            tmp_coords = []
+            tmp_ids = []
+            for nid, data in nav_graph.nodes(data=True):
+                coord = None
+                if "x" in data and "y" in data:
+                    coord = (float(data["x"]), float(data["y"]))
+                elif "lon" in data and "lat" in data:
+                    coord = (float(data["lon"]), float(data["lat"]))
+                else:
+                    pos = data.get("pos")
+                    if pos is not None and len(pos) >= 2:
+                        coord = (float(pos[0]), float(pos[1]))
+                if coord is None:
+                    continue
+                tmp_ids.append(nid)
+                tmp_coords.append(coord)
+            if tmp_coords:
+                nav_coords = np.array(tmp_coords)
+                nav_ids = tmp_ids
+                nav_tree = cKDTree(nav_coords)
+
+        def _nearest_nav_node(lon: float, lat: float):
+            if nav_tree is None or nav_coords is None or not nav_ids:
+                return None
+            d, idx = nav_tree.query([lon, lat], k=1)
+            try:
+                idx_int = int(idx)
+            except Exception:
+                idx_int = int(np.atleast_1d(idx)[0])
+            return nav_ids[idx_int]
+
+        def _node_lonlat(nid) -> Optional[Tuple[float, float]]:
+            if nav_graph is None:
+                return None
+            data = nav_graph.nodes.get(nid, {})
+            if "x" in data and "y" in data:
+                return float(data["x"]), float(data["y"])
+            if "lon" in data and "lat" in data:
+                return float(data["lon"]), float(data["lat"])
+            pos = data.get("pos")
+            if pos is not None and len(pos) >= 2:
+                return float(pos[0]), float(pos[1])
+            return None
+
+        def _astar_route(
+            lon1: float,
+            lat1: float,
+            lon2: float,
+            lat2: float,
+        ) -> Optional[Tuple[float, List[Tuple[float, float]]]]:
+            """
+            Маршрут A* в навигационном графе между ближайшими к (lon1,lat1) и (lon2,lat2) узлами.
+            Возвращает (длина_км, список (lon,lat)). При ошибке — None.
+            """
+            if nav_graph is None or nav_tree is None:
+                return None
+            start = _nearest_nav_node(lon1, lat1)
+            goal = _nearest_nav_node(lon2, lat2)
+            if start is None or goal is None:
+                return None
+
+            coord_cache: Dict[Any, Tuple[float, float]] = {}
+
+            def _coord(n):
+                if n in coord_cache:
+                    return coord_cache[n]
+                c = _node_lonlat(n)
+                if c is None:
+                    return None
+                coord_cache[n] = c
+                return c
+
+            def heuristic(u, v):
+                cu = _coord(u)
+                cv = _coord(v)
+                if cu is None or cv is None:
+                    return 0.0
+                lon_u, lat_u = cu
+                lon_v, lat_v = cv
+                return haversine_km(lat_u, lon_u, lat_v, lon_v)
+
+            try:
+                path = nx.astar_path(nav_graph, start, goal, heuristic=heuristic, weight="weight")
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                return None
+
+            coords_path: List[Tuple[float, float]] = []
+            total_len = 0.0
+            prev = None
+            for n in path:
+                c = _coord(n)
+                if c is None:
+                    continue
+                lon_n, lat_n = c
+                coords_path.append((lon_n, lat_n))
+                if prev is not None:
+                    try:
+                        data = nav_graph.get_edge_data(prev, n, default=None)
+                    except Exception:
+                        data = None
+                    if isinstance(data, dict) and data:
+                        edge_attrs = data
+                        if any(isinstance(k, (int, str)) and isinstance(v, dict) for k, v in data.items()):
+                            edge_attrs = next(iter(data.values()))
+                        w = edge_attrs.get("weight") or edge_attrs.get("length") or 0.0
+                        total_len += float(w)
+                    else:
+                        lon_p, lat_p = _coord(prev)
+                        total_len += haversine_km(lat_p, lon_p, lat_n, lon_n)
+                prev = n
+
+            if len(coords_path) < 2:
+                return None
+            return total_len, coords_path
+
         type_b = (
             charge_stations["station_type"] == "charge_b"
             if "station_type" in charge_stations.columns
@@ -620,20 +1104,67 @@ class StationPlacement:
                 edge_key = (min(ui, vi), max(ui, vi))
                 if edge_key in seen_edges:
                     continue
-                seen_edges.add(edge_key)
-                features.append({
-                    "type": "Feature",
-                    "geometry": {
-                        "type": "LineString",
-                        "coordinates": [[b_pts[i, 0], b_pts[i, 1]], [b_pts[j, 0], b_pts[j, 1]]],
-                    },
-                    "properties": {
-                        "edge_type": "local",
-                        "source_id": str(ui),
-                        "target_id": str(vi),
-                        "weight_km": round(d_km, 4),
-                    },
-                })
+                # Если есть навигационный граф, строим маршрут A*,
+                # иначе используем прямой отрезок, как раньше (с учётом бесполётных зон).
+                lon_u, lat_u = b_pts[i, 0], b_pts[i, 1]
+                lon_v, lat_v = b_pts[j, 0], b_pts[j, 1]
+                route = None
+                if nav_graph is not None:
+                    route = _astar_route(
+                        lon1=lon_u,
+                        lat1=lat_u,
+                        lon2=lon_v,
+                        lat2=lat_v,
+                    )
+
+                if route is not None:
+                    d_km_route, coords_route = route
+                    if d_km_route <= 0:
+                        continue
+                    seen_edges.add(edge_key)
+                    features.append({
+                        "type": "Feature",
+                        "geometry": {
+                            "type": "LineString",
+                            "coordinates": coords_route,
+                        },
+                        "properties": {
+                            "edge_type": "local",
+                            "source_id": str(ui),
+                            "target_id": str(vi),
+                            "weight_km": round(d_km_route, 4),
+                        },
+                    })
+                else:
+                    # Фоллбэк: прямое локальное ребро не над бесполётной зоной
+                    obstacles = None
+                    if no_fly_zones is not None:
+                        try:
+                            graph_service = GraphService()
+                            obstacles = graph_service._prepare_obstacles(None, no_fly_zones, buffer_distance=0.0)
+                        except Exception:
+                            obstacles = None
+                    if obstacles is not None:
+                        try:
+                            line = LineString([[lon_u, lat_u], [lon_v, lat_v]])
+                            if obstacles.intersects(line) or obstacles.contains(line):
+                                continue
+                        except Exception:
+                            pass
+                    seen_edges.add(edge_key)
+                    features.append({
+                        "type": "Feature",
+                        "geometry": {
+                            "type": "LineString",
+                            "coordinates": [[lon_u, lat_u], [lon_v, lat_v]],
+                        },
+                        "properties": {
+                            "edge_type": "local",
+                            "source_id": str(ui),
+                            "target_id": str(vi),
+                            "weight_km": round(d_km, 4),
+                        },
+                    })
         self.logger.info(f"Локальные рёбра Б↔Б (макс. {max_neighbors_b} на станцию): {len(features)}")
         return features
 
@@ -1008,6 +1539,7 @@ def run_full_pipeline(
     road_graph = data.get("road_graph")
     city_boundary = data.get("city_boundary")
     no_fly_zones = data.get("no_fly_zones")
+    flight_levels = data.get("flight_levels", [])
 
     placement = StationPlacement(data_service, logger=logger)
 
@@ -1079,6 +1611,7 @@ def run_full_pipeline(
         core_radius_factor_a=0.0,
         core_weight_quantile_a=0.0,
         min_center_distance_factor_b=0.75,   # Б плотнее — дозаполняют слабо заполненные кластеры
+        parallel=True,
     )
 
     # Кандидаты гаражи и ТО (промзоны)
@@ -1120,8 +1653,76 @@ def run_full_pipeline(
     garage_placeholder = (garage_candidates.iloc[:num_garages].copy() if num_garages > 0 and garage_candidates is not None and len(garage_candidates) > 0 else gpd.GeoDataFrame())
     to_placeholder = (to_candidates.iloc[:num_to].copy() if num_to > 0 and to_candidates is not None and len(to_candidates) > 0 else gpd.GeoDataFrame())
 
-    # Шаг 3: trunk (с заглушками)
-    trunk = placement.build_trunk_graph(charge_stations, garage_placeholder, to_placeholder, no_fly_zones, max_edge_km=R_GARAGE_TO_KM)
+    # Навигационный граф для A*: свободный полёт по всей доступной территории (не только по дорогам),
+    # с учётом бесполётных зон. Строим граф на основе триангуляции Делоне + (опционально) дорог.
+    nav_graph: Optional[nx.Graph] = None
+    try:
+        graph_service = GraphService()
+        obstacles = graph_service._prepare_obstacles(None, no_fly_zones, buffer_distance=0.0)
+
+        # Базовые "летаемые" точки в пределах границы города, вне зданий и no_fly_zones
+        flyable_points = graph_service.get_flyable_points(
+            city_boundary=city_boundary,
+            buildings=buildings,
+            no_fly_zones=no_fly_zones,
+            building_buffer_deg=0.00025,
+            min_distance_deg=0.0003,
+            max_points=3000,
+        )
+
+        # Добавляем координаты всех станций (зарядки, гаражи, ТО) как обязательные узлы графа,
+        # чтобы A* всегда мог "подцепиться" к точкам инфраструктуры.
+        extra_points = []
+        for gdf in (charge_stations, garage_candidates, to_candidates):
+            if gdf is None or len(gdf) == 0:
+                continue
+            for _, row in gdf.iterrows():
+                lon, lat = _coords_from_geom(row.geometry)
+                extra_points.append((lon, lat))
+
+        # Объединяем наборы точек, не допуская слишком близких дубликатов
+        all_points = graph_service.merge_points_min_distance(
+            points_a=flyable_points,
+            points_b=extra_points,
+            min_distance_deg=0.00015,
+        )
+
+        if city_boundary is not None and all_points:
+            bounds = city_boundary.bounds  # (minx, miny, maxx, maxy)
+            delaunay_graph = graph_service.create_delaunay_graph(
+                bounds=bounds,
+                buildings=None,
+                no_fly_zones=no_fly_zones,
+                min_clearance=0.0,
+                city_boundary=city_boundary,
+                points=all_points,
+            )
+        else:
+            delaunay_graph = nx.Graph()
+
+        # Если есть дорожный граф, мягко объединяем его с Delaunay:
+        # дрон может как следовать дорогам, так и летать "по воздуху" между ними, избегая препятствий.
+        if road_graph is not None and len(road_graph.nodes) > 0 and delaunay_graph.number_of_nodes() > 0:
+            nav_graph = graph_service.merge_road_and_delaunay(
+                road_graph=road_graph,
+                delaunay_graph=delaunay_graph,
+                max_connection_distance_deg=0.0003,
+                obstacles=obstacles,
+            )
+        else:
+            nav_graph = delaunay_graph if delaunay_graph.number_of_nodes() > 0 else None
+    except Exception:
+        nav_graph = None
+
+    # Шаг 3: trunk (с заглушками, с использованием навигационного графа для A*)
+    trunk = placement.build_trunk_graph(
+        charge_stations,
+        garage_placeholder,
+        to_placeholder,
+        no_fly_zones,
+        nav_graph=nav_graph,
+        max_edge_km=R_GARAGE_TO_KM,
+    )
 
     # Шаг 4–5: гаражи и ТО размещаем по покрытию спроса (как зарядки) до 95%
     garages = placement.place_garages(
@@ -1180,20 +1781,33 @@ def run_full_pipeline(
         max_to_stations=100,
     )
 
-    # Пересобираем trunk с уже выбранными гаражами и ТО
-    trunk = placement.build_trunk_graph(charge_stations, garages, to_stations, no_fly_zones, max_edge_km=R_GARAGE_TO_KM)
+    # Пересобираем trunk с уже выбранными гаражами и ТО (с тем же навигационным графом)
+    trunk = placement.build_trunk_graph(
+        charge_stations,
+        garages,
+        to_stations,
+        no_fly_zones,
+        nav_graph=nav_graph,
+        max_edge_km=R_GARAGE_TO_KM,
+    )
 
     # Ветки: Б → (А / гараж / ТО), макс. 3 связи на станцию Б
     branch_edges = placement.build_branch_edges(
         charge_stations,
         garages,
         to_stations,
+        no_fly_zones=no_fly_zones,
+        nav_graph=nav_graph,
         k_nearest=3,
         max_branch_km=R_GARAGE_TO_KM,
     )
     # Локальная сеть Б↔Б, макс. 2 связи на станцию
     local_edges = placement.build_local_edges(
-        charge_stations, max_edge_km=R_GARAGE_TO_KM, max_neighbors_b=2
+        charge_stations,
+        no_fly_zones=no_fly_zones,
+        nav_graph=nav_graph,
+        max_edge_km=R_GARAGE_TO_KM,
+        max_neighbors_b=2,
     )
 
     # Шаг 6: метрики

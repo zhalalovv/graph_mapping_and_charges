@@ -455,17 +455,29 @@ def get_stations_placement(
         trunk_edges = []
         if trunk is not None and trunk.number_of_edges() > 0:
             for u, v, data in trunk.edges(data=True):
-                nu, nv = trunk.nodes[u], trunk.nodes[v]
-                lon1 = nu.get("lon") or nu.get("x")
-                lat1 = nu.get("lat") or nu.get("y")
-                lon2 = nv.get("lon") or nv.get("x")
-                lat2 = nv.get("lat") or nv.get("y")
-                if lon1 is not None and lat1 is not None and lon2 is not None and lat2 is not None:
+                # Если в данных ребра уже есть полилиния (geometry_coords) — используем её,
+                # иначе строим простой отрезок между узлами (как раньше).
+                coords = data.get("geometry_coords")
+                if coords and isinstance(coords, (list, tuple)) and len(coords) >= 2:
+                    line_coords = [[float(lon), float(lat)] for lon, lat in coords]
+                    weight_val = data.get("weight") or data.get("length")
                     trunk_edges.append({
                         "type": "Feature",
-                        "geometry": {"type": "LineString", "coordinates": [[lon1, lat1], [lon2, lat2]]},
-                        "properties": {"weight_km": data.get("weight") or data.get("length")},
+                        "geometry": {"type": "LineString", "coordinates": line_coords},
+                        "properties": {"weight_km": weight_val},
                     })
+                else:
+                    nu, nv = trunk.nodes[u], trunk.nodes[v]
+                    lon1 = nu.get("lon") or nu.get("x")
+                    lat1 = nu.get("lat") or nu.get("y")
+                    lon2 = nv.get("lon") or nv.get("x")
+                    lat2 = nv.get("lat") or nv.get("y")
+                    if lon1 is not None and lat1 is not None and lon2 is not None and lat2 is not None:
+                        trunk_edges.append({
+                            "type": "Feature",
+                            "geometry": {"type": "LineString", "coordinates": [[lon1, lat1], [lon2, lat2]]},
+                            "properties": {"weight_km": data.get("weight") or data.get("length")},
+                        })
         trunk_fc = round_coords({"type": "FeatureCollection", "features": trunk_edges})
 
         # Ветки от станций типа Б к станциям типа А (связь, не магистраль)
