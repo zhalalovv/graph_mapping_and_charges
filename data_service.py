@@ -1314,6 +1314,9 @@ class DataService:
         fill_clusters: bool = False,
         # Шаг сетки внутри кластера (в метрах). По умолчанию = dbscan_eps_m.
         cluster_fill_step_m: Optional[float] = None,
+        # Радиус кругов при построении полигона кластера (hull): eps_m * hull_radius_factor.
+        # Чем меньше коэффициент, тем ближе граница к зданиям (меньше заходит на соседние зоны).
+        hull_radius_factor: float = 0.3,
     ):
         """
         Шаг B: точки спроса для размещения — только по зданиям (центроиды), дороги не используются.
@@ -1415,11 +1418,15 @@ class DataService:
             if btag in ("hotel", "hostel", "dormitory", "motel"):
                 return "public"
 
-            # 6) Частный сектор
+            # 6) Частный сектор (явные теги: house, yes, residential и т.д.)
             if self._is_private_house(row, is_apartment=False):
                 return "private"
 
-            # 7) Остальное
+            # 7) Здания без тега building или с пустым/yes — в РФ часто частный сектор; не тянем в МКД.
+            if (not btag or btag in ("yes", "true", "1")) and not amenity and not shop:
+                return "private"
+
+            # 8) Остальное
             return "other"
 
         def _building_demand_weight(row) -> float:
@@ -1537,7 +1544,9 @@ class DataService:
                             "demand_type": str(demand_type) if demand_type is not None else None,
                         })
                         try:
-                            circles_utm = [Point(float(x), float(y)).buffer(eps_m) for x, y in sub_pts]
+                            # Граница полигона — по уменьшенному радиусу, чтобы не захватывать соседние типы зданий (МКД/частный сектор).
+                            hull_radius_m = max(30.0, float(eps_m) * float(hull_radius_factor))
+                            circles_utm = [Point(float(x), float(y)).buffer(hull_radius_m) for x, y in sub_pts]
                             region_utm = unary_union(circles_utm)
                             if region_utm is None or region_utm.is_empty:
                                 return
@@ -1680,42 +1689,38 @@ class DataService:
         self.logger.info(f"Точки спроса ({method}): {len(gdf)}, сумма весов {gdf['weight'].sum()}")
 
         if return_hulls:
-            # Устраняем пересечения только внутри одного типа спроса (demand_type).
-            # Кластеры разных типов (частный сектор, МКД, магазины и т.д.) не вырезают друг друга —
-            # так на карте чётко видно отдельно «только частные», отдельно «МКД», отдельно «магазины».
+            # Устраняем пересечения глобально для всех кластеров (включая разные demand_type),
+            # чтобы полигоны кластеров не накладывались друг на друга.
             if hull_rows:
                 try:
                     from shapely.ops import unary_union as shp_union
 
                     hulls_gdf = gpd.GeoDataFrame(hull_rows, crs="EPSG:4326")
-                    # Группируем по типу спроса
                     demand_type_col = "demand_type"
-                    type_vals = hulls_gdf[demand_type_col].fillna("other").astype(str)
+                    # Сортируем все кластеры по весу (от более тяжёлых к более лёгким)
+                    sub = hulls_gdf.sort_values(by="weight", ascending=False).reset_index(drop=True)
                     cleaned_parts = []
-                    for dtype in type_vals.unique():
-                        mask = type_vals == dtype
-                        sub = hulls_gdf.loc[mask].sort_values(by="weight", ascending=False).reset_index(drop=True)
-                        used_geom = None
-                        for idx, row in sub.iterrows():
-                            geom = row.geometry
-                            if geom is None or geom.is_empty:
-                                continue
-                            if used_geom is not None and not used_geom.is_empty:
-                                try:
-                                    geom = geom.difference(used_geom)
-                                except Exception:
-                                    pass
-                            if geom is None or geom.is_empty:
-                                continue
-                            cleaned_parts.append({
-                                "geometry": geom,
-                                "weight": row["weight"],
-                                "demand_type": row.get(demand_type_col),
-                            })
+                    used_geom = None
+                    for idx, row in sub.iterrows():
+                        geom = row.geometry
+                        if geom is None or geom.is_empty:
+                            continue
+                        if used_geom is not None and not used_geom.is_empty:
                             try:
-                                used_geom = geom if used_geom is None else shp_union([used_geom, geom])
+                                geom = geom.difference(used_geom)
                             except Exception:
                                 pass
+                        if geom is None or geom.is_empty:
+                            continue
+                        cleaned_parts.append({
+                            "geometry": geom,
+                            "weight": row["weight"],
+                            "demand_type": row.get(demand_type_col),
+                        })
+                        try:
+                            used_geom = geom if used_geom is None else shp_union([used_geom, geom])
+                        except Exception:
+                            pass
                     hulls_gdf = gpd.GeoDataFrame(cleaned_parts, crs="EPSG:4326")
                     hulls_gdf = hulls_gdf[~hulls_gdf["geometry"].isna() & ~hulls_gdf["geometry"].is_empty].copy()
                     hulls_gdf["cluster_id"] = range(len(hulls_gdf))

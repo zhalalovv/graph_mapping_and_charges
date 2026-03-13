@@ -170,11 +170,18 @@ def get_building_clusters(
                 cluster_hulls_fc = {"type": "FeatureCollection", "features": []}
             else:
                 features = []
-                for idx, row in demand_gdf.iterrows():
-                    g = row["geometry"]
-                    if g is None:
+                # Для отображения центроидов кластеров используем центроиды полигонов hulls_gdf,
+                # чтобы точки на карте всегда находились внутри/в центре соответствующих областей спроса.
+                source_gdf = hulls_gdf if (hulls_gdf is not None and len(hulls_gdf) > 0) else demand_gdf
+                for idx, row in source_gdf.iterrows():
+                    geom = row.get("geometry")
+                    if geom is None or geom.is_empty:
                         continue
-                    lon, lat = g.x, g.y
+                    try:
+                        c = getattr(geom, "centroid", None) or geom
+                        lon, lat = float(c.x), float(c.y)
+                    except Exception:
+                        continue
                     weight = int(row.get("weight", 1))
                     props = {"weight": weight, "cluster_id": idx}
                     if "demand_type" in row and row.get("demand_type") is not None:

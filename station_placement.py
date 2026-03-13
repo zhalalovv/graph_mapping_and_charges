@@ -153,6 +153,8 @@ class StationPlacement:
             3) Повторяем до исчерпания всех точек.
 
         Если задан cluster_id_column, дробление выполняется отдельно внутри каждого исходного кластера.
+        Если в demand есть колонка demand_type, дробление также выполняется отдельно внутри каждого типа спроса,
+        чтобы один подкластер содержал только один тип зданий.
         """
         if demand is None or len(demand) == 0:
             return gpd.GeoDataFrame()
@@ -245,11 +247,22 @@ class StationPlacement:
             return out_rows
 
         all_rows: List[Dict[str, Any]] = []
-        if cluster_id_column is not None and cluster_id_column in demand.columns:
-            for _, g in demand.groupby(cluster_id_column):
-                all_rows.extend(_split_one_group(g))
+
+        # Сначала разбиваем по типу спроса (если есть demand_type),
+        # затем — опционально по исходному cluster_id_column внутри каждого типа.
+        if "demand_type" in demand.columns:
+            type_groups = demand.groupby("demand_type", dropna=False)
         else:
-            all_rows.extend(_split_one_group(demand))
+            type_groups = [(None, demand)]
+
+        for _, type_group in type_groups:
+            if len(type_group) == 0:
+                continue
+            if cluster_id_column is not None and cluster_id_column in type_group.columns:
+                for _, g in type_group.groupby(cluster_id_column):
+                    all_rows.extend(_split_one_group(g))
+            else:
+                all_rows.extend(_split_one_group(type_group))
 
         if not all_rows:
             return gpd.GeoDataFrame(crs=demand.crs or "EPSG:4326")
