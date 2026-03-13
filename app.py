@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
 from data_service import DataService
-from station_placement import run_full_pipeline, R_CHARGE_KM, R_GARAGE_TO_KM, D_MAX_KM
+from station_placement import run_full_pipeline, R_CHARGE_KM, R_GARAGE_TO_KM, D_MAX_KM, StationPlacement
 import geopandas as gpd
 import osmnx as ox
 
@@ -29,10 +29,6 @@ app.add_middleware(
 data_service = DataService()
 logger = logging.getLogger(__name__)
 
-# Каталог для сохранения размещения станций (переживает перезапуск сервера)
-PLACEMENT_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "placement_cache")
-
-
 def _placement_slug(city: str) -> str:
     """Нормализует название города в имя файла."""
     s = city.strip().lower()
@@ -41,32 +37,37 @@ def _placement_slug(city: str) -> str:
     return s or "default"
 
 
-def _placement_cache_path(city: str) -> str:
-    os.makedirs(PLACEMENT_CACHE_DIR, exist_ok=True)
-    return os.path.join(PLACEMENT_CACHE_DIR, f"{_placement_slug(city)}.json")
-
-
 def save_placement(city: str, data: dict) -> None:
-    """Сохраняет результат размещения на диск."""
+    """Сохраняет результат размещения в Redis (без использования локального диска)."""
+    redis_client = data_service.get_redis_client()
+    if redis_client is None:
+        logger.warning("Redis недоступен, размещение станций не будет закэшировано")
+        return
     try:
-        path = _placement_cache_path(city)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=0)
-        logger.info("Сохранено размещение: %s", path)
+        key = f"drone_planner:placement:{_placement_slug(city)}"
+        redis_client.set(key, json.dumps(data, ensure_ascii=False))
+        logger.info("Сохранено размещение в Redis: %s", key)
     except Exception as e:
-        logger.warning("Не удалось сохранить размещение: %s", e)
+        logger.warning("Не удалось сохранить размещение в Redis: %s", e)
 
 
 def load_placement(city: str) -> Optional[dict]:
-    """Загружает сохранённое размещение с диска. None если файла нет."""
+    """Загружает сохранённое размещение из Redis. None если записи нет или Redis недоступен."""
+    redis_client = data_service.get_redis_client()
+    if redis_client is None:
+        logger.warning("Redis недоступен, нет кэша размещений")
+        return None
     try:
-        path = _placement_cache_path(city)
-        if not os.path.isfile(path):
+        key = f"drone_planner:placement:{_placement_slug(city)}"
+        blob = redis_client.get(key)
+        if not blob:
             return None
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        # Redis возвращает bytes — декодируем и парсим JSON
+        if isinstance(blob, bytes):
+            blob = blob.decode("utf-8", errors="ignore")
+        return json.loads(blob)
     except Exception as e:
-        logger.warning("Не удалось загрузить размещение: %s", e)
+        logger.warning("Не удалось загрузить размещение из Redis: %s", e)
         return None
 
 
@@ -125,18 +126,45 @@ def get_building_clusters(
             })
 
         if method == "dbscan":
-            # Кластеры DBSCAN: центроиды + выпуклые оболочки (области кластеров)
-            no_fly_zones = data.get("no_fly_zones")
-            result = data_service.get_demand_points_weighted(
-                buildings, road_graph, city_boundary,
-                method="dbscan",
-                dbscan_eps_m=dbscan_eps_m,
-                dbscan_min_samples=dbscan_min_samples,
-                return_hulls=True,
-                use_all_buildings=use_all_buildings,
-                no_fly_zones=no_fly_zones,
-            )
-            demand_gdf, hulls_gdf = result if isinstance(result, tuple) else (result, None)
+            # Кластеры DBSCAN: сначала пытаемся взять предвычисленные кластеры,
+            # выделенные на этапе get_city_data (и уже нарезанные до <=100 точек).
+            demand_gdf = data.get("demand_points")
+            hulls_gdf = data.get("demand_hulls")
+            if demand_gdf is None or len(demand_gdf) == 0:
+                # Если предвычисленных кластеров нет (старый кэш или ошибка) — считаем как раньше
+                no_fly_zones = data.get("no_fly_zones")
+                result = data_service.get_demand_points_weighted(
+                    buildings, road_graph, city_boundary,
+                    method="dbscan",
+                    dbscan_eps_m=dbscan_eps_m,
+                    dbscan_min_samples=dbscan_min_samples,
+                    return_hulls=True,
+                    use_all_buildings=use_all_buildings,
+                    no_fly_zones=no_fly_zones,
+                )
+                demand_gdf, hulls_gdf = result if isinstance(result, tuple) else (result, None)
+                # И сразу режем крупные кластеры, чтобы в одном итоговом кластере
+                # было не более 100 точек/зданий.
+                if demand_gdf is not None and len(demand_gdf) > 0:
+                    try:
+                        placement = StationPlacement(data_service, logger=logger)
+                        if "weight" in demand_gdf.columns:
+                            total_weight = float(demand_gdf["weight"].sum())
+                            # Целимся примерно в такие кластеры, чтобы их было хотя бы len(demand_gdf)/300,
+                            # но не делаем cap слишком маленьким.
+                            approx_clusters = max(1, len(demand_gdf) // 300)
+                            max_weight_per_cluster = max(total_weight / approx_clusters, 1.0)
+                        else:
+                            max_weight_per_cluster = float("inf")
+                        demand_gdf = placement.split_demand_by_capacity(
+                            demand_gdf,
+                            max_weight_per_cluster=max_weight_per_cluster,
+                            max_points_per_cluster=300,
+                            cluster_id_column=None,
+                            k_neighbors=16,
+                        )
+                    except Exception:
+                        pass
             if demand_gdf is None or len(demand_gdf) == 0:
                 clusters_fc = {"type": "FeatureCollection", "features": []}
                 cluster_hulls_fc = {"type": "FeatureCollection", "features": []}
@@ -148,10 +176,13 @@ def get_building_clusters(
                         continue
                     lon, lat = g.x, g.y
                     weight = int(row.get("weight", 1))
+                    props = {"weight": weight, "cluster_id": idx}
+                    if "demand_type" in row and row.get("demand_type") is not None:
+                        props["demand_type"] = str(row["demand_type"])
                     features.append({
                         "type": "Feature",
                         "geometry": {"type": "Point", "coordinates": [round(lon, 6), round(lat, 6)]},
-                        "properties": {"weight": weight, "cluster_id": idx},
+                        "properties": props,
                     })
                 clusters_fc = round_coords({"type": "FeatureCollection", "features": features}, precision=6)
                 cluster_hulls_fc = {"type": "FeatureCollection", "features": []}
@@ -165,10 +196,19 @@ def get_building_clusters(
                             geom_json = json.loads(gpd.GeoSeries([g], crs="EPSG:4326").to_json())
                             geom = geom_json.get("features", [{}])[0].get("geometry")
                             if geom:
+                                # Вес области спроса не должен превышать 300
+                                w = min(300, int(row.get("weight", 1)))
+                                props = {
+                                    "weight": w,
+                                    "cluster_id": idx,
+                                }
+                                # Пробрасываем тип спроса (тип зданий) для стилизации на фронтенде
+                                if "demand_type" in row:
+                                    props["demand_type"] = row.get("demand_type")
                                 hull_features.append({
                                     "type": "Feature",
                                     "geometry": round_coords(geom, precision=6),
-                                    "properties": {"weight": int(row.get("weight", 1)), "cluster_id": idx},
+                                    "properties": props,
                                 })
                         except Exception:
                             pass

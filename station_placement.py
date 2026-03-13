@@ -130,6 +130,136 @@ class StationPlacement:
             cluster_fill_step_m=cluster_fill_step_m,
         )
 
+    # --- Дополнительно: дробление крупных кластеров по "ёмкости" станции ---
+    def split_demand_by_capacity(
+        self,
+        demand: gpd.GeoDataFrame,
+        *,
+        max_weight_per_cluster: float,
+        max_points_per_cluster: Optional[int] = None,
+        cluster_id_column: Optional[str] = None,
+        k_neighbors: int = 16,
+    ) -> gpd.GeoDataFrame:
+        """
+        Жадное "capacity clustering" поверх уже готовых точек спроса.
+
+        Идея:
+        - На входе есть точки спроса (обычно центроиды DBSCAN-кластеров или ячеек сетки) с колонкой weight.
+        - Мы хотим получить новые, более мелкие кластеры так, чтобы суммарный вес каждого не превышал max_weight_per_cluster
+          (и, опционально, чтобы в одном кластере было не больше max_points_per_cluster точек).
+        - Алгоритм:
+            1) Берём "seed" — точку с максимальным весом среди ещё не использованных.
+            2) Строим вокруг неё кластер, добавляя ближайших соседей (по k-ближайших) пока не исчерпана ёмкость.
+            3) Повторяем до исчерпания всех точек.
+
+        Если задан cluster_id_column, дробление выполняется отдельно внутри каждого исходного кластера.
+        """
+        if demand is None or len(demand) == 0:
+            return gpd.GeoDataFrame()
+        if "geometry" not in demand.columns:
+            return gpd.GeoDataFrame()
+        if "weight" not in demand.columns:
+            demand = demand.copy()
+            demand["weight"] = 1.0
+
+        def _split_one_group(group: gpd.GeoDataFrame) -> List[Dict[str, Any]]:
+            pts = _points_array(group)
+            if len(pts) == 0:
+                return []
+            weights = group["weight"].values.astype(float)
+            n = len(pts)
+            tree = cKDTree(pts)
+            used = np.zeros(n, dtype=bool)
+            out_rows: List[Dict[str, Any]] = []
+
+            # Защита от некорректных параметров
+            cap = float(max_weight_per_cluster) if max_weight_per_cluster is not None else float("inf")
+            max_pts = int(max_points_per_cluster) if max_points_per_cluster is not None else None
+            k = max(1, int(k_neighbors))
+
+            while not used.all():
+                remaining_idx = np.where(~used)[0]
+                if remaining_idx.size == 0:
+                    break
+                # seed = самая "тяжёлая" ещё не использованная точка
+                seed_local = remaining_idx[np.argmax(weights[remaining_idx])]
+                cluster_indices = [int(seed_local)]
+                used[seed_local] = True
+                current_weight = float(weights[seed_local])
+
+                # Очередь "фронтира": от этих точек будем пытаться расширять кластер
+                frontier = [int(seed_local)]
+
+                while frontier:
+                    if max_pts is not None and len(cluster_indices) >= max_pts:
+                        break
+                    idx = frontier.pop()
+                    # Ищем среди k ближайших соседа, который ещё не использован и влезает по весу
+                    try:
+                        dists, neigh_idx = tree.query(pts[idx], k=k + 1)
+                    except Exception:
+                        # На случай, если k==1 и query вернул скаляры
+                        dists, neigh_idx = tree.query(pts[idx], k=2)
+                    dists = np.atleast_1d(dists)
+                    neigh_idx = np.atleast_1d(neigh_idx)
+                    for j in neigh_idx:
+                        j_int = int(j)
+                        if j_int == idx or j_int < 0:
+                            continue
+                        if used[j_int]:
+                            continue
+                        w_j = float(weights[j_int])
+                        if current_weight + w_j > cap:
+                            continue
+                        cluster_indices.append(j_int)
+                        used[j_int] = True
+                        current_weight += w_j
+                        frontier.append(j_int)
+                        if max_pts is not None and len(cluster_indices) >= max_pts:
+                            break
+
+                # Формируем агрегированную точку кластера (взвешенный центроид)
+                cluster_pts = pts[cluster_indices]
+                cluster_w = weights[cluster_indices]
+                if cluster_pts.shape[0] == 0:
+                    continue
+                lon = float(np.average(cluster_pts[:, 0], weights=cluster_w))
+                lat = float(np.average(cluster_pts[:, 1], weights=cluster_w))
+                row: Dict[str, Any] = {
+                    "geometry": Point(lon, lat),
+                    "weight": float(cluster_w.sum()),
+                    "source_size": int(len(cluster_indices)),
+                }
+                # Пробрасываем demand_type: если в исходной группе он был и
+                # в подкластер попали разные типы — берём самый частый.
+                if "demand_type" in group.columns:
+                    try:
+                        sub = group.iloc[cluster_indices]
+                        if "demand_type" in sub.columns:
+                            vc = sub["demand_type"].value_counts(dropna=False)
+                            if not vc.empty:
+                                row["demand_type"] = str(vc.idxmax())
+                    except Exception:
+                        pass
+                out_rows.append(row)
+            return out_rows
+
+        all_rows: List[Dict[str, Any]] = []
+        if cluster_id_column is not None and cluster_id_column in demand.columns:
+            for _, g in demand.groupby(cluster_id_column):
+                all_rows.extend(_split_one_group(g))
+        else:
+            all_rows.extend(_split_one_group(demand))
+
+        if not all_rows:
+            return gpd.GeoDataFrame(crs=demand.crs or "EPSG:4326")
+        gdf = gpd.GeoDataFrame(all_rows, crs=demand.crs or "EPSG:4326")
+        # Жёстное ограничение веса агрегированной точки спроса:
+        # вес (агр. точек) не должен превышать 300.
+        if "weight" in gdf.columns:
+            gdf["weight"] = gdf["weight"].clip(upper=300.0)
+        return gdf
+
     # --- Кандидаты зарядок относительно кластеров DBSCAN ---
     def build_charge_candidates_from_clusters(
         self,
@@ -459,7 +589,7 @@ class StationPlacement:
         )
         return gdf, metrics
 
-    # --- Шаг 3: магистральный граф (только А–А, макс. 4 связи на станцию, без Delaunay) ---
+    # --- Шаг 3: магистральный граф (только А–А, макс. 4 связи на станцию) ---
     def build_trunk_graph(
         self,
         charge_stations: gpd.GeoDataFrame,
@@ -503,6 +633,7 @@ class StationPlacement:
         nav_coords = None
         nav_ids: List[Any] = []
         graph_service: Optional[GraphService] = None
+        obstacles = None
 
         if nav_graph is not None and nav_graph.number_of_nodes() > 0:
             graph_service = GraphService()
@@ -527,6 +658,11 @@ class StationPlacement:
                 nav_coords = np.array(tmp_coords)
                 nav_ids = tmp_ids
                 nav_tree = cKDTree(nav_coords)
+            # Объединённая геометрия бесполётных зон для проверки прямых сегментов
+            try:
+                obstacles = graph_service._prepare_obstacles(None, no_fly_zones, buffer_distance=0.0)
+            except Exception:
+                obstacles = None
 
         def _nearest_nav_node(lon: float, lat: float):
             if nav_tree is None or nav_coords is None or not nav_ids:
@@ -648,9 +784,26 @@ class StationPlacement:
                 nid_j = a_ids[j]
                 if G.has_edge(nid_i, nid_j):
                     continue
+                # Сначала пробуем прямое ребро: если оно не пересекает бесполётные зоны — берём его.
+                use_straight = True
+                if obstacles is not None:
+                    try:
+                        line = LineString([[a_pts[i, 0], a_pts[i, 1]], [a_pts[j, 0], a_pts[j, 1]]])
+                        if obstacles.intersects(line) or obstacles.contains(line):
+                            use_straight = False
+                    except Exception:
+                        pass
+                if use_straight:
+                    G.add_edge(
+                        nid_i,
+                        nid_j,
+                        weight=d_km_straight,
+                        length=d_km_straight,
+                    )
+                    continue
 
-                # Если есть навигационный граф, строим маршрут A*,
-                # иначе используем прямой отрезок как раньше.
+                # Если прямое ребро проходит над бесполётной зоной — пытаемся обойти её по A*.
+                route = None
                 if nav_graph is not None:
                     route = _astar_route(
                         lon1=a_pts[i, 0],
@@ -658,8 +811,6 @@ class StationPlacement:
                         lon2=a_pts[j, 0],
                         lat2=a_pts[j, 1],
                     )
-                else:
-                    route = None
 
                 if route is not None:
                     d_km_route, coords_route = route
@@ -671,14 +822,6 @@ class StationPlacement:
                         weight=d_km_route,
                         length=d_km_route,
                         geometry_coords=coords_route,
-                    )
-                else:
-                    # Фоллбэк: прямое ребро
-                    G.add_edge(
-                        nid_i,
-                        nid_j,
-                        weight=d_km_straight,
-                        length=d_km_straight,
                     )
         # Связность: объединяем компоненты зарядок А
         charge_nodes_ids = [n for n, d in G.nodes(data=True) if d.get("node_type") == "charge"]
@@ -736,6 +879,7 @@ class StationPlacement:
         nav_tree = None
         nav_coords = None
         nav_ids: List[Any] = []
+        obstacles = None
 
         if nav_graph is not None and nav_graph.number_of_nodes() > 0:
             tmp_coords = []
@@ -758,6 +902,12 @@ class StationPlacement:
                 nav_coords = np.array(tmp_coords)
                 nav_ids = tmp_ids
                 nav_tree = cKDTree(nav_coords)
+            # Объединённая геометрия бесполётных зон для проверки прямых веток
+            try:
+                graph_service = GraphService()
+                obstacles = graph_service._prepare_obstacles(None, no_fly_zones, buffer_distance=0.0)
+            except Exception:
+                obstacles = None
 
         def _nearest_nav_node(lon: float, lat: float):
             if nav_tree is None or nav_coords is None or not nav_ids:
@@ -886,8 +1036,29 @@ class StationPlacement:
                     candidates.append((d_km, lon_t, lat_t, tid))
             candidates.sort(key=lambda x: x[0])
             for d_km, lon_t, lat_t, tid in candidates[:k]:
-                # Если есть навигационный граф, строим маршрут A*,
-                # иначе используем прямой отрезок, как раньше (с учётом бесполётных зон).
+                # Сначала пробуем прямую ветку: если она не пересекает бесполётные зоны — берём её.
+                use_straight = True
+                if obstacles is not None:
+                    try:
+                        line = LineString([[lon_b, lat_b], [lon_t, lat_t]])
+                        if obstacles.intersects(line) or obstacles.contains(line):
+                            use_straight = False
+                    except Exception:
+                        pass
+                if use_straight:
+                    features.append({
+                        "type": "Feature",
+                        "geometry": {"type": "LineString", "coordinates": [[lon_b, lat_b], [lon_t, lat_t]]},
+                        "properties": {
+                            "edge_type": "branch",
+                            "source_id": str(idx_b),
+                            "target_id": tid,
+                            "weight_km": round(d_km, 4),
+                        },
+                    })
+                    continue
+
+                # Если прямая ветка пересекает бесполётную зону — пытаемся обойти её по A*.
                 route = None
                 if nav_graph is not None:
                     route = _astar_route(
@@ -909,32 +1080,6 @@ class StationPlacement:
                             "source_id": str(idx_b),
                             "target_id": tid,
                             "weight_km": round(d_km_route, 4),
-                        },
-                    })
-                else:
-                    # Фоллбэк: прямое ребро, не над бесполётными зонами
-                    obstacles = None
-                    if no_fly_zones is not None:
-                        try:
-                            graph_service = GraphService()
-                            obstacles = graph_service._prepare_obstacles(None, no_fly_zones, buffer_distance=0.0)
-                        except Exception:
-                            obstacles = None
-                    if obstacles is not None:
-                        try:
-                            line = LineString([[lon_b, lat_b], [lon_t, lat_t]])
-                            if obstacles.intersects(line) or obstacles.contains(line):
-                                continue
-                        except Exception:
-                            pass
-                    features.append({
-                        "type": "Feature",
-                        "geometry": {"type": "LineString", "coordinates": [[lon_b, lat_b], [lon_t, lat_t]]},
-                        "properties": {
-                            "edge_type": "branch",
-                            "source_id": str(idx_b),
-                            "target_id": tid,
-                            "weight_km": round(d_km, 4),
                         },
                     })
         self.logger.info(f"Ветки Б→А/гараж/ТО (макс. {k} на станцию): {len(features)} рёбер")
@@ -961,6 +1106,7 @@ class StationPlacement:
         nav_tree = None
         nav_coords = None
         nav_ids: List[Any] = []
+        obstacles = None
 
         if nav_graph is not None and nav_graph.number_of_nodes() > 0:
             tmp_coords = []
@@ -983,6 +1129,12 @@ class StationPlacement:
                 nav_coords = np.array(tmp_coords)
                 nav_ids = tmp_ids
                 nav_tree = cKDTree(nav_coords)
+            # Объединённая геометрия бесполётных зон для проверки прямых локальных рёбер
+            try:
+                graph_service = GraphService()
+                obstacles = graph_service._prepare_obstacles(None, no_fly_zones, buffer_distance=0.0)
+            except Exception:
+                obstacles = None
 
         def _nearest_nav_node(lon: float, lat: float):
             if nav_tree is None or nav_coords is None or not nav_ids:
@@ -1108,6 +1260,33 @@ class StationPlacement:
                 # иначе используем прямой отрезок, как раньше (с учётом бесполётных зон).
                 lon_u, lat_u = b_pts[i, 0], b_pts[i, 1]
                 lon_v, lat_v = b_pts[j, 0], b_pts[j, 1]
+                # Сначала пробуем прямое локальное ребро: если оно не пересекает бесполётные зоны — берём его.
+                use_straight = True
+                if obstacles is not None:
+                    try:
+                        line = LineString([[lon_u, lat_u], [lon_v, lat_v]])
+                        if obstacles.intersects(line) or obstacles.contains(line):
+                            use_straight = False
+                    except Exception:
+                        pass
+                if use_straight:
+                    seen_edges.add(edge_key)
+                    features.append({
+                        "type": "Feature",
+                        "geometry": {
+                            "type": "LineString",
+                            "coordinates": [[lon_u, lat_u], [lon_v, lat_v]],
+                        },
+                        "properties": {
+                            "edge_type": "local",
+                            "source_id": str(ui),
+                            "target_id": str(vi),
+                            "weight_km": round(d_km, 4),
+                        },
+                    })
+                    continue
+
+                # Если прямое локальное ребро пересекает бесполётную зону — пытаемся обойти её по A*.
                 route = None
                 if nav_graph is not None:
                     route = _astar_route(
@@ -1133,36 +1312,6 @@ class StationPlacement:
                             "source_id": str(ui),
                             "target_id": str(vi),
                             "weight_km": round(d_km_route, 4),
-                        },
-                    })
-                else:
-                    # Фоллбэк: прямое локальное ребро не над бесполётной зоной
-                    obstacles = None
-                    if no_fly_zones is not None:
-                        try:
-                            graph_service = GraphService()
-                            obstacles = graph_service._prepare_obstacles(None, no_fly_zones, buffer_distance=0.0)
-                        except Exception:
-                            obstacles = None
-                    if obstacles is not None:
-                        try:
-                            line = LineString([[lon_u, lat_u], [lon_v, lat_v]])
-                            if obstacles.intersects(line) or obstacles.contains(line):
-                                continue
-                        except Exception:
-                            pass
-                    seen_edges.add(edge_key)
-                    features.append({
-                        "type": "Feature",
-                        "geometry": {
-                            "type": "LineString",
-                            "coordinates": [[lon_u, lat_u], [lon_v, lat_v]],
-                        },
-                        "properties": {
-                            "edge_type": "local",
-                            "source_id": str(ui),
-                            "target_id": str(vi),
-                            "weight_km": round(d_km, 4),
                         },
                     })
         self.logger.info(f"Локальные рёбра Б↔Б (макс. {max_neighbors_b} на станцию): {len(features)}")
@@ -1527,6 +1676,9 @@ def run_full_pipeline(
     dbscan_min_samples: int = 15,
     use_all_buildings: bool = False,
     max_charge_stations: Optional[int] = None,
+    # Параллельное размещение зарядок (ускорение расчёта на многоядерных CPU)
+    parallel_charge: bool = True,
+    parallel_charge_workers: Optional[int] = None,
     num_garages: int = 1,
     num_to: int = 1,
 ) -> Dict[str, Any]:
@@ -1559,6 +1711,31 @@ def run_full_pipeline(
     )
     if demand is None or len(demand) == 0:
         return {"error": "Нет точек спроса", "demand": None, "charge_stations": None, "garages": None, "to_stations": None, "trunk_graph": None, "metrics": {}}
+
+    # Дополнительно дробим слишком крупные кластеры спроса, чтобы:
+    # 1) кластеры не «впадали» друг в друга;
+    # 2) в одном кластере было не более 300 исходных точек.
+    try:
+        # Оцениваем разумную ёмкость по весу (чтобы не было кластеров с весом как 21000 точек).
+        if "weight" in demand.columns and len(demand) > 0:
+            total_weight = float(demand["weight"].sum())
+            # Целимся примерно в такие кластеры, чтобы их было хотя бы len(demand)/300,
+            # но не делаем cap слишком маленьким.
+            approx_clusters = max(1, len(demand) // 300)
+            max_weight_per_cluster = max(total_weight / approx_clusters, 1.0)
+        else:
+            max_weight_per_cluster = float("inf")
+
+        demand = placement.split_demand_by_capacity(
+            demand,
+            max_weight_per_cluster=max_weight_per_cluster,
+            max_points_per_cluster=300,
+            cluster_id_column=None,
+            k_neighbors=16,
+        )
+    except Exception:
+        # Если что-то пошло не так при дроблении — продолжаем с исходным спросом.
+        pass
 
     # Кандидаты зарядок: крыши МКД (для типа А) + наземные (для типа Б — полное покрытие, в т.ч. отдалённые зоны)
     candidates_rooftop = data_service.get_station_candidates(
@@ -1611,7 +1788,8 @@ def run_full_pipeline(
         core_radius_factor_a=0.0,
         core_weight_quantile_a=0.0,
         min_center_distance_factor_b=0.75,   # Б плотнее — дозаполняют слабо заполненные кластеры
-        parallel=True,
+        parallel=parallel_charge,
+        parallel_workers=parallel_charge_workers,
     )
 
     # Кандидаты гаражи и ТО (промзоны)
@@ -1653,64 +1831,22 @@ def run_full_pipeline(
     garage_placeholder = (garage_candidates.iloc[:num_garages].copy() if num_garages > 0 and garage_candidates is not None and len(garage_candidates) > 0 else gpd.GeoDataFrame())
     to_placeholder = (to_candidates.iloc[:num_to].copy() if num_to > 0 and to_candidates is not None and len(to_candidates) > 0 else gpd.GeoDataFrame())
 
-    # Навигационный граф для A*: свободный полёт по всей доступной территории (не только по дорогам),
-    # с учётом бесполётных зон. Строим граф на основе триангуляции Делоне + (опционально) дорог.
+    # Навигационный граф для A*: свободное воздушное пространство (НЕ дорожный граф).
+    # Узлы строятся везде, где можно летать, а рёбра проходят только в обход no_fly_zones.
     nav_graph: Optional[nx.Graph] = None
     try:
         graph_service = GraphService()
-        obstacles = graph_service._prepare_obstacles(None, no_fly_zones, buffer_distance=0.0)
-
-        # Базовые "летаемые" точки в пределах границы города, вне зданий и no_fly_zones
-        flyable_points = graph_service.get_flyable_points(
+        nav_graph = graph_service.build_air_graph(
             city_boundary=city_boundary,
             buildings=buildings,
             no_fly_zones=no_fly_zones,
             building_buffer_deg=0.00025,
             min_distance_deg=0.0003,
             max_points=3000,
+            k_neighbors=6,
         )
-
-        # Добавляем координаты всех станций (зарядки, гаражи, ТО) как обязательные узлы графа,
-        # чтобы A* всегда мог "подцепиться" к точкам инфраструктуры.
-        extra_points = []
-        for gdf in (charge_stations, garage_candidates, to_candidates):
-            if gdf is None or len(gdf) == 0:
-                continue
-            for _, row in gdf.iterrows():
-                lon, lat = _coords_from_geom(row.geometry)
-                extra_points.append((lon, lat))
-
-        # Объединяем наборы точек, не допуская слишком близких дубликатов
-        all_points = graph_service.merge_points_min_distance(
-            points_a=flyable_points,
-            points_b=extra_points,
-            min_distance_deg=0.00015,
-        )
-
-        if city_boundary is not None and all_points:
-            bounds = city_boundary.bounds  # (minx, miny, maxx, maxy)
-            delaunay_graph = graph_service.create_delaunay_graph(
-                bounds=bounds,
-                buildings=None,
-                no_fly_zones=no_fly_zones,
-                min_clearance=0.0,
-                city_boundary=city_boundary,
-                points=all_points,
-            )
-        else:
-            delaunay_graph = nx.Graph()
-
-        # Если есть дорожный граф, мягко объединяем его с Delaunay:
-        # дрон может как следовать дорогам, так и летать "по воздуху" между ними, избегая препятствий.
-        if road_graph is not None and len(road_graph.nodes) > 0 and delaunay_graph.number_of_nodes() > 0:
-            nav_graph = graph_service.merge_road_and_delaunay(
-                road_graph=road_graph,
-                delaunay_graph=delaunay_graph,
-                max_connection_distance_deg=0.0003,
-                obstacles=obstacles,
-            )
-        else:
-            nav_graph = delaunay_graph if delaunay_graph.number_of_nodes() > 0 else None
+        if nav_graph is not None and nav_graph.number_of_nodes() == 0:
+            nav_graph = None
     except Exception:
         nav_graph = None
 

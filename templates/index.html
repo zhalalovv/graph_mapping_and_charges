@@ -184,10 +184,19 @@
             </div>
         </div>
         <div class="flight-levels-panel" style="margin-top:12px">
-            <h3 style="margin:0 0 8px">Кластеры DBSCAN</h3>
+            <h3 style="margin:0 0 8px">Кластеры по типам</h3>
             <p style="font-size:12px; color:#6b7280; margin:0 0 8px">
-                На карте — область кластера (объединение окрестностей радиуса eps вокруг точек), без пустых промежутков. Клик — подсказка.
+                Области выделены по типу: МКД, частный сектор, магазины, офисы и т.д. Клик по области — подсказка.
             </p>
+            <div class="height-legend" style="flex-wrap:wrap; gap:4px 10px">
+                <span><span class="swatch" style="background:#22c55e"></span> МКД</span>
+                <span><span class="swatch" style="background:#f97316"></span> Частный сектор</span>
+                <span><span class="swatch" style="background:#a855f7"></span> Магазины/ТЦ</span>
+                <span><span class="swatch" style="background:#0ea5e9"></span> Офисы</span>
+                <span><span class="swatch" style="background:#eab308"></span> Общественные</span>
+                <span><span class="swatch" style="background:#64748b"></span> Промзона</span>
+                <span><span class="swatch" style="background:#6366f1"></span> Прочее</span>
+            </div>
             <button class="floating-btn btn-secondary" id="toggleClusterHullsBtn" style="width:100%; margin-top:6px; display:none" onclick="toggleClusterHulls()" title="Включить/выключить отображение областей кластеров">
                 <span id="clusterHullsLabel">Скрыть область кластера</span>
             </button>
@@ -385,37 +394,78 @@
                 const hullsFc = data.cluster_hulls || { type: 'FeatureCollection', features: [] };
                 clustersLayer = L.layerGroup();
                 if (hullsFc.features && hullsFc.features.length > 0) {
+                    const demandTypeColor = {
+                        apartment: '#22c55e',
+                        private: '#f97316',
+                        retail: '#a855f7',
+                        office: '#0ea5e9',
+                        public: '#eab308',
+                        industrial: '#64748b',
+                        other: '#6366f1'
+                    };
+                    const demandTypeLabel = {
+                        apartment: 'МКД',
+                        private: 'Частный сектор',
+                        retail: 'Магазины / ТЦ',
+                        office: 'Офисы / коммерция',
+                        public: 'Общественные',
+                        industrial: 'Промзона',
+                        other: 'Прочее'
+                    };
                     clusterHullsLayer = L.geoJSON(hullsFc, {
-                        style: {
-                            color: '#3730a3',
-                            weight: 2,
-                            fillColor: '#6366f1',
-                            fillOpacity: 0.25,
+                        style: function(feature) {
+                            const t = feature.properties && feature.properties.demand_type;
+                            const color = demandTypeColor[t] || demandTypeColor.other;
+                            return {
+                                color: color,
+                                weight: 2,
+                                fillColor: color,
+                                fillOpacity: 0.28,
+                            };
                         },
                         onEachFeature: function(feature, layer) {
-                            const w = feature.properties && feature.properties.weight != null ? feature.properties.weight : '—';
-                            layer.bindPopup('<strong>Область кластера DBSCAN</strong><br>Точек в кластере: ' + w + '<br>Радиус eps: ' + epsM + ' м');
+                            const p = feature.properties || {};
+                            const w = p.weight != null ? p.weight : '—';
+                            const t = p.demand_type || 'other';
+                            const label = demandTypeLabel[t] || t;
+                            layer.bindPopup(
+                                '<strong>Область спроса</strong>'
+                                + '<br>Тип: ' + label
+                                + '<br>Вес (агр. точек): ' + w
+                            );
                         }
                     });
                     if (clusterHullsVisible) clusterHullsLayer.addTo(map);
                 } else {
                     clusterHullsLayer = null;
                 }
+                const pointColors = { apartment: '#22c55e', private: '#f97316', retail: '#a855f7', office: '#0ea5e9', public: '#eab308', industrial: '#64748b', other: '#6366f1' };
+                const pointLabels = { apartment: 'МКД', private: 'Частный сектор', retail: 'Магазины / ТЦ', office: 'Офисы', public: 'Общественные', industrial: 'Промзона', other: 'Прочее' };
                 const pointsLayer = L.geoJSON(fc, {
                     pointToLayer: function(feature, latlng) {
-                        const w = feature.properties && feature.properties.weight != null ? feature.properties.weight : 1;
+                        const p = feature.properties || {};
+                        const w = p.weight != null ? p.weight : 1;
+                        const t = p.demand_type || 'other';
                         const r = Math.min(10, Math.max(3, 3 + Math.log2(w)));
+                        const color = pointColors[t] || pointColors.other;
                         return L.circleMarker(latlng, {
                             radius: r,
-                            fillColor: '#6366f1',
-                            color: '#3730a3',
+                            fillColor: color,
+                            color: color,
                             weight: 2,
                             fillOpacity: 0.9,
                         });
                     },
                     onEachFeature: function(feature, layer) {
-                        const w = feature.properties && feature.properties.weight != null ? feature.properties.weight : '—';
-                        layer.bindPopup('<strong>Центроид кластера DBSCAN</strong><br>Точек в кластере: ' + w + '<br>Радиус eps: ' + epsM + ' м');
+                        const p = feature.properties || {};
+                        const w = p.weight != null ? p.weight : '—';
+                        const t = p.demand_type || 'other';
+                        const label = pointLabels[t] || t;
+                        layer.bindPopup(
+                            '<strong>Точка спроса</strong>'
+                            + '<br>Тип: ' + label
+                            + '<br>Вес (агр. точек): ' + w
+                        );
                     }
                 });
                 pointsLayer.addTo(clustersLayer);

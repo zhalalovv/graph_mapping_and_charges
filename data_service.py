@@ -26,8 +26,9 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"osmnx\.f
 
 class DataService:
     def __init__(self, cache_dir="cache_data"):
+        # Локальный кэш на диске больше не используется как хранилище данных.
+        # Параметр оставлен для совместимости, но директории мы не создаём и файлы не пишем.
         self.cache_dir = cache_dir
-        os.makedirs(cache_dir, exist_ok=True)
         self.progress_callbacks = []
         # Используем несколько геокодеров для лучшей поддержки российских адресов
         self.geolocators = {
@@ -40,7 +41,7 @@ class DataService:
         # Настройка логирования
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
-        # optional Redis for caching heavy city data
+        # Redis — основное хранилище кэша тяжёлых данных города
         redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
         try:
             self._redis: Redis | None = Redis.from_url(redis_url)
@@ -48,7 +49,8 @@ class DataService:
             self._redis.ping()
         except Exception:
             self._redis = None
-            self.logger.info("Redis not available for DataService cache; using disk cache")
+            # Локальный диск для кэша данных больше не используется
+            self.logger.info("Redis not available for DataService cache; диск как кэш не используется")
     
     def add_progress_callback(self, callback):
         self.progress_callbacks.append(callback)
@@ -63,43 +65,115 @@ class DataService:
         # Для совместимости: при load_no_fly_zones=True ключ без суффикса (старый кэш); при False — __nofly0
         base_suffix = f"{self._sanitize_name(normalized_name)}__{self._sanitize_name(network_type)}__{int(bool(simplify))}"
         key_suffix = base_suffix if load_no_fly_zones else f"{base_suffix}__nofly0"
-        cache_file = os.path.join(self.cache_dir, f"{key_suffix}.pkl")
         redis_key = f"drone_planner:city:{key_suffix}"
+        redis_clusters_key = f"drone_planner:city_clusters:{key_suffix}"
         
         # Try Redis first
         if self._redis is not None:
             try:
                 blob = self._redis.get(redis_key)
                 if blob:
-                    cached_data = pickle.loads(blob)
+                    base_data = pickle.loads(blob)
                     # Проверяем, есть ли границы города в кэше
-                    if 'city_boundary' not in cached_data:
+                    if 'city_boundary' not in base_data:
                         self.logger.info("В Redis кэше нет границ города, перезагружаем данные")
                         # Удаляем из Redis и загружаем заново
                         self._redis.delete(redis_key)
+                        self._redis.delete(redis_clusters_key)
                     else:
+                        # Пытаемся подгрузить предвычисленные кластеры из отдельного ключа
+                        have_clusters = False
+                        if self._redis is not None:
+                            try:
+                                clusters_blob = self._redis.get(redis_clusters_key)
+                                if clusters_blob:
+                                    clusters_data = pickle.loads(clusters_blob)
+                                    if isinstance(clusters_data, dict):
+                                        if 'demand_points' in clusters_data:
+                                            base_data['demand_points'] = clusters_data['demand_points']
+                                        if 'demand_hulls' in clusters_data:
+                                            base_data['demand_hulls'] = clusters_data['demand_hulls']
+                                        have_clusters = True
+                            except Exception as e:
+                                self.logger.warning(f"Ошибка чтения кластеров города из Redis: {e}")
+
+                        # Если кластеров в отдельном ключе ещё нет (старый кэш) — считаем и сохраняем их отдельно
+                        if not have_clusters:
+                            try:
+                                from station_placement import StationPlacement
+
+                                buildings = base_data.get('buildings')
+                                road_graph = base_data.get('road_graph')
+                                city_boundary = base_data.get('city_boundary')
+                                no_fly_zones = base_data.get('no_fly_zones')
+                                demand_result = self.get_demand_points_weighted(
+                                    buildings,
+                                    road_graph,
+                                    city_boundary,
+                                    method="dbscan",
+                                    dbscan_eps_m=180.0,
+                                    dbscan_min_samples=15,
+                                    return_hulls=True,
+                                    use_all_buildings=False,
+                                    no_fly_zones=no_fly_zones,
+                                )
+                                demand_gdf, hulls_gdf = (
+                                    demand_result if isinstance(demand_result, tuple) else (demand_result, None)
+                                )
+                                demand_points = None
+                                demand_hulls = None
+                                if demand_gdf is not None and len(demand_gdf) > 0:
+                                    try:
+                                        placement = StationPlacement(self, logger=self.logger)
+                                        if "weight" in demand_gdf.columns:
+                                            total_weight = float(demand_gdf["weight"].sum())
+                                            approx_clusters = max(1, len(demand_gdf) // 300)
+                                            max_weight_per_cluster = max(total_weight / approx_clusters, 1.0)
+                                        else:
+                                            max_weight_per_cluster = float("inf")
+                                        demand_gdf = placement.split_demand_by_capacity(
+                                            demand_gdf,
+                                            max_weight_per_cluster=max_weight_per_cluster,
+                                            max_points_per_cluster=300,
+                                            cluster_id_column=None,
+                                            k_neighbors=16,
+                                        )
+                                    except Exception:
+                                        pass
+                                    demand_points = demand_gdf
+                                    demand_hulls = hulls_gdf
+
+                                base_data['demand_points'] = demand_points
+                                base_data['demand_hulls'] = demand_hulls
+
+                                if self._redis is not None:
+                                    try:
+                                        clusters_payload = {
+                                            'demand_points': demand_points,
+                                            'demand_hulls': demand_hulls,
+                                        }
+                                        self._redis.set(redis_clusters_key, pickle.dumps(clusters_payload))
+                                    except Exception as e:
+                                        self.logger.warning(f"Не удалось сохранить кластеры города в Redis: {e}")
+                            except Exception as e:
+                                self.logger.warning(f"Не удалось пересчитать кластеры города из кэша: {e}")
+
                         self._update_progress("cache", 100, "Загрузка из Redis")
-                        return self.ensure_flight_levels(cached_data)
+                        return self.ensure_flight_levels(base_data)
             except Exception as e:
                 self.logger.warning(f"Ошибка чтения из Redis: {e}")
 
-        if os.path.exists(cache_file):
-            self._update_progress("cache", 100, "Загрузка из кэша")
-            try:
-                cached_data = self._load_from_cache(cache_file)
-                # Проверяем, есть ли границы города в кэше (для совместимости со старым кэшем)
-                if 'city_boundary' not in cached_data:
-                    self.logger.info("В кэше нет границ города, перезагружаем данные")
-                    os.remove(cache_file)
-                    return self._download_city_data(normalized_name, cache_file, redis_key, network_type=network_type, simplify=simplify, load_no_fly_zones=load_no_fly_zones)
-                return self.ensure_flight_levels(cached_data)
-            except Exception as e:
-                self.logger.warning(f"Ошибка загрузки кэша: {e}, перезагружаем данные")
-                os.remove(cache_file)
-        
-        return self._download_city_data(normalized_name, cache_file, redis_key, network_type=network_type, simplify=simplify, load_no_fly_zones=load_no_fly_zones)
+        # Локальный диск как кэш больше не используется: при промахе в Redis загружаем данные заново
+        return self._download_city_data(
+            normalized_name,
+            redis_key=redis_key,
+            clusters_redis_key=redis_clusters_key,
+            network_type=network_type,
+            simplify=simplify,
+            load_no_fly_zones=load_no_fly_zones,
+        )
     
-    def _download_city_data(self, city_name, cache_file, redis_key: str | None = None, *, network_type: str = 'drive', simplify: bool = True, load_no_fly_zones: bool = True):
+    def _download_city_data(self, city_name, redis_key: str | None = None, clusters_redis_key: str | None = None, *, network_type: str = 'drive', simplify: bool = True, load_no_fly_zones: bool = True):
         self._update_progress("download", 0, "Начало загрузки данных")
         
         try:
@@ -283,7 +357,55 @@ class DataService:
             
             self._update_progress("download", 80, "Загрузка запретных зон" if load_no_fly_zones else "Пропуск беспилотных зон (только дороги)")
             no_fly_zones = self._get_no_fly_zones(city_name, buildings) if load_no_fly_zones else []
-            
+
+            # Предварительное выделение кластеров спроса на этапе загрузки города (DBSCAN),
+            # с дополнительным дроблением, чтобы в одном кластере было не более 100 точек.
+            demand_points = None
+            demand_hulls = None
+            try:
+                demand_result = self.get_demand_points_weighted(
+                    buildings,
+                    road_graph,
+                    city_boundary,
+                    method="dbscan",
+                    dbscan_eps_m=180.0,
+                    dbscan_min_samples=15,
+                    return_hulls=True,
+                    use_all_buildings=False,
+                    no_fly_zones=no_fly_zones,
+                )
+                demand_gdf, hulls_gdf = (
+                    demand_result if isinstance(demand_result, tuple) else (demand_result, None)
+                )
+                if demand_gdf is not None and len(demand_gdf) > 0:
+                    try:
+                        from station_placement import StationPlacement
+
+                        placement = StationPlacement(self, logger=self.logger)
+                        if "weight" in demand_gdf.columns:
+                            total_weight = float(demand_gdf["weight"].sum())
+                            # Целимся примерно в такие кластеры, чтобы их было хотя бы len(demand_gdf)/300,
+                            # но не делаем cap слишком маленьким.
+                            approx_clusters = max(1, len(demand_gdf) // 300)
+                            max_weight_per_cluster = max(total_weight / approx_clusters, 1.0)
+                        else:
+                            max_weight_per_cluster = float("inf")
+                        demand_gdf = placement.split_demand_by_capacity(
+                            demand_gdf,
+                            max_weight_per_cluster=max_weight_per_cluster,
+                            max_points_per_cluster=300,
+                            cluster_id_column=None,
+                            k_neighbors=16,
+                        )
+                    except Exception:
+                        # Если дробление не удалось, используем исходные кластеры.
+                        pass
+                    demand_points = demand_gdf
+                    demand_hulls = hulls_gdf
+            except Exception as e:
+                self.logger.warning(f"Не удалось предварительно выделить кластеры спроса: {e}")
+
+            # Базовые данные города (без кластеров)
             data = {
                 'road_graph': road_graph,
                 'buildings': buildings,
@@ -299,24 +421,37 @@ class DataService:
                     'nodes': len(road_graph.nodes),
                     'edges': len(road_graph.edges),
                     'buildings': len(buildings)
-                }
+                },
             }
+
+            # Полные данные (для возврата вызывающему коду) включают также предвычисленные кластеры
+            full_data = dict(data)
+            full_data['demand_points'] = demand_points
+            full_data['demand_hulls'] = demand_hulls
             
             self._update_progress("download", 85, "Расчёт эшелонов полётов")
-            data = self.ensure_flight_levels(data)
-
-            self._update_progress("download", 90, "Сохранение в кэш")
-            with open(cache_file, 'wb') as f:
-                pickle.dump(data, f)
-            # Save to Redis as well
+            full_data = self.ensure_flight_levels(full_data)
+        
+            # Кэшируем только в Redis, локальные файлы больше не используем
+            self._update_progress("download", 90, "Сохранение в Redis кэш")
             if self._redis is not None and redis_key:
                 try:
+                    # В ключе города храним только базовые данные (без кластеров)
                     self._redis.set(redis_key, pickle.dumps(data))
                 except Exception as e:
                     self.logger.warning(f"Не удалось сохранить данные города в Redis: {e}")
+            if self._redis is not None and clusters_redis_key:
+                try:
+                    clusters_payload = {
+                        'demand_points': demand_points,
+                        'demand_hulls': demand_hulls,
+                    }
+                    self._redis.set(clusters_redis_key, pickle.dumps(clusters_payload))
+                except Exception as e:
+                    self.logger.warning(f"Не удалось сохранить кластеры города в Redis: {e}")
             
             self._update_progress("download", 100, "Данные загружены")
-            return data
+            return full_data
             
         except Exception as e:
             self._update_progress("error", 0, f"Ошибка: {str(e)}")
@@ -1235,20 +1370,99 @@ class DataService:
             except Exception as e:
                 self.logger.warning(f"Фильтрация зданий по границе города: {e}")
         # Зоны спроса — только по домам (центроиды зданий). Дороги не используются.
-        # Вес спроса: многоквартирники — повышенный (APARTMENT_DEMAND_WEIGHT), остальные — 1
+        # Дополнительно помечаем тип здания и вес спроса по типу.
+        def _building_demand_type(row) -> str:
+            """
+            Тип спроса по зданию (максимально используя доступные теги):
+            - apartment: многоквартирные дома (приоритетные по спросу)
+            - office: офисы, коммерция
+            - retail: крупная розница / ТЦ
+            - industrial: промзона, склады, заводы
+            - public: школы, больницы, госучреждения и пр.
+            - private: частный сектор (индивидуальные дома)
+            - other: всё остальное.
+            """
+            # 1) МКД — сразу как apartment (приоритетный тип)
+            if self._is_apartment(row):
+                return "apartment"
+
+            # Нормализованные теги
+            btag_raw = row.get("building") if hasattr(row, "get") else None
+            btag = str(btag_raw).lower().strip() if btag_raw is not None and not (isinstance(btag_raw, float) and pd.isna(btag_raw)) else ""
+            amenity_raw = row.get("amenity") if hasattr(row, "get") else None
+            amenity = str(amenity_raw).lower().strip() if amenity_raw is not None and not (isinstance(amenity_raw, float) and pd.isna(amenity_raw)) else ""
+            shop_raw = row.get("shop") if hasattr(row, "get") else None
+            shop = str(shop_raw).lower().strip() if shop_raw is not None and not (isinstance(shop_raw, float) and pd.isna(shop_raw)) else ""
+
+            # 2) Общественные объекты (школы, больницы и т.п.)
+            if amenity in self._PUBLIC_AMENITY_VALUES:
+                return "public"
+
+            # 3) Коммерция / офисы / розница
+            if btag in ("office", "commercial"):
+                return "office"
+            if btag in ("retail", "supermarket", "mall", "shop"):
+                return "retail"
+            if shop:
+                # Любой shop без уточнения — розница/ТЦ
+                return "retail"
+
+            # 4) Промзона / индустриальные объекты
+            if btag in ("industrial", "warehouse", "factory", "manufacture", "plant", "depot"):
+                return "industrial"
+
+            # 5) Отели / общежития (можно считать отдельной категорией, но для спроса близко к public)
+            if btag in ("hotel", "hostel", "dormitory", "motel"):
+                return "public"
+
+            # 6) Частный сектор
+            if self._is_private_house(row, is_apartment=False):
+                return "private"
+
+            # 7) Остальное
+            return "other"
+
+        def _building_demand_weight(row) -> float:
+            """
+            Вес спроса по типу здания:
+            - apartment (МКД): 5
+            - retail (торговые/ТЦ): 4
+            - office (коммерция/офисы): 3
+            - industrial (склады/промзона): 2
+            - private / public / other: 1
+            """
+            t = _building_demand_type(row)
+            if t == "apartment":
+                return 5.0
+            if t == "retail":
+                return 4.0
+            if t == "office":
+                return 3.0
+            if t == "industrial":
+                return 2.0
+            return 1.0
+
         pts_list = []
         weights_list = []
+        types_list = []
         for idx, b in buildings.iterrows():
             g = b.geometry
             if g is None or not getattr(g, "is_valid", True):
                 continue
             c = g.centroid
             pts_list.append([c.x, c.y])
-            weights_list.append(self.APARTMENT_DEMAND_WEIGHT if self._is_apartment(b) else 1)
+            # Вес спроса по типу здания
+            w = _building_demand_weight(b)
+            weights_list.append(w)
+            types_list.append(_building_demand_type(b))
         base_points = np.array(pts_list) if pts_list else np.empty((0, 2))
         base_weights = np.array(weights_list, dtype=float) if weights_list else np.ones(len(base_points))
+        base_types = np.array(types_list, dtype=object) if types_list else np.array([], dtype=object)
         if len(base_points) > 0:
-            self.logger.info(f"Точки для кластеризации: только по зданиям ({len(base_points)} центроидов), многоквартирники с весом {self.APARTMENT_DEMAND_WEIGHT}")
+            self.logger.info(
+                f"Точки для кластеризации: только по зданиям ({len(base_points)} центроидов), "
+                f"типы спроса: {set(base_types.tolist()) if base_types.size > 0 else set()}"
+            )
         if len(base_points) < 2:
             return gpd.GeoDataFrame()
         use_utm = True
@@ -1271,13 +1485,6 @@ class DataService:
                 from sklearn.cluster import DBSCAN
                 from pyproj import Transformer
                 eps_m = dbscan_eps_m
-                clustering = DBSCAN(eps=eps_m, min_samples=dbscan_min_samples, metric="euclidean").fit(pts_utm)
-                labels = np.array(clustering.labels_, dtype=int)
-                # Точки-шум (label -1) не присваиваем кластерам — одиночные здания остаются выбросами, зоной спроса не считаются
-                cluster_ids = sorted(set(labels) - {-1})
-                n_noise = int((labels == -1).sum())
-                if n_noise > 0:
-                    self.logger.info(f"Точки-шум (одиночки/выбросы): {n_noise} — не образуют зону спроса")
                 inv = Transformer.from_crs(crs_utm, "EPSG:4326", always_xy=True)
                 # Шаг сетки внутри кластера (в метрах) для fill_clusters.
                 # По умолчанию делаем сетку существенно реже eps, чтобы не взрывать число точек.
@@ -1289,119 +1496,146 @@ class DataService:
                 if fill_step_m <= 0:
                     fill_step_m = max(400.0, float(eps_m) * 2.0)
                 from shapely.ops import transform as sh_transform
-                for lid in cluster_ids:
-                    mask = labels == lid
-                    cluster_pts = pts_utm[mask]
-                    n_buildings = len(cluster_pts)
-                    if n_buildings < min_buildings_for_zone:
-                        continue  # одиночки и малые группы — выбросы, зону спроса не создаём
-                    weight = float(base_weights[mask].sum())
-                    cx, cy = cluster_pts.mean(axis=0)
-                    lon, lat = inv.transform(cx, cy)
-                    # Базовая точка спроса — центроид кластера (не заполнитель).
-                    rows.append(
-                        {
-                            "geometry": Point(lon, lat),
-                            "weight": int(round(weight)),
-                            "is_cluster_fill": False,
-                        }
-                    )
 
-                    # Для dbscan можем дополнительно построить область кластера
-                    # и, при необходимости, "заполнить" её сеткой точек спроса.
-                    if len(cluster_pts) >= 1:
+                # Кластеризуем отдельно по каждому типу спроса (apartment / office / private / other).
+                unique_types = set(base_types.tolist()) if base_types.size > 0 else {None}
+                for demand_type in unique_types:
+                    if demand_type is None:
+                        mask_type = np.ones(len(base_points), dtype=bool)
+                    else:
+                        mask_type = base_types == demand_type
+                    if not mask_type.any():
+                        continue
+                    pts_type = pts_utm[mask_type]
+                    if pts_type.shape[0] < 2:
+                        continue
+                    weights_type = base_weights[mask_type]
+
+                    clustering = DBSCAN(eps=eps_m, min_samples=dbscan_min_samples, metric="euclidean").fit(pts_type)
+                    labels = np.array(clustering.labels_, dtype=int)
+                    # Точки-шум (label -1) не присваиваем кластерам — одиночные здания остаются выбросами, зоной спроса не считаются
+                    cluster_ids = sorted(set(labels) - {-1})
+                    n_noise = int((labels == -1).sum())
+                    if n_noise > 0:
+                        self.logger.info(
+                            f"Точки-шум (тип={demand_type}): {n_noise} — не образуют зону спроса"
+                        )
+
+                    MAX_WEIGHT_PER_HULL = 300  # макс. вес одной области спроса (и точек в ней)
+
+                    def _build_one_region(sub_pts, sub_weights, do_fill):
+                        """Строит одну область (hull) по точкам sub_pts и при необходимости заполняет сеткой."""
+                        if len(sub_pts) < 1:
+                            return
+                        sub_w = float(sub_weights.sum())
+                        cx, cy = sub_pts.mean(axis=0)
+                        lon_c, lat_c = inv.transform(cx, cy)
+                        rows.append({
+                            "geometry": Point(lon_c, lat_c),
+                            "weight": min(MAX_WEIGHT_PER_HULL, int(round(sub_w))),
+                            "is_cluster_fill": False,
+                            "demand_type": str(demand_type) if demand_type is not None else None,
+                        })
                         try:
-                            circles_utm = [Point(float(x), float(y)).buffer(eps_m) for x, y in cluster_pts]
+                            circles_utm = [Point(float(x), float(y)).buffer(eps_m) for x, y in sub_pts]
                             region_utm = unary_union(circles_utm)
                             if region_utm is None or region_utm.is_empty:
-                                continue
+                                return
                             region_utm = region_utm.simplify(2.0)
                             region_4326 = sh_transform(lambda x, y: inv.transform(x, y), region_utm)
-                            # Обрезаем область кластера по границе города
-                            if (
-                                city_boundary is not None
-                                and hasattr(city_boundary, "is_valid")
-                                and getattr(city_boundary, "is_valid", True)
-                                and region_4326.is_valid
-                                and not region_4326.is_empty
-                            ):
+                            if (city_boundary is not None and hasattr(city_boundary, "is_valid")
+                                    and getattr(city_boundary, "is_valid", True)
+                                    and region_4326.is_valid and not region_4326.is_empty):
                                 try:
                                     clipped = region_4326.intersection(city_boundary)
                                     if clipped is not None and not clipped.is_empty and clipped.is_valid:
                                         region_4326 = clipped
                                 except Exception:
                                     pass
-                            # Исключаем беспилотные зоны из полигона зоны спроса (не выделяем no_fly в зонах спроса)
-                            if (
-                                no_fly_union is not None
-                                and not no_fly_union.is_empty
-                                and region_4326.is_valid
-                                and not region_4326.is_empty
-                            ):
+                            if (no_fly_union is not None and not no_fly_union.is_empty
+                                    and region_4326.is_valid and not region_4326.is_empty):
                                 try:
                                     region_4326 = region_4326.difference(no_fly_union)
                                     if region_4326.is_empty:
-                                        continue
+                                        return
                                 except Exception:
                                     pass
                             if region_4326.is_valid and not region_4326.is_empty:
-                                # Сохраняем полигон кластера для фронтенда, если требуется
                                 if return_hulls and hull_rows is not None:
-                                    hull_rows.append(
-                                        {
-                                            "geometry": region_4326,
-                                            "weight": int(round(weight)),
-                                            "cluster_id": len(hull_rows),
-                                        }
-                                    )
-                                # Дополнительное заполнение кластера сеткой точек спроса,
-                                # чтобы алгоритм размещения стремился покрыть весь полигон.
-                                if fill_clusters:
+                                    hull_rows.append({
+                                        "geometry": region_4326,
+                                        "weight": min(MAX_WEIGHT_PER_HULL, int(round(sub_w))),
+                                        "cluster_id": len(hull_rows),
+                                        "demand_type": str(demand_type) if demand_type is not None else None,
+                                    })
+                                if do_fill and fill_clusters:
                                     try:
                                         minx, miny, maxx, maxy = region_4326.bounds
                                         if maxx > minx and maxy > miny:
-                                            # Приблизительное преобразование метров в градусы.
-                                            # 1° широты ≈ 111 км, долгота ≈ 111 * cos(lat).
                                             lat_center = (miny + maxy) / 2.0
-                                            step_km = fill_step_m / 1000.0
-                                            if step_km <= 0:
-                                                step_km = eps_m / 1000.0
+                                            step_km = fill_step_m / 1000.0 or eps_m / 1000.0
                                             deg_lat = step_km / 111.0
-                                            deg_lon = step_km / (
-                                                111.0 * max(0.2, np.cos(np.radians(lat_center)))
-                                            )
-                                            step_x = max(deg_lon, 1e-5)
-                                            step_y = max(deg_lat, 1e-5)
-                                            # Жёсткий лимит на число точек-заполнителей в одном кластере,
-                                            # чтобы не взорвать размер выборки и время размещения.
-                                            max_fill_points = 500
-                                            fill_count = 0
+                                            deg_lon = step_km / (111.0 * max(0.2, np.cos(np.radians(lat_center))))
+                                            step_x, step_y = max(deg_lon, 1e-5), max(deg_lat, 1e-5)
+                                            fill_count, max_fill_points = 0, 500
                                             x = float(minx)
                                             while x <= maxx:
                                                 y = float(miny)
                                                 while y <= maxy:
-                                                    p = Point(x, y)
-                                                    if region_4326.contains(p):
-                                                        rows.append(
-                                                            {
-                                                                "geometry": p,
-                                                                "weight": 1,
-                                                                "is_cluster_fill": True,
-                                                            }
-                                                        )
+                                                    if region_4326.contains(Point(x, y)):
+                                                        rows.append({"geometry": Point(x, y), "weight": 1, "is_cluster_fill": True, "demand_type": str(demand_type) if demand_type is not None else None})
                                                         fill_count += 1
                                                         if fill_count >= max_fill_points:
                                                             break
                                                     y += step_y
-                                                    if fill_count >= max_fill_points:
-                                                        break
                                                 x += step_x
                                                 if fill_count >= max_fill_points:
                                                     break
                                     except Exception as e_fill:
-                                        self.logger.debug(f"fill_clusters for cluster {lid}: {e_fill}")
+                                        self.logger.debug(f"fill_clusters: {e_fill}")
                         except Exception as e:
-                            self.logger.debug(f"Область кластера {lid}: {e}")
+                            self.logger.debug(f"Область кластера (type={demand_type}): {e}")
+
+                    for lid in cluster_ids:
+                        mask = labels == lid
+                        cluster_pts = pts_type[mask]
+                        n_buildings = len(cluster_pts)
+                        if n_buildings < min_buildings_for_zone:
+                            continue
+                        weights_cluster = np.asarray(weights_type[mask], dtype=float)
+                        weight = float(weights_cluster.sum())
+
+                        if weight <= MAX_WEIGHT_PER_HULL and n_buildings <= MAX_WEIGHT_PER_HULL:
+                            _build_one_region(cluster_pts, weights_cluster, do_fill=True)
+                        else:
+                            # Крупный кластер: дробим компактно по пространству (K-means), а не полосками по X
+                            from sklearn.cluster import KMeans
+
+                            def _split_by_cap(pts, weights, cap):
+                                """Рекурсивно разбивает точки на группы с весом ≤ cap, по пространственной близости (K-means)."""
+                                if len(pts) == 0:
+                                    return []
+                                if float(weights.sum()) <= cap:
+                                    return [(pts, weights)]
+                                if len(pts) == 1:
+                                    return [(pts, weights)]
+                                k = min(2, len(pts) - 1)
+                                if k < 2:
+                                    return [(pts, weights)]
+                                km = KMeans(n_clusters=k, random_state=42, n_init=10).fit(pts)
+                                out = []
+                                for j in range(k):
+                                    mask = km.labels_ == j
+                                    sub_pts = pts[mask]
+                                    sub_w = weights[mask]
+                                    out.extend(_split_by_cap(sub_pts, sub_w, cap))
+                                return out
+
+                            groups = _split_by_cap(cluster_pts, weights_cluster, MAX_WEIGHT_PER_HULL)
+                            for sub_pts, sub_weights in groups:
+                                if len(sub_pts) < 1:
+                                    continue
+                                _build_one_region(sub_pts, sub_weights, do_fill=False)
             except Exception:
                 method = "grid"
                 hull_rows = None
@@ -1440,12 +1674,61 @@ class DataService:
             if return_hulls:
                 return (gpd.GeoDataFrame(), gpd.GeoDataFrame())
             return gpd.GeoDataFrame()
+
         gdf = gpd.GeoDataFrame(rows, crs="EPSG:4326")
         gdf["weight"] = gdf.get("weight", 1)
         self.logger.info(f"Точки спроса ({method}): {len(gdf)}, сумма весов {gdf['weight'].sum()}")
+
         if return_hulls:
-            hulls_gdf = gpd.GeoDataFrame(hull_rows, crs="EPSG:4326") if hull_rows else gpd.GeoDataFrame()
+            # Устраняем пересечения только внутри одного типа спроса (demand_type).
+            # Кластеры разных типов (частный сектор, МКД, магазины и т.д.) не вырезают друг друга —
+            # так на карте чётко видно отдельно «только частные», отдельно «МКД», отдельно «магазины».
+            if hull_rows:
+                try:
+                    from shapely.ops import unary_union as shp_union
+
+                    hulls_gdf = gpd.GeoDataFrame(hull_rows, crs="EPSG:4326")
+                    # Группируем по типу спроса
+                    demand_type_col = "demand_type"
+                    type_vals = hulls_gdf[demand_type_col].fillna("other").astype(str)
+                    cleaned_parts = []
+                    for dtype in type_vals.unique():
+                        mask = type_vals == dtype
+                        sub = hulls_gdf.loc[mask].sort_values(by="weight", ascending=False).reset_index(drop=True)
+                        used_geom = None
+                        for idx, row in sub.iterrows():
+                            geom = row.geometry
+                            if geom is None or geom.is_empty:
+                                continue
+                            if used_geom is not None and not used_geom.is_empty:
+                                try:
+                                    geom = geom.difference(used_geom)
+                                except Exception:
+                                    pass
+                            if geom is None or geom.is_empty:
+                                continue
+                            cleaned_parts.append({
+                                "geometry": geom,
+                                "weight": row["weight"],
+                                "demand_type": row.get(demand_type_col),
+                            })
+                            try:
+                                used_geom = geom if used_geom is None else shp_union([used_geom, geom])
+                            except Exception:
+                                pass
+                    hulls_gdf = gpd.GeoDataFrame(cleaned_parts, crs="EPSG:4326")
+                    hulls_gdf = hulls_gdf[~hulls_gdf["geometry"].isna() & ~hulls_gdf["geometry"].is_empty].copy()
+                    hulls_gdf["cluster_id"] = range(len(hulls_gdf))
+                except Exception as e:
+                    self.logger.warning(f"Не удалось устранить пересечения кластеров: {e}")
+                    hulls_gdf = gpd.GeoDataFrame(hull_rows, crs="EPSG:4326")
+            else:
+                hulls_gdf = gpd.GeoDataFrame()
+            # Вес областей спроса не должен превышать 300
+            if not hulls_gdf.empty and "weight" in hulls_gdf.columns:
+                hulls_gdf["weight"] = hulls_gdf["weight"].clip(upper=300).astype(int)
             return (gdf, hulls_gdf)
+
         return gdf
 
     @staticmethod
@@ -2155,15 +2438,6 @@ class DataService:
         
         # Если город не найден в списке, считаем координаты валидными
         return True
-    
-    def _load_from_cache(self, cache_file):
-        try:
-            with open(cache_file, 'rb') as f:
-                return pickle.load(f)
-        except:
-            if os.path.exists(cache_file):
-                os.remove(cache_file)
-            raise
     
     def _normalize_city_name(self, city_name):
         """Минимальная нормализация: тримминг без привязки к стране (универсальность)"""
