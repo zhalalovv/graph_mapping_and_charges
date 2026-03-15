@@ -1374,9 +1374,33 @@ class DataService:
                 self.logger.warning(f"Фильтрация зданий по границе города: {e}")
         # Зоны спроса — только по домам (центроиды зданий). Дороги не используются.
         # Дополнительно помечаем тип здания и вес спроса по типу.
+        def _get_building_levels(row) -> Optional[int]:
+            """Число надземных этажей из building:levels или из height (примерно). None если неизвестно."""
+            for key in ("building:levels", "levels"):
+                val = row.get(key) if hasattr(row, "get") else None
+                if val is None or (isinstance(val, float) and pd.isna(val)):
+                    continue
+                try:
+                    s = str(val).strip().split()[0]  # "3" или "12 m" -> "12"
+                    n = int(float(s.replace(",", ".")))
+                    if 0 < n <= 200:
+                        return n
+                except (ValueError, TypeError):
+                    pass
+            val = row.get("height") if hasattr(row, "get") else None
+            if val is not None and str(val).strip():
+                try:
+                    s = str(val).strip().lower().replace("m", "").replace("м", "").strip().split()[0]
+                    h = float(s.replace(",", "."))
+                    if 2 < h < 500:
+                        return max(1, int(round(h / 3.0)))
+                except (ValueError, TypeError):
+                    pass
+            return None
+
         def _building_demand_type(row) -> str:
             """
-            Тип спроса по зданию (максимально используя доступные теги):
+            Тип спроса по зданию (максимально используя доступные теги и этажность):
             - apartment: многоквартирные дома (приоритетные по спросу)
             - office: офисы, коммерция
             - retail: крупная розница / ТЦ
@@ -1385,13 +1409,16 @@ class DataService:
             - private: частный сектор (индивидуальные дома)
             - other: всё остальное.
             """
-            # 1) МКД — сразу как apartment (приоритетный тип)
+            levels = _get_building_levels(row)
+
+            # 1) МКД — явные теги или residential/yes при этажности >= 3
             if self._is_apartment(row):
                 return "apartment"
-
-            # Нормализованные теги
             btag_raw = row.get("building") if hasattr(row, "get") else None
             btag = str(btag_raw).lower().strip() if btag_raw is not None and not (isinstance(btag_raw, float) and pd.isna(btag_raw)) else ""
+            if btag in ("residential", "yes", "true", "1") and levels is not None and levels >= 3:
+                return "apartment"
+
             amenity_raw = row.get("amenity") if hasattr(row, "get") else None
             amenity = str(amenity_raw).lower().strip() if amenity_raw is not None and not (isinstance(amenity_raw, float) and pd.isna(amenity_raw)) else ""
             shop_raw = row.get("shop") if hasattr(row, "get") else None
@@ -1400,33 +1427,38 @@ class DataService:
             # 2) Общественные объекты (школы, больницы и т.п.)
             if amenity in self._PUBLIC_AMENITY_VALUES:
                 return "public"
+            if btag in ("school", "university", "college", "kindergarten", "hospital", "clinic", "civic", "government", "public"):
+                return "public"
 
             # 3) Коммерция / офисы / розница
             if btag in ("office", "commercial"):
                 return "office"
-            if btag in ("retail", "supermarket", "mall", "shop"):
+            if btag in ("retail", "supermarket", "mall", "shop", "kiosk", "market"):
                 return "retail"
             if shop:
-                # Любой shop без уточнения — розница/ТЦ
                 return "retail"
 
             # 4) Промзона / индустриальные объекты
-            if btag in ("industrial", "warehouse", "factory", "manufacture", "plant", "depot"):
+            if btag in ("industrial", "warehouse", "factory", "manufacture", "plant", "depot", "hangar", "storage"):
                 return "industrial"
 
-            # 5) Отели / общежития (можно считать отдельной категорией, но для спроса близко к public)
+            # 5) Отели / общежития
             if btag in ("hotel", "hostel", "dormitory", "motel"):
                 return "public"
 
-            # 6) Частный сектор (явные теги: house, yes, residential и т.д.)
+            # 6) Частный сектор: явные теги дома или yes/1 при этажности <= 2; residential только при этажности <= 2
             if self._is_private_house(row, is_apartment=False):
                 return "private"
-
-            # 7) Здания без тега building или с пустым/yes — в РФ часто частный сектор; не тянем в МКД.
-            if (not btag or btag in ("yes", "true", "1")) and not amenity and not shop:
+            if btag in ("yes", "true", "1") and (levels is None or levels <= 2) and not amenity and not shop:
+                return "private"
+            if btag == "residential" and levels is not None and levels <= 2:
                 return "private"
 
-            # 8) Остальное
+            # 7) Без тега building или пустой тег — при отсутствии amenity/shop считаем частный сектор
+            if (not btag or (isinstance(btag_raw, float) and pd.isna(btag_raw))) and not amenity and not shop:
+                return "private"
+
+            # 8) Остальное (residential без этажности и т.п. — не приписываем ни к МКД, ни к частному)
             return "other"
 
         def _building_demand_weight(row) -> float:
@@ -1520,12 +1552,25 @@ class DataService:
 
                     clustering = DBSCAN(eps=eps_m, min_samples=dbscan_min_samples, metric="euclidean").fit(pts_type)
                     labels = np.array(clustering.labels_, dtype=int)
-                    # Точки-шум (label -1) не присваиваем кластерам — одиночные здания остаются выбросами, зоной спроса не считаются
                     cluster_ids = sorted(set(labels) - {-1})
                     n_noise = int((labels == -1).sum())
-                    if n_noise > 0:
+                    # Точки-шум (label -1) привязываем к ближайшему кластеру того же типа, чтобы все здания попали в кластер
+                    if n_noise > 0 and cluster_ids:
+                        centroids = {}
+                        for lid in cluster_ids:
+                            mask_lid = labels == lid
+                            centroids[lid] = np.array(pts_type[mask_lid].mean(axis=0))
+                        noise_idx = np.where(labels == -1)[0]
+                        for i in noise_idx:
+                            pt = pts_type[i]
+                            best_lid = min(cluster_ids, key=lambda lid: float(np.sum((pt - centroids[lid]) ** 2)))
+                            labels[i] = best_lid
                         self.logger.info(
-                            f"Точки-шум (тип={demand_type}): {n_noise} — не образуют зону спроса"
+                            f"Точки-шум (тип={demand_type}): {n_noise} привязаны к ближайшему кластеру"
+                        )
+                    elif n_noise > 0:
+                        self.logger.info(
+                            f"Точки-шум (тип={demand_type}): {n_noise} — кластеров нет, зона спроса не создаётся"
                         )
 
                     MAX_WEIGHT_PER_HULL = 300  # макс. вес одной области спроса (и точек в ней)
