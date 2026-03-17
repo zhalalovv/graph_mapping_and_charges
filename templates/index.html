@@ -598,10 +598,11 @@
             ensureMap();
             const R_CHARGE_M = 1600;
             const R_GARAGE_TO_M = 3200;
-            if (data.demand && data.demand.features && data.demand.features.length) {
+            // Слой точек спроса (серые точки) отключён по умолчанию,
+            // чтобы при загрузке размещения не захламлять карту.
+            // Если понадобится вернуть — можно быстро включить, выставив window.SHOW_DEMAND_POINTS = true в консоли.
+            if (window.SHOW_DEMAND_POINTS && data.demand && data.demand.features && data.demand.features.length) {
                 demandLayer = L.geoJSON(data.demand, {
-                    // Скрываем технические точки-заполнители кластеров (is_cluster_fill = true),
-                    // чтобы в UI отображались только "основные" точки спроса.
                     filter: (f) => !(f.properties && f.properties.is_cluster_fill),
                     style: { color: '#94a3b8', fillColor: '#94a3b8', weight: 1, radius: 4 },
                     pointToLayer: (f, latlng) =>
@@ -612,11 +613,6 @@
                             weight: 1,
                             fillOpacity: 0.7
                         }),
-                    onEachFeature: (f, layer) => {
-                        if (f.properties && f.properties.weight != null) {
-                            layer.bindPopup('Спрос: ' + f.properties.weight);
-                        }
-                    }
                 }).addTo(map);
             }
                 if (data.charge_stations && data.charge_stations.features && data.charge_stations.features.length) {
