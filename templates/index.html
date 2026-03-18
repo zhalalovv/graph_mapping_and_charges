@@ -200,6 +200,9 @@
             <button class="floating-btn btn-secondary" id="toggleClusterHullsBtn" style="width:100%; margin-top:6px; display:none" onclick="toggleClusterHulls()" title="Включить/выключить отображение областей кластеров">
                 <span id="clusterHullsLabel">Скрыть область кластера</span>
             </button>
+            <button class="floating-btn btn-secondary" id="toggleClusterPointsBtn" style="width:100%; margin-top:6px; display:none" onclick="toggleClusterPoints()" title="Включить/выключить отображение точек кластеров">
+                <span id="clusterPointsLabel">Показать точки кластеров</span>
+            </button>
         </div>
         <div class="flight-levels-panel" style="margin-top:12px">
             <h3 style="margin:0 0 8px">Высота зданий</h3>
@@ -245,15 +248,35 @@
                     <button type="button" class="floating-btn btn-secondary" style="padding:6px 10px; font-size:12px" onclick="setAllRadiusVisibility(false)">Снять все</button>
                 </div>
             </div>
+            <div id="routesVisibilityPanel" style="margin-top:10px; display:none; padding:8px; background:#f9fafb; border-radius:8px; border:1px solid #e2e8f0">
+                <div style="font-size:13px; font-weight:600; color:#374151; margin-bottom:6px">Маршруты</div>
+                <label style="display:flex; align-items:center; gap:6px; margin-bottom:4px; cursor:pointer; font-size:13px">
+                    <input type="checkbox" id="routesTrunk" onchange="applyRoutesVisibility()" />
+                    <span style="color:#4f46e5">Магистраль</span>
+                </label>
+                <label style="display:flex; align-items:center; gap:6px; margin-bottom:4px; cursor:pointer; font-size:13px">
+                    <input type="checkbox" id="routesBranch" onchange="applyRoutesVisibility()" />
+                    <span style="color:#0d9488">Ветки Б→А/гараж/ТО</span>
+                </label>
+                <label style="display:flex; align-items:center; gap:6px; margin-bottom:6px; cursor:pointer; font-size:13px">
+                    <input type="checkbox" id="routesLocal" onchange="applyRoutesVisibility()" />
+                    <span style="color:#14b8a6">Локальная сеть Б↔Б</span>
+                </label>
+                <div style="display:flex; gap:6px; margin-top:4px">
+                    <button type="button" class="floating-btn btn-secondary" style="padding:6px 10px; font-size:12px" onclick="setAllRoutesVisibility(true)">Все</button>
+                    <button type="button" class="floating-btn btn-secondary" style="padding:6px 10px; font-size:12px" onclick="setAllRoutesVisibility(false)">Снять все</button>
+                </div>
+            </div>
             <div id="stationsMetrics" style="margin-top:8px; font-size:12px; color:#374151; display:none"></div>
         </div>
     </div>
 
     <script>
-        let map, boundaryLayer, noFlyZonesLayer, buildingsLayer, clustersLayer, clusterHullsLayer;
+        let map, boundaryLayer, noFlyZonesLayer, buildingsLayer, clustersLayer, clusterHullsLayer, clusterPointsLayer;
         let demandLayer, chargeStationsLayer, garagesLayer, toStationsLayer, trunkEdgesLayer, branchEdgesLayer, localEdgesLayer;
         let chargeRadiusLayer, garageRadiusLayer, toRadiusLayer;
         let clusterHullsVisible = true;
+        let clusterPointsVisible = false; // точки кластеров (центроиды/точки спроса) по умолчанию скрыты
         let buildingsVisible = true;
         
         // Список популярных городов
@@ -390,6 +413,10 @@
                     map.removeLayer(clusterHullsLayer);
                     clusterHullsLayer = null;
                 }
+                if (clusterPointsLayer) {
+                    map.removeLayer(clusterPointsLayer);
+                    clusterPointsLayer = null;
+                }
                 const epsM = data.dbscan_eps_m != null ? Number(data.dbscan_eps_m) : 180;
                 const hullsFc = data.cluster_hulls || { type: 'FeatureCollection', features: [] };
                 clustersLayer = L.layerGroup();
@@ -418,9 +445,10 @@
                             const color = demandTypeColor[t] || demandTypeColor.other;
                             return {
                                 color: color,
-                                weight: 2,
+                                weight: 1,
+                                opacity: 0.45,
                                 fillColor: color,
-                                fillOpacity: 0.28,
+                                fillOpacity: 0.10,
                             };
                         },
                         onEachFeature: function(feature, layer) {
@@ -441,7 +469,7 @@
                 }
                 const pointColors = { apartment: '#22c55e', private: '#f97316', retail: '#a855f7', office: '#0ea5e9', public: '#eab308', industrial: '#64748b', other: '#6366f1' };
                 const pointLabels = { apartment: 'МКД', private: 'Частный сектор', retail: 'Магазины / ТЦ', office: 'Офисы', public: 'Общественные', industrial: 'Промзона', other: 'Прочее' };
-                const pointsLayer = L.geoJSON(fc, {
+                clusterPointsLayer = L.geoJSON(fc, {
                     pointToLayer: function(feature, latlng) {
                         const p = feature.properties || {};
                         const w = p.weight != null ? p.weight : 1;
@@ -468,10 +496,13 @@
                         );
                     }
                 });
-                pointsLayer.addTo(clustersLayer);
+                if (clusterPointsVisible) clusterPointsLayer.addTo(clustersLayer);
                 clustersLayer.addTo(map);
                 document.getElementById('toggleClusterHullsBtn').style.display = 'block';
                 updateClusterHullsButtonLabel();
+                const pointsBtn = document.getElementById('toggleClusterPointsBtn');
+                if (pointsBtn) pointsBtn.style.display = 'block';
+                updateClusterPointsButtonLabel();
                 console.log('✓ Кластеры DBSCAN: ' + fc.features.length + ', областей (hulls): ' + (hullsFc.features ? hullsFc.features.length : 0));
             } catch (e) {
                 console.warn('Кластеры DBSCAN не загружены:', e);
@@ -592,6 +623,9 @@
             const panel = document.getElementById('radiusVisibilityPanel');
             if (panel) panel.style.display = 'none';
             ['radiusCharge','radiusGarage','radiusTO'].forEach(id => { const c = document.getElementById(id); if (c) c.checked = false; });
+            const routesPanel = document.getElementById('routesVisibilityPanel');
+            if (routesPanel) routesPanel.style.display = 'none';
+            ['routesTrunk','routesBranch','routesLocal'].forEach(id => { const c = document.getElementById(id); if (c) c.checked = false; });
         }
 
         function applyPlacementData(data) {
@@ -643,7 +677,24 @@
                         },
                         onEachFeature: (f, layer) => {
                             const typeA = (f.properties && f.properties.station_type === 'charge_a');
-                            layer.bindPopup(typeA ? 'Зарядка тип А (основное покрытие)<br>R = 1.6 км' : 'Вспомогательная зарядка (тип Б)<br>Покрытие остального спроса, связь с тип А, не магистраль<br>R = 1.6 км');
+                            const p = f.properties || {};
+                            let roofInfo = '';
+                            if (p.roof_posts_total != null) {
+                                const a = (p.roof_area_m2 != null) ? (Number(p.roof_area_m2).toLocaleString('ru-RU', { maximumFractionDigits: 0 }) + ' м²') : '—';
+                                const aCh = (p.roof_area_charge_m2 != null) ? (Number(p.roof_area_charge_m2).toLocaleString('ru-RU', { maximumFractionDigits: 0 }) + ' м²') : '—';
+                                const aW = (p.roof_area_wait_m2 != null) ? (Number(p.roof_area_wait_m2).toLocaleString('ru-RU', { maximumFractionDigits: 0 }) + ' м²') : '—';
+                                roofInfo = '<br><br><strong>Крыша (оценка вместимости)</strong>'
+                                    + '<br>Площадь крыши: ' + a
+                                    + '<br>Площадь под зарядку/ожидание (60/40 от 50% крыши): ' + aCh + ' / ' + aW
+                                    + '<br>Постов всего: ' + p.roof_posts_total
+                                    + '<br>Зарядка/ожидание: ' + p.roof_posts_charge + ' / ' + p.roof_posts_wait;
+                            }
+                            layer.bindPopup(
+                                (typeA
+                                    ? 'Зарядка тип А (основное покрытие)<br>R = 1.6 км'
+                                    : 'Вспомогательная зарядка (тип Б)<br>Покрытие остального спроса, связь с тип А, не магистраль<br>R = 1.6 км'
+                                ) + roofInfo
+                            );
                         }
                     }).addTo(map);
                 }
@@ -688,14 +739,17 @@
                 if (data.trunk_edges && data.trunk_edges.features && data.trunk_edges.features.length) {
                     trunkEdgesLayer = L.geoJSON(data.trunk_edges, {
                         style: { color: '#6366f1', weight: 3, opacity: 0.8 }
-                    }).addTo(map);
+                    });
+                    trunkEdgesLayer.addTo(map);
                 }
                 const localPathsStyle = { color: '#0d9488', weight: 2, opacity: 0.85 };
                 if (data.branch_edges && data.branch_edges.features && data.branch_edges.features.length) {
-                    branchEdgesLayer = L.geoJSON(data.branch_edges, { style: localPathsStyle }).addTo(map);
+                    branchEdgesLayer = L.geoJSON(data.branch_edges, { style: localPathsStyle });
+                    branchEdgesLayer.addTo(map);
                 }
                 if (data.local_edges && data.local_edges.features && data.local_edges.features.length) {
-                    localEdgesLayer = L.geoJSON(data.local_edges, { style: localPathsStyle }).addTo(map);
+                    localEdgesLayer = L.geoJSON(data.local_edges, { style: localPathsStyle });
+                    localEdgesLayer.addTo(map);
                 }
                 const m = document.getElementById('stationsMetrics');
                 if (m && data.metrics) {
@@ -711,6 +765,15 @@
                 }
                 const panel = document.getElementById('radiusVisibilityPanel');
                 if (panel) { panel.style.display = 'block'; applyRadiusVisibility(); }
+                const routesPanel = document.getElementById('routesVisibilityPanel');
+                if (routesPanel) {
+                    routesPanel.style.display = 'block';
+                    // По умолчанию показываем только магистраль, локальные можно включить отдельно
+                    setAllRoutesVisibility(false);
+                    const trunkCheckbox = document.getElementById('routesTrunk');
+                    if (trunkCheckbox) trunkCheckbox.checked = true;
+                    applyRoutesVisibility();
+                }
         }
 
         async function loadStationsPlacement() {
@@ -802,6 +865,30 @@
             applyRadiusVisibility();
         }
 
+        function applyRoutesVisibility() {
+            if (!map) return;
+            const trunk = document.getElementById('routesTrunk');
+            const branch = document.getElementById('routesBranch');
+            const local = document.getElementById('routesLocal');
+            if (trunkEdgesLayer) {
+                if (trunk && trunk.checked) trunkEdgesLayer.addTo(map); else map.removeLayer(trunkEdgesLayer);
+            }
+            if (branchEdgesLayer) {
+                if (branch && branch.checked) branchEdgesLayer.addTo(map); else map.removeLayer(branchEdgesLayer);
+            }
+            if (localEdgesLayer) {
+                if (local && local.checked) localEdgesLayer.addTo(map); else map.removeLayer(localEdgesLayer);
+            }
+        }
+
+        function setAllRoutesVisibility(visible) {
+            ['routesTrunk','routesBranch','routesLocal'].forEach(id => {
+                const c = document.getElementById(id);
+                if (c) c.checked = visible;
+            });
+            applyRoutesVisibility();
+        }
+
         function updateBuildingsButtonLabel() {
             const el = document.getElementById('buildingsLabel');
             if (!el) return;
@@ -825,6 +912,12 @@
             el.textContent = clusterHullsVisible ? 'Скрыть область кластера' : 'Показать область кластера';
         }
 
+        function updateClusterPointsButtonLabel() {
+            const el = document.getElementById('clusterPointsLabel');
+            if (!el) return;
+            el.textContent = clusterPointsVisible ? 'Скрыть точки кластеров' : 'Показать точки кластеров';
+        }
+
         function toggleClusterHulls() {
             if (!map) return;
             clusterHullsVisible = !clusterHullsVisible;
@@ -844,6 +937,17 @@
                 }
             }
             updateClusterHullsButtonLabel();
+        }
+
+        function toggleClusterPoints() {
+            if (!clustersLayer) return;
+            clusterPointsVisible = !clusterPointsVisible;
+            if (clusterPointsVisible) {
+                if (clusterPointsLayer) clusterPointsLayer.addTo(clustersLayer);
+            } else {
+                if (clusterPointsLayer) clustersLayer.removeLayer(clusterPointsLayer);
+            }
+            updateClusterPointsButtonLabel();
         }
 
         // Инициализация

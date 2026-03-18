@@ -23,6 +23,7 @@ import pandas as pd
 import geopandas as gpd
 import networkx as nx
 from shapely.geometry import Point
+from shapely.ops import unary_union
 from scipy.spatial import cKDTree
 
 # Радиус Земли в км
@@ -434,65 +435,207 @@ class StationPlacement:
         charge_stations: gpd.GeoDataFrame,
         garage_points: gpd.GeoDataFrame,
         to_points: gpd.GeoDataFrame,
-        no_fly_zones,
+        obstacles,
+        air_graph: Optional[nx.Graph] = None,
         *,
         max_edge_km: float = R_GARAGE_TO_KM,
         max_neighbors_a: int = 4,
     ) -> nx.Graph:
-        """Магистраль: узлы — зарядки типа А, гаражи, ТО; рёбра только между тип А и тип А, макс. 4 соседа на станцию."""
+        """
+        Магистраль: узлы — все станции типа А:
+        - зарядки типа А (основное покрытие),
+        - гаражи,
+        - станции ТО.
+
+        Рёбра магистрали соединяют каждую станцию с ближайшими соседями в пределах max_edge_km (км),
+        не более 2 рёбер на станцию (даже если max_neighbors_a > 2).
+
+        Если прямая связь между станциями пересекает препятствия (бесполётные зоны / высокие здания),
+        и есть предварительно построенный
+        воздушный граф air_graph, то вместо прямого отрезка строится обход по воздушному графу
+        (A* по весу рёбер). Полученная полилиния сохраняется в атрибуте geometry_coords ребра.
+        """
         nodes_list = []
-        # Только зарядки типа А для рёбер магистрали
-        a_list = []
+        # Зарядки типа А, гаражи и ТО — все считаются станциями типа А для магистрали
+        trunk_nodes = []
         for i, row in (charge_stations.iterrows() if charge_stations is not None and len(charge_stations) > 0 else []):
             if row.get("station_type") != "charge_a":
                 continue
             lon, lat = _coords_from_geom(row.geometry)
             nid = f"charge_{i}"
             nodes_list.append(((lon, lat), "charge", nid))
-            a_list.append((nid, lon, lat))
-        # Гаражи и ТО — только узлы, без рёбер в магистрали
+            trunk_nodes.append((nid, lon, lat))
         for i, row in (garage_points.iterrows() if garage_points is not None and len(garage_points) > 0 else []):
             lon, lat = _coords_from_geom(row.geometry)
-            nodes_list.append(((lon, lat), "garage", f"garage_{i}"))
+            nid = f"garage_{i}"
+            nodes_list.append(((lon, lat), "garage", nid))
+            trunk_nodes.append((nid, lon, lat))
         for i, row in (to_points.iterrows() if to_points is not None and len(to_points) > 0 else []):
             lon, lat = _coords_from_geom(row.geometry)
-            nodes_list.append(((lon, lat), "to", f"to_{i}"))
+            nid = f"to_{i}"
+            nodes_list.append(((lon, lat), "to", nid))
+            trunk_nodes.append((nid, lon, lat))
 
         G = nx.Graph()
         for (lon, lat), typ, nid in nodes_list:
             G.add_node(nid, lon=lon, lat=lat, node_type=typ)
 
-        if len(a_list) < 2:
+        if len(trunk_nodes) < 2:
             return G
 
-        # Рёбра только А–А: каждая станция А соединяется с макс. max_neighbors_a ближайшими А в пределах max_edge_km
-        a_pts = np.array([[lon, lat] for _, lon, lat in a_list])
-        a_ids = [nid for nid, _, _ in a_list]
-        k = min(max_neighbors_a, len(a_list) - 1)
+        # Геометрия беспилотных зон (WGS84) для проверки: проходит ли магистральный отрезок через зону
+        nfz_union = None
+        if obstacles is not None and getattr(obstacles, "is_empty", True) is False and getattr(obstacles, "is_valid", True):
+            nfz_union = obstacles
+
+        # Подготовка структур для A* по воздушному графу
+        air_coords = None
+        air_ids = None
+        air_tree = None
+        if air_graph is not None and air_graph.number_of_nodes() > 1:
+            air_ids = list(air_graph.nodes())
+            pts = []
+            for nid in air_ids:
+                data = air_graph.nodes[nid]
+                lon = data.get("lon") or data.get("x")
+                lat = data.get("lat") or data.get("y")
+                if lon is None or lat is None:
+                    pts.append((np.nan, np.nan))
+                else:
+                    pts.append((float(lon), float(lat)))
+            air_coords = np.array(pts, dtype=float)
+            # Фильтруем узлы без координат
+            valid_mask = ~np.isnan(air_coords[:, 0]) & ~np.isnan(air_coords[:, 1])
+            if not np.any(valid_mask):
+                air_coords = None
+                air_ids = None
+            else:
+                air_coords_valid = air_coords[valid_mask]
+                air_ids_valid = [air_ids[i] for i, ok in enumerate(valid_mask) if ok]
+                air_coords = air_coords_valid
+                air_ids = air_ids_valid
+                try:
+                    air_tree = cKDTree(air_coords)
+                except Exception:
+                    air_tree = None
+
+        def _edge_intersects_nfz(lon1: float, lat1: float, lon2: float, lat2: float) -> bool:
+            """Проверка: проходит ли отрезок магистрали через беспилотную зону (пересекает или внутри)."""
+            if nfz_union is None:
+                return False
+            from shapely.geometry import LineString as _Line
+
+            try:
+                line = _Line([(float(lon1), float(lat1)), (float(lon2), float(lat2))])
+                if not line.is_valid:
+                    return False
+                # пересекает границу или лежит внутри зоны
+                return nfz_union.intersects(line)
+            except Exception:
+                return False
+
+        def _astar_detour(lon1: float, lat1: float, lon2: float, lat2: float):
+            """
+            Обход по воздушному графу между двумя точками.
+            Возвращает (coords: List[(lon, lat)], length_km) или (None, None) при неудаче.
+            """
+            if air_graph is None or air_tree is None or air_coords is None or not air_ids:
+                return None, None
+            try:
+                # Находим ближайшие узлы воздушного графа к концам магистрали
+                d_start, idx_start = air_tree.query([lon1, lat1], k=1)
+                d_end, idx_end = air_tree.query([lon2, lat2], k=1)
+                start_id = air_ids[int(idx_start)]
+                end_id = air_ids[int(idx_end)]
+
+                def _heuristic(a, b):
+                    da = air_graph.nodes[a]
+                    db = air_graph.nodes[b]
+                    lon_a = da.get("lon") or da.get("x")
+                    lat_a = da.get("lat") or da.get("y")
+                    lon_b = db.get("lon") or db.get("x")
+                    lat_b = db.get("lat") or db.get("y")
+                    if lon_a is None or lat_a is None or lon_b is None or lat_b is None:
+                        return 0.0
+                    return haversine_km(lat_a, lon_a, lat_b, lon_b)
+
+                path = nx.astar_path(air_graph, start_id, end_id, heuristic=_heuristic, weight="weight")
+                if not path or len(path) < 2:
+                    return None, None
+                coords = []
+                total_len = 0.0
+                prev = None
+                for nid in path:
+                    d = air_graph.nodes[nid]
+                    lon = d.get("lon") or d.get("x")
+                    lat = d.get("lat") or d.get("y")
+                    if lon is None or lat is None:
+                        continue
+                    lon_f, lat_f = float(lon), float(lat)
+                    coords.append((lon_f, lat_f))
+                    if prev is not None:
+                        total_len += haversine_km(prev[1], prev[0], lat_f, lon_f)
+                    prev = (lon_f, lat_f)
+                if len(coords) < 2:
+                    return None, None
+                return coords, total_len
+            except Exception:
+                return None, None
+
+        # Рёбра между всеми станциями типа А: каждая станция соединяется с макс. max_neighbors_a
+        # ближайшими соседями в пределах max_edge_km.
+        pts = np.array([[lon, lat] for _, lon, lat in trunk_nodes])
+        ids = [nid for nid, _, _ in trunk_nodes]
+        # Не более 2 соседей на станцию, даже если max_neighbors_a больше.
+        k = min(max(1, int(max_neighbors_a)), 2, len(trunk_nodes) - 1)
         if k <= 0:
             return G
-        for i in range(len(a_list)):
-            nid_i = a_ids[i]
-            lat_i, lon_i = a_pts[i, 1], a_pts[i, 0]
+        for i in range(len(trunk_nodes)):
+            nid_i = ids[i]
+            lat_i, lon_i = pts[i, 1], pts[i, 0]
             candidates = []
-            for j in range(len(a_list)):
+            for j in range(len(trunk_nodes)):
                 if j == i:
                     continue
-                d_km = haversine_km(lat_i, lon_i, a_pts[j, 1], a_pts[j, 0])
+                d_km = haversine_km(lat_i, lon_i, pts[j, 1], pts[j, 0])
                 if d_km <= max_edge_km:
                     candidates.append((d_km, j))
             candidates.sort(key=lambda x: x[0])
             for d_km, j in candidates[:k]:
-                nid_j = a_ids[j]
+                nid_j = ids[j]
                 if not G.has_edge(nid_i, nid_j):
+                    lon_j, lat_j = pts[j, 0], pts[j, 1]
+                    # Проверяем: проходит ли прямая между станциями через беспилотную зону
+                    if not _edge_intersects_nfz(lon_i, lat_i, lon_j, lat_j):
+                        G.add_edge(nid_i, nid_j, weight=d_km, length=d_km)
+                        continue
+                    # Отрезок пересекает беспилотную зону — строим обход по воздушному графу (A*)
+                    self.logger.debug("Магистраль пересекает беспилотную зону %s–%s, строим обход A*", nid_i, nid_j)
+                    if air_graph is not None and air_tree is not None:
+                        detour_coords, detour_len = _astar_detour(lon_i, lat_i, lon_j, lat_j)
+                        if detour_coords is not None and detour_len is not None:
+                            G.add_edge(
+                                nid_i,
+                                nid_j,
+                                weight=detour_len,
+                                length=detour_len,
+                                geometry_coords=detour_coords,
+                            )
+                            self.logger.info("Обход беспилотной зоны: %s–%s, точек маршрута %s", nid_i, nid_j, len(detour_coords))
+                            continue
+                    self.logger.warning("Обход не построен для %s–%s, оставлена прямая", nid_i, nid_j)
                     G.add_edge(nid_i, nid_j, weight=d_km, length=d_km)
-        # Связность: объединяем компоненты зарядок А
-        charge_nodes_ids = [n for n, d in G.nodes(data=True) if d.get("node_type") == "charge"]
-        if len(charge_nodes_ids) > 1:
-            sub = G.subgraph(charge_nodes_ids).copy()
+        # Связность: объединяем компоненты всех узлов магистрали
+        trunk_node_ids = list(G.nodes())
+        if len(trunk_node_ids) > 1:
+            sub = G.subgraph(trunk_node_ids).copy()
             components = list(nx.connected_components(sub))
             if len(components) > 1:
-                coords = {n: (G.nodes[n].get("lon"), G.nodes[n].get("lat")) for n in charge_nodes_ids if G.nodes[n].get("lon") is not None}
+                coords = {
+                    n: (G.nodes[n].get("lon"), G.nodes[n].get("lat"))
+                    for n in trunk_node_ids
+                    if G.nodes[n].get("lon") is not None
+                }
                 base_comp = set(components[0])
                 remaining = [set(c) for c in components[1:]]
                 while remaining:
@@ -1002,6 +1145,8 @@ def run_full_pipeline(
     Запускает полный пайплайн: данные города → спрос (DBSCAN или сетка) → зарядки → гаражи/ТО → метрики.
     """
     logger = logging.getLogger(__name__)
+    from graph_service import GraphService
+
     data = data_service.get_city_data(city_name, network_type=network_type, simplify=simplify, load_no_fly_zones=True)
     buildings = data.get("buildings")
     road_graph = data.get("road_graph")
@@ -1119,8 +1264,57 @@ def run_full_pipeline(
     garage_placeholder = (garage_candidates.iloc[:num_garages].copy() if num_garages > 0 and garage_candidates is not None and len(garage_candidates) > 0 else gpd.GeoDataFrame())
     to_placeholder = (to_candidates.iloc[:num_to].copy() if num_to > 0 and to_candidates is not None and len(to_candidates) > 0 else gpd.GeoDataFrame())
 
+    # Воздушный граф для обхода бесполётных зон и препятствий (используется в магистрали при необходимости обхода)
+    air_graph = None
+    try:
+        if city_boundary is not None:
+            gs = GraphService()
+            air_graph = gs.build_air_graph(
+                city_boundary=city_boundary,
+                buildings=buildings,
+                no_fly_zones=no_fly_zones,
+                building_buffer_deg=0.00025,
+                min_distance_deg=0.0003,
+                max_points=3000,
+                k_neighbors=6,
+            )
+    except Exception:
+        air_graph = None
+
+    # Объединённая геометрия беспилотных зон (только они) для проверки магистрали и A* обхода
+    no_fly_zones_union = None
+    try:
+        geoms = []
+        if no_fly_zones is not None:
+            if isinstance(no_fly_zones, gpd.GeoDataFrame) and len(no_fly_zones) > 0:
+                try:
+                    nfz_4326 = no_fly_zones.to_crs("EPSG:4326")
+                except Exception:
+                    nfz_4326 = no_fly_zones
+                for g in nfz_4326.geometry:
+                    if g is not None and not getattr(g, "is_empty", True):
+                        geoms.append(g)
+            elif isinstance(no_fly_zones, list) and len(no_fly_zones) > 0:
+                for z in no_fly_zones:
+                    g = getattr(z, "geometry", z)
+                    if g is not None and hasattr(g, "is_valid") and g.is_valid and not getattr(g, "is_empty", True):
+                        geoms.append(g)
+        if geoms:
+            no_fly_zones_union = unary_union(geoms)
+            if no_fly_zones_union is not None and (getattr(no_fly_zones_union, "is_empty", True) or not getattr(no_fly_zones_union, "is_valid", True)):
+                no_fly_zones_union = None
+    except Exception:
+        no_fly_zones_union = None
+
     # Шаг 3: trunk (с заглушками)
-    trunk = placement.build_trunk_graph(charge_stations, garage_placeholder, to_placeholder, no_fly_zones, max_edge_km=R_GARAGE_TO_KM)
+    trunk = placement.build_trunk_graph(
+        charge_stations,
+        garage_placeholder,
+        to_placeholder,
+        no_fly_zones_union,
+        air_graph=air_graph,
+        max_edge_km=R_GARAGE_TO_KM,
+    )
 
     # Шаг 4–5: гаражи и ТО размещаем по покрытию спроса (как зарядки) до 95%
     garages = placement.place_garages(
@@ -1180,7 +1374,14 @@ def run_full_pipeline(
     )
 
     # Пересобираем trunk с уже выбранными гаражами и ТО
-    trunk = placement.build_trunk_graph(charge_stations, garages, to_stations, no_fly_zones, max_edge_km=R_GARAGE_TO_KM)
+    trunk = placement.build_trunk_graph(
+        charge_stations,
+        garages,
+        to_stations,
+        no_fly_zones_union,
+        air_graph=air_graph,
+        max_edge_km=R_GARAGE_TO_KM,
+    )
 
     # Ветки: Б → (А / гараж / ТО), макс. 3 связи на станцию Б
     branch_edges = placement.build_branch_edges(
@@ -1200,6 +1401,7 @@ def run_full_pipeline(
     metrics["charge"] = charge_metrics
 
     return {
+        "buildings": buildings,
         "demand": demand,
         "charge_stations": charge_stations,
         "garages": garages,

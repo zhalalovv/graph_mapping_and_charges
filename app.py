@@ -9,6 +9,9 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
+import numpy as np
+import pandas as pd
+
 from data_service import DataService
 from station_placement import run_full_pipeline, R_CHARGE_KM, R_GARAGE_TO_KM, D_MAX_KM, StationPlacement
 import geopandas as gpd
@@ -478,6 +481,119 @@ def get_stations_placement(
         if result.get("error"):
             return JSONResponse({"error": result["error"]}, status_code=400)
 
+        # --- Расчёт вместимости крыш для станции зарядки/ожидания (по объёмам дрона) ---
+        # Исходные данные пользователя:
+        # - 6.187 м²/место зарядки (уже с запасом + инфраструктура + проходы)
+        # - 5.156 м²/место ожидания (с запасом + проходы)
+        # - распределение площади 60/40 в пользу зарядок
+        # - используем ~50% площади крыши под посты
+        def _attach_roof_capacity(buildings_gdf: gpd.GeoDataFrame, charge_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+            if buildings_gdf is None or len(buildings_gdf) == 0 or charge_gdf is None or len(charge_gdf) == 0:
+                return charge_gdf
+            try:
+                b = buildings_gdf.copy()
+                c = charge_gdf.copy()
+                if b.crs is None:
+                    b = b.set_crs("EPSG:4326", allow_override=True)
+                if c.crs is None:
+                    c = c.set_crs("EPSG:4326", allow_override=True)
+
+                # Метрическая проекция для корректных площадей/предикатов
+                crs_utm = b.estimate_utm_crs()
+                b_utm = b.to_crs(crs_utm)
+                c_utm = c.to_crs(crs_utm)
+
+                if "area_m2" not in b_utm.columns or b_utm["area_m2"].isna().all():
+                    try:
+                        b_utm["area_m2"] = b_utm.geometry.area.astype(float)
+                    except Exception:
+                        b_utm["area_m2"] = None
+
+                # Привязка станции к зданию
+                c_points = c_utm.copy()
+                c_points["__station_row_id__"] = np.arange(len(c_points), dtype=int)
+                joined = gpd.sjoin(
+                    c_points[["geometry", "__station_row_id__"]],
+                    b_utm[["geometry", "area_m2"]],
+                    how="left",
+                    predicate="within",
+                )
+                if joined is None or len(joined) == 0:
+                    return charge_gdf
+
+                # Параметры расчёта (можно позже вынести в query params)
+                usable_roof_ratio = 0.5
+                charge_area_ratio = 0.6
+                wait_area_ratio = 0.4
+                charge_spot_area_m2 = 6.187
+                wait_spot_area_m2 = 5.156
+
+                # По каждому зданию считаем вместимость и маппим обратно на станции
+                building_caps: Dict[int, Dict[str, Any]] = {}
+                for _, r in joined.iterrows():
+                    b_idx = r.get("index_right")
+                    if pd.isna(b_idx):
+                        continue
+                    b_idx_int = int(b_idx)
+                    if b_idx_int in building_caps:
+                        continue
+                    try:
+                        roof_area = float(b_utm.loc[b_idx_int].get("area_m2") or 0.0)
+                    except Exception:
+                        roof_area = 0.0
+                    effective_area = max(0.0, roof_area * usable_roof_ratio)
+                    area_charge = effective_area * charge_area_ratio
+                    area_wait = effective_area * wait_area_ratio
+
+                    n_charge = int(np.floor(area_charge / charge_spot_area_m2)) if charge_spot_area_m2 > 0 else 0
+                    n_wait = int(np.floor(area_wait / wait_spot_area_m2)) if wait_spot_area_m2 > 0 else 0
+                    n_total = int(n_charge + n_wait)
+                    building_caps[b_idx_int] = {
+                        "roof_area_m2": roof_area,
+                        "effective_area_m2": effective_area,
+                        "area_charge_m2": area_charge,
+                        "area_wait_m2": area_wait,
+                        "n_total": n_total,
+                        "n_charge": n_charge,
+                        "n_wait": n_wait,
+                    }
+
+                # Словарь station_row_id -> building_idx
+                station_to_building: Dict[int, int] = {}
+                for _, r in joined.iterrows():
+                    b_idx = r.get("index_right")
+                    if pd.isna(b_idx):
+                        continue
+                    s_id = int(r.get("__station_row_id__"))
+                    station_to_building[s_id] = int(b_idx)
+
+                # Вешаем рассчитанные поля на каждый station point (если он на крыше)
+                c_out = c.copy()
+                c_out["roof_area_m2"] = None
+                c_out["roof_effective_area_m2"] = None
+                c_out["roof_area_charge_m2"] = None
+                c_out["roof_area_wait_m2"] = None
+                c_out["roof_posts_total"] = None
+                c_out["roof_posts_charge"] = None
+                c_out["roof_posts_wait"] = None
+                for i in range(len(c_out)):
+                    b_idx = station_to_building.get(i)
+                    if b_idx is None:
+                        continue
+                    cap = building_caps.get(b_idx)
+                    if not cap:
+                        continue
+                    c_out.at[c_out.index[i], "roof_area_m2"] = round(float(cap["roof_area_m2"]), 1)
+                    c_out.at[c_out.index[i], "roof_effective_area_m2"] = round(float(cap["effective_area_m2"]), 1)
+                    c_out.at[c_out.index[i], "roof_area_charge_m2"] = round(float(cap["area_charge_m2"]), 1)
+                    c_out.at[c_out.index[i], "roof_area_wait_m2"] = round(float(cap["area_wait_m2"]), 1)
+                    c_out.at[c_out.index[i], "roof_posts_total"] = int(cap["n_total"])
+                    c_out.at[c_out.index[i], "roof_posts_charge"] = int(cap["n_charge"])
+                    c_out.at[c_out.index[i], "roof_posts_wait"] = int(cap["n_wait"])
+                return c_out
+            except Exception:
+                return charge_gdf
+
         def gdf_to_geojson(gdf, default_props=None):
             if gdf is None or len(gdf) == 0:
                 return {"type": "FeatureCollection", "features": []}
@@ -493,7 +609,8 @@ def get_stations_placement(
             return obj
 
         demand_geojson = gdf_to_geojson(result.get("demand"))
-        charge_geojson = gdf_to_geojson(result.get("charge_stations"))
+        charge_gdf = _attach_roof_capacity(result.get("buildings"), result.get("charge_stations"))
+        charge_geojson = gdf_to_geojson(charge_gdf)
         garages_geojson = gdf_to_geojson(result.get("garages"))
         to_geojson = gdf_to_geojson(result.get("to_stations"))
 
