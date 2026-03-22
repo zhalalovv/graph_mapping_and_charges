@@ -10,14 +10,11 @@ import time
 import pickle
 import requests
 from geopy.geocoders import Nominatim
-from geopy.extra.rate_limiter import RateLimiter
 import logging
 import json
 from redis import Redis
-from shapely.geometry import box, MultiPoint, Point, LineString, Polygon
-from shapely.ops import unary_union, polygonize
-from shapely.strtree import STRtree
-from shapely.prepared import prep
+from shapely.geometry import box, MultiPoint, Point, Polygon
+from shapely.ops import unary_union
 
 # Подавляем DeprecationWarning из OSMnx (unary_union и др. — внутренние вызовы библиотеки)
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="osmnx")
@@ -30,13 +27,7 @@ class DataService:
         # Параметр оставлен для совместимости, но директории мы не создаём и файлы не пишем.
         self.cache_dir = cache_dir
         self.progress_callbacks = []
-        # Используем несколько геокодеров для лучшей поддержки российских адресов
-        self.geolocators = {
-            'nominatim': Nominatim(user_agent="drone_route_planner", timeout=10),
-            'nominatim_ru': Nominatim(user_agent="drone_route_planner", timeout=10, domain='nominatim.openstreetmap.org')
-        }
-        # Rate-limited reverse geocoder
-        self._reverse = RateLimiter(self.geolocators['nominatim'].reverse, min_delay_seconds=1)
+        self._nominatim_geocoder = Nominatim(user_agent="city_cluster_app", timeout=10)
         
         # Настройка логирования
         logging.basicConfig(level=logging.INFO)
@@ -100,8 +91,6 @@ class DataService:
                         # Если кластеров в отдельном ключе ещё нет (старый кэш) — считаем и сохраняем их отдельно
                         if not have_clusters:
                             try:
-                                from station_placement import StationPlacement
-
                                 buildings = base_data.get('buildings')
                                 road_graph = base_data.get('road_graph')
                                 city_boundary = base_data.get('city_boundary')
@@ -120,39 +109,19 @@ class DataService:
                                 demand_gdf, hulls_gdf = (
                                     demand_result if isinstance(demand_result, tuple) else (demand_result, None)
                                 )
-                                demand_points = None
-                                demand_hulls = None
-                                if demand_gdf is not None and len(demand_gdf) > 0:
-                                    try:
-                                        placement = StationPlacement(self, logger=self.logger)
-                                        if "weight" in demand_gdf.columns:
-                                            total_weight = float(demand_gdf["weight"].sum())
-                                            approx_clusters = max(1, len(demand_gdf) // 300)
-                                            max_weight_per_cluster = max(total_weight / approx_clusters, 1.0)
-                                        else:
-                                            max_weight_per_cluster = float("inf")
-                                        demand_gdf = placement.split_demand_by_capacity(
-                                            demand_gdf,
-                                            max_weight_per_cluster=max_weight_per_cluster,
-                                            max_points_per_cluster=300,
-                                            cluster_id_column=None,
-                                            k_neighbors=16,
-                                        )
-                                    except Exception:
-                                        pass
-                                    demand_points = demand_gdf
-                                    demand_hulls = hulls_gdf
-
-                                base_data['demand_points'] = demand_points
-                                base_data['demand_hulls'] = demand_hulls
-
+                                base_data['demand_points'] = demand_gdf
+                                base_data['demand_hulls'] = hulls_gdf
                                 if self._redis is not None:
                                     try:
-                                        clusters_payload = {
-                                            'demand_points': demand_points,
-                                            'demand_hulls': demand_hulls,
-                                        }
-                                        self._redis.set(redis_clusters_key, pickle.dumps(clusters_payload))
+                                        self._redis.set(
+                                            redis_clusters_key,
+                                            pickle.dumps(
+                                                {
+                                                    "demand_points": demand_gdf,
+                                                    "demand_hulls": hulls_gdf,
+                                                }
+                                            ),
+                                        )
                                     except Exception as e:
                                         self.logger.warning(f"Не удалось сохранить кластеры города в Redis: {e}")
                             except Exception as e:
@@ -255,7 +224,7 @@ class DataService:
             # Fallback 3: геокодируем точку и загружаем по радиусу (~10 км)
             if road_graph is None or len(road_graph.nodes) == 0:
                 try:
-                    loc = self.geolocators['nominatim'].geocode(city_name)
+                    loc = self._nominatim_geocoder.geocode(city_name)
                     if loc and loc.latitude and loc.longitude:
                         road_graph = ox.graph_from_point((loc.latitude, loc.longitude), dist=10000, custom_filter=road_filter, simplify=simplify)
                         if road_graph is not None and len(road_graph.nodes) > 0:
@@ -358,8 +327,6 @@ class DataService:
             self._update_progress("download", 80, "Загрузка запретных зон" if load_no_fly_zones else "Пропуск беспилотных зон (только дороги)")
             no_fly_zones = self._get_no_fly_zones(city_name, buildings) if load_no_fly_zones else []
 
-            # Предварительное выделение кластеров спроса на этапе загрузки города (DBSCAN),
-            # с дополнительным дроблением, чтобы в одном кластере было не более 100 точек.
             demand_points = None
             demand_hulls = None
             try:
@@ -378,28 +345,6 @@ class DataService:
                     demand_result if isinstance(demand_result, tuple) else (demand_result, None)
                 )
                 if demand_gdf is not None and len(demand_gdf) > 0:
-                    try:
-                        from station_placement import StationPlacement
-
-                        placement = StationPlacement(self, logger=self.logger)
-                        if "weight" in demand_gdf.columns:
-                            total_weight = float(demand_gdf["weight"].sum())
-                            # Целимся примерно в такие кластеры, чтобы их было хотя бы len(demand_gdf)/300,
-                            # но не делаем cap слишком маленьким.
-                            approx_clusters = max(1, len(demand_gdf) // 300)
-                            max_weight_per_cluster = max(total_weight / approx_clusters, 1.0)
-                        else:
-                            max_weight_per_cluster = float("inf")
-                        demand_gdf = placement.split_demand_by_capacity(
-                            demand_gdf,
-                            max_weight_per_cluster=max_weight_per_cluster,
-                            max_points_per_cluster=300,
-                            cluster_id_column=None,
-                            k_neighbors=16,
-                        )
-                    except Exception:
-                        # Если дробление не удалось, используем исходные кластеры.
-                        pass
                     demand_points = demand_gdf
                     demand_hulls = hulls_gdf
             except Exception as e:
@@ -783,38 +728,7 @@ class DataService:
         
         return []
     
-    # --- Кандидаты размещения станций (Шаг A) и точки спроса (Шаг B) ---
-    # Теги OSM, по которым отстраиваются кандидаты станций:
-    #
-    # Зарядки (крыша): здания с building=* из ALLOWED_ROOF_BUILDING_TAGS (см. ниже),
-    #   площадь footprint ≥ ROOF_MIN_AREA_M2; здания грузятся по tags={"building": True}.
-    # Зарядки (земля), гаражи, ТО: промзоны и парковки из _load_industrial_and_parking_areas:
-    #   landuse=industrial | warehouse; building=industrial | warehouse | factory | manufacture;
-    #   amenity=parking; parking=True.
-    #   Гаражи и ТО — только здания в промзонах (industrial), без парковок.
-    #
-    NO_FLY_BUFFER_DEGREES_PER_M = 0.000009  # ~1 м в градусах на широте ~55
-    ROOF_MIN_AREA_M2 = 80.0  # минимальная площадь крыши для крышной зарядки
-    GROUND_MIN_AREA_M2 = 100.0  # минимальная площадка для наземной зарядки
-    # Крышные зарядки: только МКД (многоквартирные дома), без коммерции/офисов
-    # Используем тот же набор тегов, что и в _is_apartment.
-    ALLOWED_ROOF_BUILDING_TAGS = frozenset((
-        'apartments', 'apartment', 'apartment_block', 'multistory', 'block', 'flats',
-        'semidetached_house',
-    ))
-    # Допустимые типы зданий для гаражей/ТО внутри промзон
-    ALLOWED_INDUSTRIAL_BUILDING_TAGS = frozenset((
-        'industrial', 'warehouse', 'factory', 'manufacture', 'garages', 'garage',
-        'service', 'commercial',
-    ))
-    # Ключевые слова тяжёлой промышленности/опасных объектов, которых нужно избегать
-    FORBIDDEN_INDUSTRIAL_KEYWORDS = (
-        'пив', 'brew', 'beer',             # пивкомбинаты / breweries
-        'завод', 'комбинат',              # крупные заводы/комбинаты
-        'судоремонт', 'судостро', 'верф', 'ship', 'dock', 'shipyard',
-        'химволокн', 'химическ', 'цемент', 'совхоз',  # заводы, химзаводы, совхозы
-    )
-    # Спрос доставки: только жилые + часть коммерции; пром/склады — только для кандидатов станций, не для спроса
+    # --- Кластеризация спроса по зданиям ---
     DEMAND_BUILDING_TAGS = frozenset((
         'house', 'residential', 'apartments', 'apartment', 'apartment_block', 'multistory', 'block', 'flats',
         'semidetached_house', 'dormitory', 'detached', 'terrace', 'hut', 'cabin', 'bungalow',
@@ -826,19 +740,13 @@ class DataService:
         'school', 'university', 'college', 'hospital', 'kindergarten', 'civic', 'government',
         'train_station', 'service',
     ))
-    # Объекты энергетики, которые нельзя использовать для размещения станций (подстанции и т.п.)
-    EXCLUDE_POWER_TAGS = frozenset((
-        'substation', 'sub_station', 'plant', 'generator', 'transformer',
-    ))
-    # Буфер вокруг подстанций (м), чтобы гаражи/ТО не ставились рядом
-    POWER_SUBSTATION_BUFFER_M = 30.0
     # Вес спроса: многоквартирники дают повышенный спрос (больше людей)
     APARTMENT_DEMAND_WEIGHT = 4
 
     def _filter_buildings_for_demand(self, buildings: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         """
-        Оставляет только здания, релевантные для спроса доставки: жилые (house/residential/apartments/dormitory)
-        и часть коммерции (retail/office). Пром/склады исключены — они только для кандидатов станций.
+        Оставляет только здания, релевантные для спроса: жилые и часть коммерции (retail/office).
+        Пром/склады исключены.
         """
         if buildings is None or len(buildings) == 0:
             return buildings
@@ -856,158 +764,6 @@ class DataService:
             self.logger.info(f"Спрос доставки: оставлено {len(out)} зданий из {len(buildings)} (жилые + retail/office, без пром/складов)")
         return out
 
-    def _industrial_polygon_is_forbidden(self, row) -> bool:
-        """True, если у объекта OSM (промзона/здание) в тегах есть ключевые слова заводов/опасных объектов."""
-        text_fields = []
-        for key in ("name", "industrial", "craft", "operator", "brand"):
-            val = row.get(key) if hasattr(row, "get") else None
-            if val is None or (isinstance(val, float) and pd.isna(val)):
-                continue
-            text_fields.append(str(val).lower())
-        combined = " ".join(text_fields)
-        if not combined:
-            return False
-        return any(k in combined for k in self.FORBIDDEN_INDUSTRIAL_KEYWORDS)
-
-    def _load_power_substation_geometries(self, bbox_osm, crs_4326):
-        """
-        Загружает из OSM геометрии подстанций и других энергообъектов (power=substation, plant, etc.).
-        bbox_osm: (north, south, east, west). Returns: list of Shapely geometry (4326).
-        """
-        north, south, east, west = bbox_osm
-        geoms = []
-        try:
-            for power_val in self.EXCLUDE_POWER_TAGS:
-                gdf = ox.features_from_bbox(bbox=(north, south, east, west), tags={"power": power_val})
-                if gdf is None or len(gdf) == 0:
-                    continue
-                if gdf.crs is None:
-                    gdf = gdf.set_crs("EPSG:4326")
-                gdf = gdf.to_crs(crs_4326)
-                for _, row in gdf.iterrows():
-                    g = row.geometry
-                    if g is None or not getattr(g, "is_valid", True):
-                        continue
-                    if g.geom_type == "Point":
-                        geoms.append(g)
-                    elif g.geom_type == "Polygon":
-                        geoms.append(g)
-                    elif g.geom_type == "MultiPolygon":
-                        for poly in g.geoms:
-                            if poly.is_valid and not poly.is_empty:
-                                geoms.append(poly)
-        except Exception as e:
-            self.logger.warning(f"Загрузка подстанций OSM: {e}")
-        return geoms
-
-    def get_power_substation_buffer_union(self, buildings):
-        """
-        Возвращает объединённую геометрию буферов (POWER_SUBSTATION_BUFFER_M м) вокруг всех
-        подстанций/энергообъектов: из зданий с power=* и из OSM (power=substation и др.).
-        Используется для жёсткого исключения кандидатов гаража/ТО из этой зоны.
-        Returns: Shapely geometry (union) или None.
-        """
-        if buildings is None or len(buildings) == 0:
-            return None
-        try:
-            buildings = buildings.to_crs("EPSG:4326")
-            power_geoms = []
-            buffer_deg = self.POWER_SUBSTATION_BUFFER_M * self.NO_FLY_BUFFER_DEGREES_PER_M
-            for _, row in buildings.iterrows():
-                geom = row.geometry
-                if geom is None or not getattr(geom, "is_valid", True):
-                    continue
-                if str(row.get("power") or "").lower().strip() in self.EXCLUDE_POWER_TAGS:
-                    try:
-                        power_geoms.append(geom.buffer(buffer_deg))
-                    except Exception:
-                        continue
-            bbox_osm = (buildings.total_bounds[3], buildings.total_bounds[1], buildings.total_bounds[2], buildings.total_bounds[0])
-            for g in self._load_power_substation_geometries(bbox_osm, "EPSG:4326"):
-                try:
-                    power_geoms.append(g.buffer(buffer_deg))
-                except Exception:
-                    continue
-            if not power_geoms:
-                return None
-            return unary_union(power_geoms)
-        except Exception as e:
-            self.logger.warning(f"get_power_substation_buffer_union: {e}")
-            return None
-
-    def _load_industrial_and_parking_areas(self, bbox_osm, crs_4326):
-        """
-        Загружает полигоны промзон и парковок/площадок из OSM по bbox.
-        bbox_osm: (north, south, east, west).
-        Returns: dict with 'industrial': list of Shapely polygons (4326), 'parking': list of (centroid Point or polygon),
-                 'industrial_forbidden': list of polygons территории заводов/опасных объектов (не ставить ТО/гараж).
-        """
-        north, south, east, west = bbox_osm
-        industrial = []
-        industrial_forbidden = []
-        parking = []
-        try:
-            # Промзоны: landuse=industrial, warehouse; здания industrial/warehouse
-            for tags in (
-                {"landuse": ["industrial", "warehouse"]},
-                {"building": ["industrial", "warehouse", "factory", "manufacture"]},
-            ):
-                gdf = ox.features_from_bbox(bbox=(north, south, east, west), tags=tags)
-                if gdf is not None and len(gdf) > 0:
-                    if gdf.crs is None:
-                        gdf = gdf.set_crs("EPSG:4326")
-                    gdf = gdf.to_crs(crs_4326)
-                    for _, row in gdf.iterrows():
-                        g = row.geometry
-                        if g is None or not getattr(g, "is_valid", True):
-                            continue
-                        # Отбрасываем энергообъекты: подстанции и пр. (power=*)
-                        power_tag = str(row.get("power") or "").lower().strip()
-                        if power_tag in self.EXCLUDE_POWER_TAGS:
-                            continue
-                        is_forbidden = self._industrial_polygon_is_forbidden(row)
-                        if g.geom_type == "Polygon":
-                            if is_forbidden:
-                                industrial_forbidden.append(g)
-                            else:
-                                industrial.append(g)
-                        elif g.geom_type == "MultiPolygon":
-                            for poly in g.geoms:
-                                if poly.is_valid and not poly.is_empty:
-                                    if is_forbidden:
-                                        industrial_forbidden.append(poly)
-                                    else:
-                                        industrial.append(poly)
-        except Exception as e:
-            self.logger.warning(f"Загрузка промзон OSM: {e}")
-        try:
-            # Парковки и площадки: amenity=parking, landuse=commercial (часто с парковками)
-            for tags in (
-                {"amenity": "parking"},
-                {"parking": True},
-            ):
-                gdf = ox.features_from_bbox(bbox=(north, south, east, west), tags=tags)
-                if gdf is not None and len(gdf) > 0:
-                    if gdf.crs is None:
-                        gdf = gdf.set_crs("EPSG:4326")
-                    gdf = gdf.to_crs(crs_4326)
-                    for _, row in gdf.iterrows():
-                        g = row.geometry
-                        if g is None or not getattr(g, "is_valid", True):
-                            continue
-                        if g.geom_type == "Point":
-                            parking.append(g)
-                        else:
-                            try:
-                                c = g.centroid
-                                if not c.is_empty:
-                                    parking.append(c)
-                            except Exception:
-                                pass
-        except Exception as e:
-            self.logger.warning(f"Загрузка парковок OSM: {e}")
-        return {"industrial": industrial, "parking": parking, "industrial_forbidden": industrial_forbidden}
-
     def _building_footprint_area_m2(self, buildings: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         """Добавляет колонку area_m2 — площадь footprint здания в м² (в UTM)."""
         if buildings is None or len(buildings) == 0:
@@ -1024,276 +780,6 @@ class DataService:
             out = buildings.copy()
             out["area_m2"] = 0.0
             return out
-
-    def _point_outside_no_fly(self, pt, no_fly_zones, buffer_deg: float) -> bool:
-        """True, если точка вне всех no-fly зон с заданным буфером."""
-        if no_fly_zones is None:
-            return True
-        if isinstance(no_fly_zones, gpd.GeoDataFrame) and no_fly_zones.empty:
-            return True
-        if isinstance(no_fly_zones, list) and len(no_fly_zones) == 0:
-            return True
-        try:
-            geoms = []
-            if isinstance(no_fly_zones, gpd.GeoDataFrame) and len(no_fly_zones) > 0:
-                geoms = list(no_fly_zones.geometry)
-            elif isinstance(no_fly_zones, list):
-                geoms = [z.geometry if hasattr(z, "geometry") else z for z in no_fly_zones]
-            for g in geoms:
-                if g is None:
-                    continue
-                buf = g.buffer(buffer_deg) if buffer_deg != 0 else g
-                if buf.contains(pt) or buf.intersects(pt):
-                    return False
-            return True
-        except Exception:
-            return True
-
-    def get_station_candidates(
-        self,
-        buildings: gpd.GeoDataFrame,
-        city_boundary,
-        no_fly_zones,
-        road_graph,
-        *,
-        station_type: str = "rooftop",
-        no_fly_buffer_m: float = 50.0,
-        min_roof_area_m2: float = None,
-        min_ground_area_m2: float = None,
-    ) -> gpd.GeoDataFrame:
-        """
-        Шаг A: формирует кандидатов размещения станций.
-        station_type: 'rooftop' | 'ground' | 'garage' | 'to'
-        Кандидаты проходят: вне no-fly + буфер, минимальная площадка/доступность.
-        """
-        if buildings is None or len(buildings) == 0:
-            return gpd.GeoDataFrame()
-        buffer_deg = no_fly_buffer_m * self.NO_FLY_BUFFER_DEGREES_PER_M
-        min_roof = min_roof_area_m2 if min_roof_area_m2 is not None else self.ROOF_MIN_AREA_M2
-        min_ground = min_ground_area_m2 if min_ground_area_m2 is not None else self.GROUND_MIN_AREA_M2
-
-        buildings = buildings.to_crs("EPSG:4326")
-        if city_boundary is not None:
-            try:
-                crs_utm = buildings.estimate_utm_crs()
-                buildings_proj = buildings.to_crs(crs_utm)
-                boundary_proj = gpd.GeoSeries([city_boundary], crs="EPSG:4326").to_crs(crs_utm).iloc[0]
-                mask = buildings_proj.geometry.centroid.within(boundary_proj)
-                buildings = buildings[mask]
-            except Exception as e:
-                self.logger.warning(f"Фильтр зданий по границе: {e}")
-        if len(buildings) == 0:
-            return gpd.GeoDataFrame()
-
-        # Объединённая геометрия зданий, чтобы не ставить станции прямо "на крыше" действующих объектов
-        buildings_union = None
-        try:
-            geoms = [g for g in buildings.geometry if g is not None and getattr(g, "is_valid", True)]
-            if geoms:
-                buildings_union = unary_union(geoms)
-        except Exception:
-            buildings_union = None
-
-        # Буфер вокруг подстанций/энергообъектов (power=*), чтобы не ставить гаражи/ТО ближе заданного расстояния.
-        # Учитываем и здания с power=*, и отдельные объекты power=* из OSM (подстанции часто не в слое зданий).
-        power_buffer_union = None
-        try:
-            power_geoms = []
-            buffer_deg = self.POWER_SUBSTATION_BUFFER_M * self.NO_FLY_BUFFER_DEGREES_PER_M
-            for _idx, row in buildings.iterrows():
-                geom = row.geometry
-                if geom is None or not getattr(geom, "is_valid", True):
-                    continue
-                power_tag = str(row.get("power") or "").lower().strip()
-                if power_tag in self.EXCLUDE_POWER_TAGS:
-                    try:
-                        power_geoms.append(geom.buffer(buffer_deg))
-                    except Exception:
-                        continue
-            # Подстанции из OSM (power=substation и др.) — часто отдельные объекты, не в buildings
-            bbox_osm = (buildings.total_bounds[3], buildings.total_bounds[1], buildings.total_bounds[2], buildings.total_bounds[0])
-            for g in self._load_power_substation_geometries(bbox_osm, "EPSG:4326"):
-                try:
-                    power_geoms.append(g.buffer(buffer_deg))
-                except Exception:
-                    continue
-            if power_geoms:
-                power_buffer_union = unary_union(power_geoms)
-        except Exception:
-            power_buffer_union = None
-
-        rows = []
-        if station_type == "rooftop":
-            buildings = self._building_footprint_area_m2(buildings)
-            for idx, row in buildings.iterrows():
-                geom = row.geometry
-                if geom is None or not geom.is_valid:
-                    continue
-                # Не используем здания с power=* (подстанции, энергообъекты)
-                power_tag = str(row.get("power") or "").lower().strip()
-                if power_tag in self.EXCLUDE_POWER_TAGS:
-                    continue
-                area = row.get("area_m2", 0) or 0
-                if area < min_roof:
-                    continue
-                tag = row.get("building")
-                tag_str = str(tag).lower().strip() if tag is not None and not (isinstance(tag, float) and pd.isna(tag)) else ""
-                # Только многоэтажки: явный тег из ALLOWED_ROOF_BUILDING_TAGS (без yes/true)
-                if not tag_str or tag_str not in self.ALLOWED_ROOF_BUILDING_TAGS:
-                    continue
-                centroid = geom.centroid
-                if not self._point_outside_no_fly(centroid, no_fly_zones, buffer_deg):
-                    continue
-                rows.append({
-                    "geometry": centroid,
-                    "station_type": "rooftop",
-                    "area_m2": area,
-                    "source": "building",
-                })
-        elif station_type == "ground":
-            bbox = (buildings.total_bounds[3], buildings.total_bounds[1], buildings.total_bounds[2], buildings.total_bounds[0])
-            zones = self._load_industrial_and_parking_areas(bbox, "EPSG:4326")
-            # Наземные: центроиды парковок и промзон (площадка ≥ min_ground)
-            for g in zones["parking"]:
-                if g is None:
-                    continue
-                pt = g if g.geom_type == "Point" else g.centroid
-                if not self._point_outside_no_fly(pt, no_fly_zones, buffer_deg):
-                    continue
-                try:
-                    area = float(g.area) if hasattr(g, "area") and g.geom_type != "Point" else min_ground * 2
-                    if g.geom_type == "Point":
-                        area = min_ground * 2
-                    else:
-                        crs_utm = gpd.GeoSeries([g], crs="EPSG:4326").estimate_utm_crs()
-                        area = gpd.GeoSeries([g], crs="EPSG:4326").to_crs(crs_utm).iloc[0].area
-                    if area < min_ground and g.geom_type != "Point":
-                        continue
-                except Exception:
-                    area = min_ground * 2
-                rows.append({
-                    "geometry": pt,
-                    "station_type": "ground",
-                    "area_m2": area,
-                    "source": "parking",
-                })
-            for poly in zones["industrial"]:
-                try:
-                    c = poly.centroid
-                    if not self._point_outside_no_fly(c, no_fly_zones, buffer_deg):
-                        continue
-                    # Не используем промзоны, которые являются подстанциями/энергообъектами (power=*)
-                    try:
-                        # У промзон из OSM теги лежат в properties GeoDataFrame; при загрузке выше мы их не сохраняем,
-                        # поэтому фильтруем по геометрии позже через пересечение с подстанциями нельзя без доп. запросов.
-                        # Здесь оставляем проверку только по buildings_union (см. ниже), а power-теги режем в _load_industrial_and_parking_areas.
-                        pass
-                    except Exception:
-                        pass
-                    # Не ставим гаражи/ТО прямо на зданиях (электробудки, корпуса заводов и т.п.)
-                    if buildings_union is not None:
-                        try:
-                            if buildings_union.contains(c) or buildings_union.intersects(c):
-                                continue
-                        except Exception:
-                            pass
-                    crs_utm = gpd.GeoSeries([poly], crs="EPSG:4326").estimate_utm_crs()
-                    area = gpd.GeoSeries([poly], crs="EPSG:4326").to_crs(crs_utm).iloc[0].area
-                    if area < min_ground:
-                        continue
-                    rows.append({
-                        "geometry": c,
-                        "station_type": "ground",
-                        "area_m2": area,
-                        "source": "industrial",
-                    })
-                except Exception:
-                    continue
-        elif station_type in ("garage", "to"):
-            # Гаражи/ТО: здания внутри промзон (industrial), без парковок и тяжёлых/опасных объектов.
-            # Территории заводов (industrial_forbidden) исключаем — не ставим ТО/гараж на заводах.
-            bbox = (buildings.total_bounds[3], buildings.total_bounds[1], buildings.total_bounds[2], buildings.total_bounds[0])
-            zones = self._load_industrial_and_parking_areas(bbox, "EPSG:4326")
-            industrial_polys = zones.get("industrial") or []
-            forbidden_polys = zones.get("industrial_forbidden") or []
-            if industrial_polys:
-                try:
-                    industrial_union = unary_union([g for g in industrial_polys if g is not None and getattr(g, "is_valid", True)])
-                except Exception:
-                    industrial_union = None
-            else:
-                industrial_union = None
-            if forbidden_polys:
-                try:
-                    industrial_forbidden_union = unary_union([g for g in forbidden_polys if g is not None and getattr(g, "is_valid", True)])
-                except Exception:
-                    industrial_forbidden_union = None
-            else:
-                industrial_forbidden_union = None
-
-            buildings_industrial = self._building_footprint_area_m2(buildings)
-            for idx, row in buildings_industrial.iterrows():
-                geom = row.geometry
-                if geom is None or not geom.is_valid:
-                    continue
-                c = geom.centroid
-                # Здание должно лежать внутри промзоны
-                if industrial_union is not None:
-                    try:
-                        if not industrial_union.contains(c) and not industrial_union.touches(c):
-                            continue
-                    except Exception:
-                        pass
-                # Не ставим ТО/гараж на территории завода (заводские полигоны из OSM)
-                if industrial_forbidden_union is not None:
-                    try:
-                        if industrial_forbidden_union.contains(c) or industrial_forbidden_union.intersects(c):
-                            continue
-                    except Exception:
-                        pass
-                # Здание с power=*, в том числе подстанции, и зона вокруг них (10 м) исключаем
-                power_tag = str(row.get("power") or "").lower().strip()
-                if power_tag in self.EXCLUDE_POWER_TAGS:
-                    continue
-                if power_buffer_union is not None:
-                    try:
-                        if power_buffer_union.contains(c) or power_buffer_union.intersects(c):
-                            continue
-                    except Exception:
-                        pass
-                # Фильтр по типу здания
-                tag = row.get("building")
-                tag_str = str(tag).lower().strip() if tag is not None and not (isinstance(tag, float) and pd.isna(tag)) else ""
-                if tag_str and tag_str not in self.ALLOWED_INDUSTRIAL_BUILDING_TAGS:
-                    continue
-                # Избегаем опасных/крупных объектов по ключевым словам в name/industrial/craft/amenity
-                text_fields = []
-                for key in ("name", "industrial", "craft", "amenity", "man_made", "operator", "brand"):
-                    val = row.get(key) if hasattr(row, "get") else None
-                    if val is None or (isinstance(val, float) and pd.isna(val)):
-                        continue
-                    text_fields.append(str(val).lower())
-                combined = " ".join(text_fields)
-                if combined:
-                    if any(k in combined for k in self.FORBIDDEN_INDUSTRIAL_KEYWORDS):
-                        continue
-                # Площадь площадки/здания
-                area = row.get("area_m2", 0) or 0
-                if area < min_ground:
-                    continue
-                if not self._point_outside_no_fly(c, no_fly_zones, buffer_deg):
-                    continue
-                rows.append({
-                    "geometry": c,
-                    "station_type": "garage" if station_type == "garage" else "to",
-                    "area_m2": area,
-                    "source": "industrial_building",
-                })
-        if not rows:
-            return gpd.GeoDataFrame()
-        gdf = gpd.GeoDataFrame(rows, crs="EPSG:4326")
-        self.logger.info(f"Кандидаты размещения ({station_type}): {len(gdf)}")
-        return gdf
 
     def get_demand_points_weighted(
         self,
@@ -1372,6 +858,8 @@ class DataService:
                         return (gpd.GeoDataFrame(), gpd.GeoDataFrame()) if return_hulls else gpd.GeoDataFrame()
             except Exception as e:
                 self.logger.warning(f"Фильтрация зданий по границе города: {e}")
+        # Площадь footprint для весов (МКД: подъезды; коммерция: area × levels).
+        buildings = self._building_footprint_area_m2(buildings)
         # Зоны спроса — только по домам (центроиды зданий). Дороги не используются.
         # Дополнительно помечаем тип здания и вес спроса по типу.
         def _get_building_levels(row) -> Optional[int]:
@@ -1397,6 +885,33 @@ class DataService:
                 except (ValueError, TypeError):
                     pass
             return None
+
+        def _apartments_per_floor_mkd(levels: int) -> int:
+            """Квартир на этаж по этажности МКД (надземные этажи)."""
+            if levels <= 5:
+                return 3
+            if levels <= 9:
+                return 4
+            if levels <= 16:
+                return 5
+            return 6
+
+        def _entrances_count_mkd(row, area_m2: float) -> int:
+            """Число подъездов: тег OSM или max(1, round(area_m² / 300))."""
+            for key in ("building:entrances", "entrances"):
+                val = row.get(key) if hasattr(row, "get") else None
+                if val is None or (isinstance(val, float) and pd.isna(val)):
+                    continue
+                try:
+                    s = str(val).strip().split()[0]
+                    n = int(float(s.replace(",", ".")))
+                    if n > 0:
+                        return n
+                except (ValueError, TypeError):
+                    continue
+            if area_m2 > 0:
+                return max(1, int(round(area_m2 / 300.0)))
+            return 1
 
         def _building_demand_type(row) -> str:
             """
@@ -1464,21 +979,29 @@ class DataService:
         def _building_demand_weight(row) -> float:
             """
             Вес спроса по типу здания:
-            - apartment (МКД): 5
-            - retail (торговые/ТЦ): 4
-            - office (коммерция/офисы): 3
-            - industrial (склады/промзона): 2
-            - private / public / other: 1
+            - apartment (МКД): кв_на_этаж(levels) * levels * entrances;
+              entrances из тега или max(1, round(area_m² / 300)).
+            - private: 1 этаж — 1.2; 2+ этажей — 1.5.
+            - retail / office / industrial / public: area_m² * levels * 0.01.
+            - other: 1.
             """
             t = _building_demand_type(row)
+            area_m2 = float(row.get("area_m2", 0) or 0)
+            levels = _get_building_levels(row)
             if t == "apartment":
-                return 5.0
-            if t == "retail":
-                return 4.0
-            if t == "office":
-                return 3.0
-            if t == "industrial":
-                return 2.0
+                lv = max(1, levels if levels is not None else 5)
+                apf = _apartments_per_floor_mkd(lv)
+                ent = _entrances_count_mkd(row, area_m2)
+                return float(apf * lv * ent)
+            if t == "private":
+                if levels is None:
+                    return 1.2
+                lv = max(1, levels)
+                return 1.2 if lv <= 1 else 1.5
+            if t in ("retail", "office", "industrial", "public"):
+                lv = max(1, levels if levels is not None else 1)
+                w = area_m2 * lv * 0.01
+                return float(w) if w > 0 else 1.0
             return 1.0
 
         pts_list = []
@@ -1525,6 +1048,8 @@ class DataService:
                 from pyproj import Transformer
                 eps_m = dbscan_eps_m
                 inv = Transformer.from_crs(crs_utm, "EPSG:4326", always_xy=True)
+                # Радиус круга вокруг центроида здания при сборке hull (тот же порядок, что hull_radius_m ниже).
+                hull_buf_m = max(30.0, float(eps_m) * float(hull_radius_factor))
                 # Шаг сетки внутри кластера (в метрах) для fill_clusters.
                 # По умолчанию делаем сетку существенно реже eps, чтобы не взрывать число точек.
                 if cluster_fill_step_m is not None:
@@ -1536,160 +1061,259 @@ class DataService:
                     fill_step_m = max(400.0, float(eps_m) * 2.0)
                 from shapely.ops import transform as sh_transform
 
-                # Кластеризуем отдельно по каждому типу спроса (apartment / office / private / other).
-                unique_types = set(base_types.tolist()) if base_types.size > 0 else {None}
-                for demand_type in unique_types:
-                    if demand_type is None:
-                        mask_type = np.ones(len(base_points), dtype=bool)
-                    else:
-                        mask_type = base_types == demand_type
-                    if not mask_type.any():
-                        continue
-                    pts_type = pts_utm[mask_type]
-                    if pts_type.shape[0] < 2:
-                        continue
-                    weights_type = base_weights[mask_type]
+                from sklearn.cluster import KMeans, MiniBatchKMeans
+                MAX_WEIGHT_PER_HULL = 10000.0
+                # За один вызов KMeans не дробим на тысячи кластеров — только порциями, иначе 80k+ точек «висит» часами.
+                MAX_K_PER_SPLIT = 48
+                # Доп. порог по разбросу центроидов зданий (без буфера hull): только при очень вытянутых группах.
+                MAX_RADIUS_PER_HULL_M = max(500.0, float(eps_m) * 4.0)
+                REGION_EPS_M = max(600.0, float(eps_m) * 6.0)
+                REGION_MIN_SAMPLES = max(6, int(dbscan_min_samples) * 2)
 
-                    clustering = DBSCAN(eps=eps_m, min_samples=dbscan_min_samples, metric="euclidean").fit(pts_type)
-                    labels = np.array(clustering.labels_, dtype=int)
-                    cluster_ids = sorted(set(labels) - {-1})
-                    n_noise = int((labels == -1).sum())
-                    # Точки-шум (label -1) привязываем к ближайшему кластеру того же типа, чтобы все здания попали в кластер
-                    if n_noise > 0 and cluster_ids:
-                        centroids = {}
-                        for lid in cluster_ids:
-                            mask_lid = labels == lid
-                            centroids[lid] = np.array(pts_type[mask_lid].mean(axis=0))
-                        noise_idx = np.where(labels == -1)[0]
-                        for i in noise_idx:
-                            pt = pts_type[i]
-                            best_lid = min(cluster_ids, key=lambda lid: float(np.sum((pt - centroids[lid]) ** 2)))
-                            labels[i] = best_lid
-                        self.logger.info(
-                            f"Точки-шум (тип={demand_type}): {n_noise} привязаны к ближайшему кластеру"
+                def _cluster_radius_m(sub_pts: np.ndarray) -> float:
+                    """Макс. расстояние от среднего центроида зданий до самой дальней точки (м)."""
+                    if len(sub_pts) <= 1:
+                        return 0.0
+                    c = np.mean(sub_pts, axis=0)
+                    d2 = np.sum((sub_pts - c) ** 2, axis=1)
+                    return float(np.sqrt(float(np.max(d2)))) if len(d2) > 0 else 0.0
+
+                def _spatial_kmeans_labels(sub_pts: np.ndarray, k: int) -> np.ndarray:
+                    """KMeans / MiniBatchKMeans по координатам в метрах; устойчиво на десятках тысяч точек."""
+                    n = len(sub_pts)
+                    k = int(max(1, min(k, n)))
+                    if k <= 1 or n <= 1:
+                        return np.zeros(n, dtype=int)
+                    if n > 3500 or k > 24:
+                        bs = min(4096, max(1024, n // 5))
+                        mb = MiniBatchKMeans(
+                            n_clusters=k,
+                            random_state=42,
+                            batch_size=bs,
+                            n_init=3,
+                            max_iter=200,
+                            reassignment_ratio=0.02,
                         )
-                    elif n_noise > 0:
-                        self.logger.info(
-                            f"Точки-шум (тип={demand_type}): {n_noise} — кластеров нет, зона спроса не создаётся"
-                        )
+                        return np.asarray(mb.fit(sub_pts).labels_, dtype=int)
+                    n_init = 5 if n < 8000 else 3
+                    km = KMeans(n_clusters=k, random_state=42, n_init=n_init, max_iter=300)
+                    return np.asarray(km.fit(sub_pts).labels_, dtype=int)
 
-                    MAX_WEIGHT_PER_HULL = 300  # макс. вес одной области спроса (и точек в ней)
+                def _partition_by_target_weight(indices):
+                    """
+                    Рекурсивно режем набор зданий так, чтобы итоговые кластеры:
+                    - по весу не превышали 10000 (сумма весов зданий);
+                    - по возможности были ~ ceil(W/10000) штук на район (KMeans в метрах).
+                    """
+                    if len(indices) == 0:
+                        return []
+                    sub_pts = pts_utm[indices]
+                    sub_w = base_weights[indices]
+                    total_w = float(sub_w.sum())
+                    radius_m = _cluster_radius_m(sub_pts)
+                    n_pts = len(indices)
+                    need_w = total_w > MAX_WEIGHT_PER_HULL
+                    need_r = radius_m > MAX_RADIUS_PER_HULL_M
+                    if (not need_w and not need_r) or n_pts <= 1:
+                        return [indices]
+                    k_w = int(np.ceil(total_w / MAX_WEIGHT_PER_HULL))
+                    k_w = max(1, k_w)
+                    k = k_w
+                    if need_r:
+                        k = max(k, 2)
+                    if need_w:
+                        k = max(k, 2)
+                    k = min(k, n_pts, MAX_K_PER_SPLIT)
+                    if k < 2 and n_pts > 1 and (need_w or need_r):
+                        k = 2
+                    labels = _spatial_kmeans_labels(sub_pts, k)
+                    out = []
+                    for j in sorted(set(np.asarray(labels, dtype=int).tolist())):
+                        m = labels == j
+                        sub_idx = indices[m]
+                        if len(sub_idx) > 0:
+                            out.extend(_partition_by_target_weight(sub_idx))
+                    return out
 
-                    def _build_one_region(sub_pts, sub_weights, do_fill):
-                        """Строит одну область (hull) по точкам sub_pts и при необходимости заполняет сеткой."""
-                        if len(sub_pts) < 1:
-                            return
-                        sub_w = float(sub_weights.sum())
-                        cx, cy = sub_pts.mean(axis=0)
-                        lon_c, lat_c = inv.transform(cx, cy)
-                        rows.append({
-                            "geometry": Point(lon_c, lat_c),
-                            "weight": min(MAX_WEIGHT_PER_HULL, int(round(sub_w))),
-                            "is_cluster_fill": False,
-                            "demand_type": str(demand_type) if demand_type is not None else None,
-                        })
-                        try:
-                            # Граница полигона — по уменьшенному радиусу, чтобы не захватывать соседние типы зданий (МКД/частный сектор).
-                            hull_radius_m = max(30.0, float(eps_m) * float(hull_radius_factor))
-                            circles_utm = [Point(float(x), float(y)).buffer(hull_radius_m) for x, y in sub_pts]
-                            region_utm = unary_union(circles_utm)
-                            if region_utm is None or region_utm.is_empty:
-                                return
-                            region_utm = region_utm.simplify(2.0)
-                            region_4326 = sh_transform(lambda x, y: inv.transform(x, y), region_utm)
-                            if (city_boundary is not None and hasattr(city_boundary, "is_valid")
-                                    and getattr(city_boundary, "is_valid", True)
-                                    and region_4326.is_valid and not region_4326.is_empty):
-                                try:
-                                    clipped = region_4326.intersection(city_boundary)
-                                    if clipped is not None and not clipped.is_empty and clipped.is_valid:
-                                        region_4326 = clipped
-                                except Exception:
-                                    pass
-                            if (no_fly_union is not None and not no_fly_union.is_empty
-                                    and region_4326.is_valid and not region_4326.is_empty):
-                                try:
-                                    region_4326 = region_4326.difference(no_fly_union)
-                                    if region_4326.is_empty:
-                                        return
-                                except Exception:
-                                    pass
-                            if region_4326.is_valid and not region_4326.is_empty:
-                                if return_hulls and hull_rows is not None:
-                                    hull_rows.append({
-                                        "geometry": region_4326,
-                                        "weight": min(MAX_WEIGHT_PER_HULL, int(round(sub_w))),
-                                        "cluster_id": len(hull_rows),
-                                        "demand_type": str(demand_type) if demand_type is not None else None,
-                                    })
-                                if do_fill and fill_clusters:
-                                    try:
-                                        minx, miny, maxx, maxy = region_4326.bounds
-                                        if maxx > minx and maxy > miny:
-                                            lat_center = (miny + maxy) / 2.0
-                                            step_km = fill_step_m / 1000.0 or eps_m / 1000.0
-                                            deg_lat = step_km / 111.0
-                                            deg_lon = step_km / (111.0 * max(0.2, np.cos(np.radians(lat_center))))
-                                            step_x, step_y = max(deg_lon, 1e-5), max(deg_lat, 1e-5)
-                                            fill_count, max_fill_points = 0, 500
-                                            x = float(minx)
-                                            while x <= maxx:
-                                                y = float(miny)
-                                                while y <= maxy:
-                                                    if region_4326.contains(Point(x, y)):
-                                                        rows.append({"geometry": Point(x, y), "weight": 1, "is_cluster_fill": True, "demand_type": str(demand_type) if demand_type is not None else None})
-                                                        fill_count += 1
-                                                        if fill_count >= max_fill_points:
-                                                            break
-                                                    y += step_y
-                                                x += step_x
-                                                if fill_count >= max_fill_points:
-                                                    break
-                                    except Exception as e_fill:
-                                        self.logger.debug(f"fill_clusters: {e_fill}")
-                        except Exception as e:
-                            self.logger.debug(f"Область кластера (type={demand_type}): {e}")
-
-                    for lid in cluster_ids:
-                        mask = labels == lid
-                        cluster_pts = pts_type[mask]
-                        n_buildings = len(cluster_pts)
-                        if n_buildings < min_buildings_for_zone:
-                            continue
-                        weights_cluster = np.asarray(weights_type[mask], dtype=float)
-                        weight = float(weights_cluster.sum())
-
-                        if weight <= MAX_WEIGHT_PER_HULL and n_buildings <= MAX_WEIGHT_PER_HULL:
-                            _build_one_region(cluster_pts, weights_cluster, do_fill=True)
+                def _merge_neighboring_weight_groups(groups):
+                    """Сливаем ближайшие по центроиду группы, если суммарный вес ≤ 10000 (меньше кластеров)."""
+                    if len(groups) <= 1:
+                        return groups
+                    groups = [np.asarray(g, dtype=int) for g in groups if len(g) > 0]
+                    try:
+                        from scipy.spatial import cKDTree
+                    except Exception:
+                        cKDTree = None
+                    max_merge_iters = min(5000, max(200, len(groups) * 3))
+                    it = 0
+                    while len(groups) > 1 and it < max_merge_iters:
+                        it += 1
+                        weights = np.array([float(base_weights[gi].sum()) for gi in groups], dtype=float)
+                        cents = np.stack([pts_utm[gi].mean(axis=0) for gi in groups], axis=0)
+                        best_i, best_j = None, None
+                        best_d = None
+                        if cKDTree is not None and len(groups) > 80:
+                            tree = cKDTree(cents)
+                            kn = min(12, len(groups))
+                            dists, nbrs = tree.query(cents, k=kn)
+                            for i in range(len(groups)):
+                                for jj in range(kn):
+                                    j = int(nbrs[i, jj])
+                                    if j == i or j < i:
+                                        continue
+                                    if weights[i] + weights[j] > MAX_WEIGHT_PER_HULL + 1e-9:
+                                        continue
+                                    d = float(dists[i, jj]) ** 2 if dists.ndim == 2 else float("inf")
+                                    if best_d is None or d < best_d:
+                                        best_d = d
+                                        best_i, best_j = i, j
                         else:
-                            # Крупный кластер: дробим компактно по пространству (K-means), а не полосками по X
-                            from sklearn.cluster import KMeans
+                            for i in range(len(groups)):
+                                for j in range(i + 1, len(groups)):
+                                    if weights[i] + weights[j] > MAX_WEIGHT_PER_HULL + 1e-9:
+                                        continue
+                                    d = float(np.sum((cents[i] - cents[j]) ** 2))
+                                    if best_d is None or d < best_d:
+                                        best_d = d
+                                        best_i, best_j = i, j
+                        if best_i is None:
+                            break
+                        merged = np.concatenate([groups[best_i], groups[best_j]])
+                        groups = [g for t, g in enumerate(groups) if t not in (best_i, best_j)]
+                        groups.append(merged)
+                    return groups
 
-                            def _split_by_cap(pts, weights, cap):
-                                """Рекурсивно разбивает точки на группы с весом ≤ cap, по пространственной близости (K-means)."""
-                                if len(pts) == 0:
-                                    return []
-                                if float(weights.sum()) <= cap:
-                                    return [(pts, weights)]
-                                if len(pts) == 1:
-                                    return [(pts, weights)]
-                                k = min(2, len(pts) - 1)
-                                if k < 2:
-                                    return [(pts, weights)]
-                                km = KMeans(n_clusters=k, random_state=42, n_init=10).fit(pts)
-                                out = []
-                                for j in range(k):
-                                    mask = km.labels_ == j
-                                    sub_pts = pts[mask]
-                                    sub_w = weights[mask]
-                                    out.extend(_split_by_cap(sub_pts, sub_w, cap))
-                                return out
+                def _build_one_region(indices, region_id, subcluster_id, do_fill):
+                    if len(indices) < 1:
+                        return
+                    sub_pts = pts_utm[indices]
+                    sub_weights = base_weights[indices]
+                    sub_w = float(sub_weights.sum())
+                    n_b = len(sub_pts)
+                    cx, cy = sub_pts.mean(axis=0)
+                    lon_c, lat_c = inv.transform(cx, cy)
+                    rows.append({
+                        "geometry": Point(lon_c, lat_c),
+                        "weight": min(MAX_WEIGHT_PER_HULL, int(round(sub_w))),
+                        "n_buildings": int(n_b),
+                        "region_id": int(region_id),
+                        "subcluster_id": int(subcluster_id),
+                        "cluster_id": int(subcluster_id),
+                        "is_cluster_fill": False,
+                    })
+                    try:
+                        hull_radius_m = float(hull_buf_m)
+                        circles_utm = [Point(float(x), float(y)).buffer(hull_radius_m) for x, y in sub_pts]
+                        region_utm = unary_union(circles_utm)
+                        if region_utm is None or region_utm.is_empty:
+                            return
+                        region_utm = region_utm.simplify(2.0)
+                        region_4326 = sh_transform(lambda x, y: inv.transform(x, y), region_utm)
+                        if (city_boundary is not None and hasattr(city_boundary, "is_valid")
+                                and getattr(city_boundary, "is_valid", True)
+                                and region_4326.is_valid and not region_4326.is_empty):
+                            try:
+                                clipped = region_4326.intersection(city_boundary)
+                                if clipped is not None and not clipped.is_empty and clipped.is_valid:
+                                    region_4326 = clipped
+                            except Exception:
+                                pass
+                        if (no_fly_union is not None and not no_fly_union.is_empty
+                                and region_4326.is_valid and not region_4326.is_empty):
+                            try:
+                                region_4326 = region_4326.difference(no_fly_union)
+                                if region_4326.is_empty:
+                                    return
+                            except Exception:
+                                pass
+                        if region_4326.is_valid and not region_4326.is_empty:
+                            if return_hulls and hull_rows is not None:
+                                hull_rows.append({
+                                    "geometry": region_4326,
+                                    "weight": min(MAX_WEIGHT_PER_HULL, int(round(sub_w))),
+                                    "n_buildings": int(n_b),
+                                    "region_id": int(region_id),
+                                    "subcluster_id": int(subcluster_id),
+                                    "cluster_id": int(subcluster_id),
+                                })
+                            if do_fill and fill_clusters:
+                                try:
+                                    minx, miny, maxx, maxy = region_4326.bounds
+                                    if maxx > minx and maxy > miny:
+                                        lat_center = (miny + maxy) / 2.0
+                                        step_km = fill_step_m / 1000.0 or eps_m / 1000.0
+                                        deg_lat = step_km / 111.0
+                                        deg_lon = step_km / (111.0 * max(0.2, np.cos(np.radians(lat_center))))
+                                        step_x, step_y = max(deg_lon, 1e-5), max(deg_lat, 1e-5)
+                                        fill_count, max_fill_points = 0, 500
+                                        x = float(minx)
+                                        while x <= maxx:
+                                            y = float(miny)
+                                            while y <= maxy:
+                                                if region_4326.contains(Point(x, y)):
+                                                    rows.append({"geometry": Point(x, y), "weight": 1, "n_buildings": 0, "region_id": int(region_id), "subcluster_id": int(subcluster_id), "cluster_id": int(subcluster_id), "is_cluster_fill": True})
+                                                    fill_count += 1
+                                                    if fill_count >= max_fill_points:
+                                                        break
+                                                y += step_y
+                                            x += step_x
+                                            if fill_count >= max_fill_points:
+                                                break
+                                except Exception as e_fill:
+                                    self.logger.debug(f"fill_clusters: {e_fill}")
+                    except Exception as e:
+                        self.logger.debug(f"Область кластера: {e}")
 
-                            groups = _split_by_cap(cluster_pts, weights_cluster, MAX_WEIGHT_PER_HULL)
-                            for sub_pts, sub_weights in groups:
-                                if len(sub_pts) < 1:
-                                    continue
-                                _build_one_region(sub_pts, sub_weights, do_fill=False)
+                # Уровень 1: крупные «районные» кластеры только по пространственной близости.
+                self.logger.info(
+                    f"DBSCAN районов: {len(pts_utm)} зданий, eps={REGION_EPS_M:.0f} м, min_samples={REGION_MIN_SAMPLES}…"
+                )
+                _dbscan_kw = {"eps": REGION_EPS_M, "min_samples": REGION_MIN_SAMPLES, "metric": "euclidean"}
+                _dbscan_kw["n_jobs"] = -1
+                try:
+                    region_labels = np.array(DBSCAN(**_dbscan_kw).fit(pts_utm).labels_, dtype=int)
+                except TypeError:
+                    _dbscan_kw.pop("n_jobs", None)
+                    region_labels = np.array(DBSCAN(**_dbscan_kw).fit(pts_utm).labels_, dtype=int)
+                self.logger.info("DBSCAN районов завершён, разбиение по весу 10000…")
+                region_ids = sorted(set(region_labels) - {-1})
+                if not region_ids:
+                    # Если город разрежен — считаем весь набор одним районом и далее режем вторым уровнем.
+                    region_labels = np.zeros(len(pts_utm), dtype=int)
+                    region_ids = [0]
+
+                # Шум первого уровня привязываем к ближайшему району; если районов нет — отдельно как шум.
+                if np.any(region_labels == -1) and region_ids:
+                    region_centers = {}
+                    for rid in region_ids:
+                        m = region_labels == rid
+                        region_centers[rid] = np.array(pts_utm[m].mean(axis=0))
+                    for i_noise in np.where(region_labels == -1)[0]:
+                        pt = pts_utm[i_noise]
+                        best_rid = min(region_ids, key=lambda rid: float(np.sum((pt - region_centers[rid]) ** 2)))
+                        region_labels[i_noise] = best_rid
+
+                subcluster_seq = 0
+                for rid in sorted(set(region_labels) - {-1}):
+                    rid_mask = region_labels == rid
+                    region_indices = np.where(rid_mask)[0]
+                    if len(region_indices) < 1:
+                        continue
+
+                    # Уровень 2: без DBSCAN — иначе получается слишком много мелких кластеров.
+                    # Целимся в ~10000 веса на подкластер: k ≈ ceil(W/10000), KMeans в метрах + рекурсия + слияние соседей.
+                    groups = _partition_by_target_weight(region_indices)
+                    groups = _merge_neighboring_weight_groups(groups)
+                    for g_idx in groups:
+                        if len(g_idx) < 1:
+                            continue
+                        subcluster_seq += 1
+                        _build_one_region(
+                            g_idx,
+                            region_id=int(rid),
+                            subcluster_id=subcluster_seq,
+                            do_fill=(len(groups) == 1),
+                        )
             except Exception:
                 method = "grid"
                 hull_rows = None
@@ -1714,6 +1338,7 @@ class DataService:
                     trans_inv = Transformer.from_crs(crs_utm, "EPSG:4326", always_xy=True)
                 except Exception:
                     pass
+            _grid_cluster_seq = 0
             for (gx, gy), weight in cell_centers.items():
                 if cell_counts.get((gx, gy), 0) < min_buildings_for_zone:
                     continue  # одиночки в ячейке — выбросы, зону спроса не создаём
@@ -1723,7 +1348,13 @@ class DataService:
                     lon, lat = trans_inv.transform(gx, gy)
                 else:
                     lon, lat = float(gx), float(gy)
-                rows.append({"geometry": Point(lon, lat), "weight": weight})
+                rows.append({
+                    "geometry": Point(lon, lat),
+                    "weight": weight,
+                    "n_buildings": int(cell_counts.get((gx, gy), 0)),
+                    "cluster_id": int(_grid_cluster_seq),
+                })
+                _grid_cluster_seq += 1
         if not rows:
             if return_hulls:
                 return (gpd.GeoDataFrame(), gpd.GeoDataFrame())
@@ -1734,25 +1365,52 @@ class DataService:
         self.logger.info(f"Точки спроса ({method}): {len(gdf)}, сумма весов {gdf['weight'].sum()}")
 
         if return_hulls:
-            # Устраняем пересечения глобально для всех кластеров (включая разные demand_type),
+            # Устраняем пересечения глобально для всех кластеров,
             # чтобы полигоны кластеров не накладывались друг на друга.
+            # Без упрощения геометрии повторяющиеся difference + нарастающий unary_union
+            # при сотнях полигонов могут «висеть» на минуты и дольше (GEOS).
             if hull_rows:
                 try:
                     from shapely.ops import unary_union as shp_union
 
                     hulls_gdf = gpd.GeoDataFrame(hull_rows, crs="EPSG:4326")
-                    demand_type_col = "demand_type"
                     # Сортируем все кластеры по весу (от более тяжёлых к более лёгким)
                     sub = hulls_gdf.sort_values(by="weight", ascending=False).reset_index(drop=True)
+                    n_hulls = len(sub)
+                    # ~5–8 м в градусах (середина широты РФ); сильно уменьшает число вершин у buffer-union кругов.
+                    _hull_tol_deg = 6e-5
+
+                    def _prep_hull_geom(g):
+                        if g is None or g.is_empty:
+                            return g
+                        try:
+                            g = g.simplify(_hull_tol_deg, preserve_topology=True)
+                            if g is None or g.is_empty:
+                                return g
+                            return g.buffer(0)
+                        except Exception:
+                            return g
+
                     cleaned_parts = []
                     used_geom = None
-                    for idx, row in sub.iterrows():
+                    if n_hulls > 0:
+                        self.logger.info(
+                            f"Устранение пересечений hull-кластеров: {n_hulls} полигонов (упрощение ~{_hull_tol_deg:.0e}°)…"
+                        )
+                    for i, (idx, row) in enumerate(sub.iterrows()):
+                        if n_hulls > 400 and i > 0 and i % 250 == 0:
+                            self.logger.info(f"Пересечения hulls: обработано {i}/{n_hulls}")
                         geom = row.geometry
+                        if geom is None or geom.is_empty:
+                            continue
+                        geom = _prep_hull_geom(geom)
                         if geom is None or geom.is_empty:
                             continue
                         if used_geom is not None and not used_geom.is_empty:
                             try:
-                                geom = geom.difference(used_geom)
+                                ug = _prep_hull_geom(used_geom)
+                                if ug is not None and not ug.is_empty:
+                                    geom = geom.difference(ug)
                             except Exception:
                                 pass
                         if geom is None or geom.is_empty:
@@ -1760,23 +1418,25 @@ class DataService:
                         cleaned_parts.append({
                             "geometry": geom,
                             "weight": row["weight"],
-                            "demand_type": row.get(demand_type_col),
+                            "n_buildings": row.get("n_buildings"),
+                            "cluster_id": row.get("cluster_id"),
                         })
                         try:
                             used_geom = geom if used_geom is None else shp_union([used_geom, geom])
+                            if used_geom is not None and not used_geom.is_empty:
+                                used_geom = _prep_hull_geom(used_geom)
                         except Exception:
                             pass
                     hulls_gdf = gpd.GeoDataFrame(cleaned_parts, crs="EPSG:4326")
                     hulls_gdf = hulls_gdf[~hulls_gdf["geometry"].isna() & ~hulls_gdf["geometry"].is_empty].copy()
-                    hulls_gdf["cluster_id"] = range(len(hulls_gdf))
                 except Exception as e:
                     self.logger.warning(f"Не удалось устранить пересечения кластеров: {e}")
                     hulls_gdf = gpd.GeoDataFrame(hull_rows, crs="EPSG:4326")
             else:
                 hulls_gdf = gpd.GeoDataFrame()
-            # Вес областей спроса не должен превышать 300
+            # Вес областей спроса не должен превышать 10000
             if not hulls_gdf.empty and "weight" in hulls_gdf.columns:
-                hulls_gdf["weight"] = hulls_gdf["weight"].clip(upper=300).astype(int)
+                hulls_gdf["weight"] = hulls_gdf["weight"].clip(upper=10000).astype(int)
             return (gdf, hulls_gdf)
 
         return gdf
@@ -1840,658 +1500,6 @@ class DataService:
             return False  # без тега не считаем частным — тип определит квартал
         tag = str(tag).lower().strip()
         return tag in cls._PRIVATE_BUILDING_TAGS
-    
-    # Смещение точки высадки от линии дороги в сторону здания (~5 м), но не заходя на здание
-    OFFSET_FROM_ROAD_DEGREES = 0.00005
-    MIN_SHIFT_DEGREES = 0.000005  # ~0.5 м — минимум, ниже не смещаем
-
-    def _point_to_road(self, pt, edge_tree, edge_geoms):
-        """Проецирует точку на ближайшее ребро дороги. Возвращает (lon, lat) на дороге."""
-        if not edge_tree or not edge_geoms:
-            return pt.x, pt.y
-        nearest_idx = edge_tree.query_nearest(pt, return_distance=False)
-        if not (hasattr(nearest_idx, '__len__') and len(nearest_idx) > 0):
-            return pt.x, pt.y
-        i = int(nearest_idx.flat[0]) if hasattr(nearest_idx, 'flat') else int(nearest_idx[0])
-        line = edge_geoms[i]
-        try:
-            projected = line.interpolate(line.project(pt))
-            return projected.x, projected.y
-        except Exception:
-            return pt.x, pt.y
-
-    def _point_inside_any_building(self, pt, building_tree, building_geoms):
-        """True, если точка внутри хотя бы одного полигона здания."""
-        if not building_tree or not building_geoms:
-            return False
-        try:
-            candidates = building_tree.query(pt)
-            for c in (candidates if hasattr(candidates, '__iter__') and not isinstance(candidates, (int, float)) else [candidates]):
-                idx = int(c)
-                if idx < len(building_geoms) and building_geoms[idx].contains(pt):
-                    return True
-        except Exception:
-            pass
-        return False
-
-    def _shift_near_road_no_building(self, rx, ry, pt, building_tree, building_geoms):
-        """Смещает точку (rx,ry) с дороги в сторону pt, но не заходя на здания. Возвращает (lon, lat)."""
-        dx = pt.x - rx
-        dy = pt.y - ry
-        d = (dx * dx + dy * dy) ** 0.5
-        if d < 1e-9:
-            return rx, ry
-        shift = self.OFFSET_FROM_ROAD_DEGREES
-        while shift >= self.MIN_SHIFT_DEGREES:
-            lon_d = rx + shift * dx / d
-            lat_d = ry + shift * dy / d
-            delivery_pt = Point(lon_d, lat_d)
-            if not self._point_inside_any_building(delivery_pt, building_tree, building_geoms):
-                return lon_d, lat_d
-            shift *= 0.5
-        return rx, ry
-
-    # Кварталы из дорог: допустимая площадь в м² (в UTM)
-    BLOCK_MIN_AREA_M2 = 200.0
-    BLOCK_MAX_AREA_M2 = 2.0e6
-
-    def _get_blocks_from_roads(self, edge_geoms, city_boundary, crs_4326):
-        """
-        Строит полигоны кварталов из линий дорог (polygonize). Возвращает список полигонов в crs_4326,
-        отфильтрованных по площади и границе города.
-        """
-        if not edge_geoms:
-            return []
-        try:
-            polygons = list(polygonize(edge_geoms))
-        except Exception as e:
-            self.logger.warning(f"Ошибка polygonize дорог: {e}")
-            return []
-        if not polygons:
-            return []
-        try:
-            crs_utm = gpd.GeoSeries([polygons[0].centroid], crs=crs_4326).estimate_utm_crs()
-        except Exception:
-            crs_utm = "EPSG:32637"
-        result = []
-        boundary_geom = city_boundary if city_boundary is not None else None
-        for poly in polygons:
-            if not poly.is_valid or poly.is_empty:
-                continue
-            try:
-                poly_utm = gpd.GeoSeries([poly], crs=crs_4326).to_crs(crs_utm).iloc[0]
-                area_m2 = poly_utm.area
-            except Exception:
-                continue
-            if area_m2 < self.BLOCK_MIN_AREA_M2 or area_m2 > self.BLOCK_MAX_AREA_M2:
-                continue
-            if boundary_geom is not None:
-                try:
-                    if not poly.within(boundary_geom) and not poly.intersects(boundary_geom):
-                        continue
-                    # Оставляем только кварталы, центр которых внутри границы
-                    if not boundary_geom.contains(poly.centroid):
-                        continue
-                except Exception:
-                    continue
-            result.append(poly)
-        return result
-
-    # Если из дорог получилось мало кварталов — делим город сеткой
-    MIN_ROAD_BLOCKS_TO_USE = 8
-    GRID_CELL_SIZE_M = 350.0
-    GRID_MAX_CELLS = 500
-
-    def _get_grid_blocks_fallback(self, buildings, city_boundary, building_centroids, crs_4326):
-        """
-        Запасной вариант: сетка ячеек по городу. Ограничено GRID_MAX_CELLS для скорости.
-        """
-        if not building_centroids or not buildings.crs:
-            return []
-        b = buildings.total_bounds
-        try:
-            crs_utm = gpd.GeoSeries([Point((b[0] + b[2]) / 2, (b[1] + b[3]) / 2)], crs=crs_4326).estimate_utm_crs()
-        except Exception:
-            return []
-        try:
-            bounds_geom = city_boundary if city_boundary is not None else box(b[0], b[1], b[2], b[3])
-            bounds_gdf = gpd.GeoDataFrame(geometry=[bounds_geom], crs=crs_4326).to_crs(crs_utm)
-            minx, miny, maxx, maxy = bounds_gdf.total_bounds
-        except Exception:
-            return []
-        cell = self.GRID_CELL_SIZE_M
-        cells = []
-        x = minx
-        while x < maxx and len(cells) < self.GRID_MAX_CELLS:
-            y = miny
-            while y < maxy and len(cells) < self.GRID_MAX_CELLS:
-                poly_utm = box(x, y, x + cell, y + cell)
-                poly_4326 = gpd.GeoSeries([poly_utm], crs=crs_utm).to_crs(crs_4326).iloc[0]
-                for pt in building_centroids:
-                    if pt is None:
-                        continue
-                    try:
-                        if poly_4326.contains(pt) or poly_4326.intersects(pt):
-                            cells.append(poly_4326)
-                            break
-                    except Exception:
-                        pass
-                y += cell
-            x += cell
-        return cells
-
-    def _block_is_private_sector(self, block_poly, building_centroids, makes_non_private_list):
-        """Квартал — частный сектор, если в нём есть здания и ни одно не «делает квартал не частным» (нет МКД, школ, офисов и т.д.)."""
-        has_building = False
-        has_non_private = False
-        for pt, makes_np in zip(building_centroids, makes_non_private_list):
-            if pt is None:
-                continue
-            try:
-                if block_poly.contains(pt) or block_poly.intersects(pt):
-                    has_building = True
-                    if makes_np:
-                        has_non_private = True
-                        break
-            except Exception:
-                continue
-        return has_building and not has_non_private
-
-    def _four_corners_of_block(self, block_poly):
-        """Четыре точки на углах ограничивающего прямоугольника. Оставлено для совместимости."""
-        minx, miny, maxx, maxy = block_poly.bounds
-        return [
-            (minx, miny),
-            (maxx, miny),
-            (maxx, maxy),
-            (minx, maxy),
-        ]
-
-    def _block_corner_points(self, block_poly, max_corners=32):
-        """
-        Углы квартала — вершины полигона (контур), а не bbox.
-        Возвращает список (lon, lat). Для сложных полигонов ограничено max_corners.
-        """
-        try:
-            if block_poly is None or not block_poly.is_valid or block_poly.is_empty:
-                return []
-            if block_poly.geom_type == 'Polygon':
-                ring = block_poly.exterior
-                if ring is None:
-                    return []
-                coords = list(ring.coords)
-                if len(coords) <= 1:
-                    return []
-                # кольцо замкнуто: первый и последний совпадают — не дублируем
-                points = [(float(x), float(y)) for x, y in coords[:-1]]
-            elif block_poly.geom_type == 'MultiPolygon':
-                # берём самый большой полигон по площади
-                best = max(block_poly.geoms, key=lambda g: g.area if g.is_valid else 0)
-                return self._block_corner_points(best, max_corners)
-            else:
-                return []
-            if len(points) > max_corners:
-                # упрощаем: равномерно берём max_corners вершин
-                step = (len(points) - 1) / max(1, max_corners - 1)
-                indices = [min(int(round(i * step)), len(points) - 1) for i in range(max_corners)]
-                points = [points[i] for i in sorted(set(indices))]
-            return points
-        except Exception:
-            return []
-
-    def _load_entrances_bbox(self, bbox):
-        """Загружает точки подъездов (entrance=*) из OSM по bbox. (north, south, east, west)."""
-        try:
-            entrances = ox.features_from_bbox(bbox=bbox, tags={"entrance": True})
-            if entrances is not None and len(entrances) > 0:
-                if entrances.crs is None:
-                    entrances = entrances.set_crs("EPSG:4326")
-                def to_point(g):
-                    if g is None: return None
-                    if g.geom_type == 'Point': return g
-                    if g.geom_type == 'MultiPoint' and len(g.geoms) > 0: return g.geoms[0]
-                    return g.centroid
-                entrances = entrances.copy()
-                entrances['geometry'] = entrances.geometry.apply(to_point)
-                return entrances
-        except Exception as e:
-            self.logger.warning(f"Не удалось загрузить подъезды из OSM: {e}")
-        return gpd.GeoDataFrame()
-
-    def _load_landuse_residential_areas(self, bbox, city_boundary, crs_4326):
-        """
-        Загружает полигоны для частного сектора: landuse=residential/allotments и place=neighbourhood/suburb (полигоны).
-        """
-        north, south, east, west = bbox
-        polygons = []
-        for tags in (
-            {"landuse": ["residential", "allotments"]},
-            {"place": ["neighbourhood", "suburb"]},
-        ):
-            try:
-                gdf = ox.features_from_bbox(bbox=(north, south, east, west), tags=tags)
-                if gdf is None or len(gdf) == 0:
-                    continue
-                if gdf.crs is not None and gdf.crs != crs_4326:
-                    gdf = gdf.to_crs(crs_4326)
-                for _, row in gdf.iterrows():
-                    g = row.geometry
-                    if g is None or not getattr(g, "is_valid", True):
-                        continue
-                    if g.geom_type == "Polygon":
-                        polygons.append(g)
-                    elif g.geom_type == "MultiPolygon":
-                        for poly in g.geoms:
-                            if poly.is_valid and not poly.is_empty:
-                                polygons.append(poly)
-            except Exception as e:
-                self.logger.debug(f"Загрузка {tags}: {e}")
-        if polygons:
-            self.logger.info(f"Загружено полигонов landuse/place (частный сектор): {len(polygons)}")
-        if not polygons or city_boundary is None:
-            return polygons
-        filtered = []
-        for poly in polygons:
-            try:
-                if not poly.intersects(city_boundary):
-                    continue
-                if not city_boundary.contains(poly.centroid) and not poly.centroid.within(city_boundary):
-                    continue
-                filtered.append(poly)
-            except Exception:
-                continue
-        return filtered if filtered else polygons
-
-    def _landuse_area_is_private_sector(self, poly, building_centroids, makes_non_private_list):
-        """
-        Классификация: частный сектор, если в полигоне landuse нет высотных/не-частных зданий.
-        """
-        try:
-            prep_poly = prep(poly)
-        except Exception:
-            prep_poly = None
-        for pt, makes_np in zip(building_centroids, makes_non_private_list):
-            if pt is None or not makes_np:
-                continue
-            try:
-                if (prep_poly if prep_poly is not None else poly).contains(pt):
-                    return False
-            except Exception:
-                continue
-        return True
-
-    def get_delivery_points(
-        self,
-        buildings: gpd.GeoDataFrame,
-        road_graph,
-        city_boundary=None,
-    ) -> gpd.GeoDataFrame:
-        """
-        Точки высадки. Частный дом определяется автоматически: по тегу OSM (building=house, yes, detached и т.д.)
-        либо по попаданию в зону частного сектора (landuse=residential/allotments, кварталы без МКД/школ/офисов).
-        В частном секторе — только 4 точки на углах квартала; на остальные здания — по подъездам (МКД) или по одному.
-        """
-        if buildings is None or len(buildings) == 0:
-            return gpd.GeoDataFrame()
-        if buildings.crs is None:
-            buildings = buildings.set_crs("EPSG:4326")
-        buildings = buildings.to_crs("EPSG:4326")
-        if city_boundary is not None:
-            try:
-                # Проекция в метры для корректного centroid/within (избегаем UserWarning о geographic CRS)
-                crs_utm = buildings.estimate_utm_crs()
-                buildings_proj = buildings.to_crs(crs_utm)
-                boundary_proj = gpd.GeoSeries([city_boundary], crs=buildings.crs).to_crs(crs_utm).iloc[0]
-                mask = buildings_proj.geometry.centroid.within(boundary_proj)
-                buildings = buildings[mask]
-            except Exception as e:
-                self.logger.warning(f"Фильтрация зданий по границе: {e}")
-        if len(buildings) == 0:
-            return gpd.GeoDataFrame()
-        
-        if road_graph is None or len(road_graph.nodes) == 0:
-            edge_geoms = []
-        else:
-            _, gdf_edges = ox.graph_to_gdfs(road_graph)
-            if gdf_edges.crs is not None and gdf_edges.crs != buildings.crs:
-                gdf_edges = gdf_edges.to_crs(buildings.crs)
-            edge_geoms = list(gdf_edges.geometry) if len(gdf_edges) > 0 else []
-        edge_tree = STRtree(edge_geoms) if edge_geoms else None
-        
-        building_geoms = list(buildings.geometry)
-        building_tree = STRtree(building_geoms) if building_geoms else None
-        is_apartment = [self._is_apartment(buildings.iloc[i]) for i in range(len(buildings))]
-        
-        # Подъезды из OSM (ограничиваем объём для больших городов)
-        xmin, ymin, xmax, ymax = buildings.total_bounds
-        entrances_gdf = self._load_entrances_bbox((ymax, ymin, xmax, xmin))
-        if len(entrances_gdf) > 3000:
-            entrances_gdf = entrances_gdf.iloc[:3000]
-        building_entrances = {}
-        if len(entrances_gdf) > 0 and building_tree is not None:
-            for _, ent in entrances_gdf.iterrows():
-                g = ent.geometry
-                if g is None or not getattr(g, 'is_valid', True):
-                    continue
-                if g.geom_type == 'Point':
-                    pt = g
-                elif g.geom_type == 'MultiPoint' and len(g.geoms) > 0:
-                    pt = g.geoms[0]
-                else:
-                    pt = g.centroid
-                try:
-                    candidates = building_tree.query(pt)
-                except Exception:
-                    continue
-                if hasattr(candidates, '__iter__') and not isinstance(candidates, (int, float)):
-                    for c in candidates:
-                        idx = int(c)
-                        if idx >= len(building_geoms):
-                            continue
-                        poly = building_geoms[idx]
-                        try:
-                            if poly.buffer(0.00005).contains(pt) and is_apartment[idx]:
-                                building_entrances.setdefault(idx, []).append(pt)
-                                break
-                        except Exception:
-                            pass
-        
-        makes_non_private = [self._building_makes_block_non_private(buildings.iloc[i]) for i in range(len(buildings))]
-        is_private = [self._is_private_house(buildings.iloc[i], is_apartment[i]) for i in range(len(buildings))]
-        building_centroids = []
-        for i in range(len(buildings)):
-            geom = buildings.iloc[i].geometry
-            if geom is not None and geom.is_valid:
-                building_centroids.append(geom.centroid)
-            else:
-                building_centroids.append(None)
-
-        # Вариант 1 (приоритет): частный сектор по landuse — residential, allotments, neighbourhood, suburb
-        bbox_osm = (ymax, ymin, xmax, xmin)  # north, south, east, west
-        landuse_polygons = self._load_landuse_residential_areas(bbox_osm, city_boundary, buildings.crs)
-        # Частный сектор по landuse только там, где внутри нет многоквартирных/школ/офисов
-        max_landuse_to_classify = 150
-        if len(landuse_polygons) > max_landuse_to_classify:
-            landuse_polygons = sorted(landuse_polygons, key=lambda p: p.area, reverse=True)[:max_landuse_to_classify]
-        private_sector_landuse = [
-            p for p in landuse_polygons
-            if self._landuse_area_is_private_sector(p, building_centroids, makes_non_private)
-        ]
-        if private_sector_landuse:
-            self.logger.info(f"Частный сектор по landuse: {len(private_sector_landuse)} полигонов")
-
-        # Кварталы по дорогам/сетке — используем вместе с landuse, чтобы очистить все частные кварталы
-        all_blocks = []
-        max_edges_for_polygonize = 6000
-        if edge_geoms and len(edge_geoms) <= max_edges_for_polygonize:
-            road_blocks = self._get_blocks_from_roads(edge_geoms, city_boundary, buildings.crs)
-            if len(road_blocks) >= self.MIN_ROAD_BLOCKS_TO_USE:
-                all_blocks = road_blocks
-        if not all_blocks and building_centroids:
-            all_blocks = self._get_grid_blocks_fallback(buildings, city_boundary, building_centroids, buildings.crs)
-        private_sector_blocks = [
-            bp for bp in all_blocks
-            if self._block_is_private_sector(bp, building_centroids, makes_non_private)
-        ]
-
-        # Кварталы внутри частного сектора (landuse): считаем их тоже частным сектором,
-        # чтобы делить зону на блоки, а не одну большую зону с 4 точками
-        blocks_inside_private_landuse = []
-        if private_sector_landuse and all_blocks:
-            try:
-                prep_landuse = [prep(p) if p.is_valid else None for p in private_sector_landuse]
-                for block_poly in all_blocks:
-                    if not block_poly.is_valid or block_poly.is_empty:
-                        continue
-                    try:
-                        c = block_poly.centroid
-                        for i, poly in enumerate(private_sector_landuse):
-                            if (prep_landuse[i] if prep_landuse[i] is not None else poly).contains(c):
-                                blocks_inside_private_landuse.append(block_poly)
-                                break
-                    except Exception:
-                        continue
-            except Exception as e:
-                self.logger.debug(f"Блоки внутри landuse: {e}")
-
-        # Объединяем: кварталы по зданиям + кварталы внутри landuse (без дубликатов по центру)
-        seen_centroids = set()
-        effective_private_blocks = []
-        for bp in private_sector_blocks + blocks_inside_private_landuse:
-            try:
-                key = (round(bp.centroid.x, 6), round(bp.centroid.y, 6))
-                if key in seen_centroids:
-                    continue
-                seen_centroids.add(key)
-                effective_private_blocks.append(bp)
-            except Exception:
-                effective_private_blocks.append(bp)
-        if blocks_inside_private_landuse:
-            self.logger.info(f"Кварталов внутри частного сектора (landuse): {len(blocks_inside_private_landuse)}, всего частных кварталов: {len(effective_private_blocks)}")
-
-        # Небольшой буфер (~20 м), чтобы здания на границе частного полигона тоже очищались
-        _buffer_deg = 0.0002
-        try:
-            landuse_for_check = [p.buffer(_buffer_deg) if p.is_valid else p for p in private_sector_landuse]
-            blocks_for_check = [p.buffer(_buffer_deg) if p.is_valid else p for p in effective_private_blocks]
-        except Exception:
-            landuse_for_check = private_sector_landuse
-            blocks_for_check = effective_private_blocks
-
-        def _centroid_in_private_sector(centroid):
-            if centroid is None:
-                return False
-            for poly in landuse_for_check:
-                try:
-                    if poly.contains(centroid) or poly.intersects(centroid):
-                        return True
-                except Exception:
-                    continue
-            for block_poly in blocks_for_check:
-                try:
-                    if block_poly.contains(centroid) or block_poly.intersects(centroid):
-                        return True
-                except Exception:
-                    continue
-            return False
-
-        # Частный дом: по тегу OSM ИЛИ по попаданию в зону частного сектора (landuse/кварталы)
-        for i in range(len(buildings)):
-            if building_centroids[i] is None:
-                continue
-            if is_private[i]:
-                continue  # уже частный по тегу
-            if not (is_apartment[i] or makes_non_private[i]) and _centroid_in_private_sector(building_centroids[i]):
-                is_private[i] = True  # частный по расположению в частном секторе
-
-        rows = []
-        for i in range(len(buildings)):
-            try:
-                b = buildings.iloc[i]
-                geom = b.geometry
-                if geom is None or not geom.is_valid:
-                    continue
-                # Не ставим точку на здание, если оно частное (по тегу OSM или по зоне)
-                if is_private[i]:
-                    continue
-                centroid = geom.centroid
-                lon_c, lat_c = centroid.x, centroid.y
-                w = self.APARTMENT_DEMAND_WEIGHT if is_apartment[i] else 1
-                if is_apartment[i] and i in building_entrances and len(building_entrances[i]) > 0:
-                    for entrance_pt in building_entrances[i]:
-                        rx, ry = self._point_to_road(entrance_pt, edge_tree, edge_geoms)
-                        lon_d, lat_d = self._shift_near_road_no_building(rx, ry, entrance_pt, building_tree, building_geoms)
-                        rows.append({
-                            'geometry': Point(lon_d, lat_d),
-                            'delivery_lon': lon_d,
-                            'delivery_lat': lat_d,
-                            'weight': w,
-                        })
-                else:
-                    rx, ry = self._point_to_road(centroid, edge_tree, edge_geoms)
-                    lon_d, lat_d = self._shift_near_road_no_building(rx, ry, centroid, building_tree, building_geoms)
-                    rows.append({
-                            'geometry': Point(lon_d, lat_d),
-                            'delivery_lon': lon_d,
-                            'delivery_lat': lat_d,
-                            'weight': w,
-                    })
-            except Exception as e:
-                self.logger.debug(f"Здание {i}: {e}")
-                continue
-
-        # На каждом квартале — минимум один узел: центр квартала, привязанный к дороге (для забора заказов)
-        if building_centroids and (edge_tree and edge_geoms) and all_blocks:
-            seen = set()
-            # Landuse-полигоны, внутри которых нет кварталов — одна точка на полигон
-            landuse_for_center = []
-            for p in private_sector_landuse:
-                has_block_inside = False
-                try:
-                    for b in all_blocks:
-                        if not b.is_valid or b.is_empty:
-                            continue
-                        if p.contains(b.centroid):
-                            has_block_inside = True
-                            break
-                except Exception:
-                    pass
-                if not has_block_inside:
-                    landuse_for_center.append(p)
-            # Все кварталы (all_blocks) — по одному узлу на квартал у дороги посередине
-            for block_poly in landuse_for_center + all_blocks:
-                try:
-                    if not block_poly.is_valid or block_poly.is_empty:
-                        continue
-                    centroid = block_poly.centroid
-                    pt = centroid
-                    rx, ry = self._point_to_road(pt, edge_tree, edge_geoms)
-                    lon_d, lat_d = self._shift_near_road_no_building(rx, ry, pt, building_tree, building_geoms)
-                    key = (round(lon_d, 6), round(lat_d, 6))
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    rows.append({
-                        'geometry': Point(lon_d, lat_d),
-                        'delivery_lon': lon_d,
-                        'delivery_lat': lat_d,
-                        'weight': 1,
-                    })
-                except Exception as e:
-                    self.logger.debug(f"Квартал: {e}")
-            self.logger.info(f"Узлы по кварталам: landuse без кварталов {len(landuse_for_center)}, всего кварталов {len(all_blocks)}, уникальных узлов у дороги: {len(seen)}")
-
-        if not rows:
-            return gpd.GeoDataFrame()
-        gdf = gpd.GeoDataFrame(rows, crs=buildings.crs)
-        self.logger.info(f"Точки высадки: {len(gdf)} (многоквартирные — по подъездам; на каждом квартале — узел у дороги посередине)")
-        return gdf
-    
-    def address_to_coords(self, address, city_name=None):
-        """Улучшенное геокодирование с поддержкой российских адресов"""
-        if not address or not address.strip():
-            return None
-        
-        address = address.strip()
-        
-        # Если это уже координаты
-        if ',' in address:
-            try:
-                coords = tuple(map(float, [x.strip() for x in address.split(',')]))
-                if len(coords) == 2 and -90 <= coords[0] <= 90 and -180 <= coords[1] <= 180:
-                    return coords
-            except ValueError:
-                pass
-        
-        # Если указан город, добавляем его к адресу
-        if city_name and city_name.strip():
-            city_name = city_name.strip()
-            # Убираем "Russia" из названия города если есть
-            if city_name.endswith(', Russia'):
-                city_name = city_name[:-8].strip()
-            
-            # Пробуем разные варианты с городом
-            search_variants = [
-                f"{address}, {city_name}",
-                f"{address}, {city_name}, Россия",
-                f"{address}, {city_name}, Russia",
-                f"{address}, {city_name}, РФ"
-            ]
-        else:
-            # Если город не указан, используем общие варианты
-            search_variants = [
-                address,
-                f"{address}, Россия",
-                f"{address}, Russia",
-                f"{address}, РФ"
-            ]
-        
-        for geocoder_name, geocoder in self.geolocators.items():
-            for search_address in search_variants:
-                try:
-                    self.logger.info(f"Поиск координат для: {search_address} (геокодер: {geocoder_name})")
-                    location = geocoder.geocode(search_address, timeout=10)
-                    if location:
-                        coords = (location.latitude, location.longitude)
-                        self.logger.info(f"Найдены координаты: {coords}")
-                        
-                        # Если указан город, проверяем что координаты находятся в разумных пределах города
-                        if city_name:
-                            if not self._validate_coords_in_city(coords, city_name):
-                                self.logger.warning(f"Координаты {coords} не находятся в границах города {city_name}")
-                                continue
-                        
-                        return coords
-                except Exception as e:
-                    self.logger.warning(f"Ошибка геокодирования '{search_address}': {e}")
-                    continue
-        
-        self.logger.warning(f"Не удалось найти координаты для адреса: {address}")
-        return None
-
-    def coords_to_address(self, coords: tuple, language: str = 'ru'):
-        """Обратное геокодирование координат в строку улицы/адреса."""
-        try:
-            if not coords or len(coords) != 2:
-                return None
-            lat, lon = coords
-            location = self._reverse((lat, lon), language=language, timeout=10)
-            if location and location.address:
-                return location.address
-            return None
-        except Exception as e:
-            self.logger.warning(f"Ошибка обратного геокодирования {coords}: {e}")
-            return None
-    
-    def _validate_coords_in_city(self, coords, city_name):
-        """Проверка что координаты находятся в разумных пределах города"""
-        city_bounds = {
-            'волгоград': {'lat': (48.5, 49.0), 'lon': (44.0, 45.0)},
-            'volgograd': {'lat': (48.5, 49.0), 'lon': (44.0, 45.0)},
-            'москва': {'lat': (55.5, 55.9), 'lon': (37.3, 37.9)},
-            'moscow': {'lat': (55.5, 55.9), 'lon': (37.3, 37.9)},
-            'санкт-петербург': {'lat': (59.8, 60.1), 'lon': (30.0, 30.7)},
-            'st petersburg': {'lat': (59.8, 60.1), 'lon': (30.0, 30.7)},
-            'st. petersburg': {'lat': (59.8, 60.1), 'lon': (30.0, 30.7)},
-            'petersburg': {'lat': (59.8, 60.1), 'lon': (30.0, 30.7)},
-        }
-        
-        normalized_city = city_name.lower().strip()
-        for city_key, bounds in city_bounds.items():
-            if city_key in normalized_city:
-                lat, lon = coords
-                if bounds['lat'][0] <= lat <= bounds['lat'][1] and bounds['lon'][0] <= lon <= bounds['lon'][1]:
-                    return True
-                else:
-                    self.logger.warning(f"Координаты {coords} не в границах {city_name}: lat {bounds['lat']}, lon {bounds['lon']}")
-                    return False
-        
-        # Если город не найден в списке, считаем координаты валидными
-        return True
-    
-    def _normalize_city_name(self, city_name):
-        """Минимальная нормализация: тримминг без привязки к стране (универсальность)"""
-        return city_name.strip()
     
     def _sanitize_name(self, name):
         import re
@@ -2647,7 +1655,180 @@ class DataService:
             max_altitude=self.MAX_DRONE_ALTITUDE,
         )
         return data
-    
+
+    # --- Кандидаты для размещения станций (зарядка / гараж / ТО) ---
+    _ROOFTOP_BUILDING_TAGS = frozenset(
+        (
+            "apartments",
+            "apartment",
+            "apartment_block",
+            "multistory",
+            "block",
+            "flats",
+            "semidetached_house",
+        )
+    )
+    _GROUND_BUILDING_TAGS = frozenset(
+        (
+            "retail",
+            "supermarket",
+            "commercial",
+            "mall",
+            "shop",
+            "kiosk",
+            "warehouse",
+            "parking",
+            "garage",
+            "garages",
+        )
+    )
+    _INDUSTRIAL_BUILDING_TAGS = frozenset(
+        (
+            "industrial",
+            "warehouse",
+            "factory",
+            "manufacture",
+            "depot",
+            "hangar",
+            "commercial",
+            "garages",
+            "shed",
+        )
+    )
+
+    def get_station_candidates(
+        self,
+        buildings: gpd.GeoDataFrame,
+        city_boundary,
+        no_fly_zones,
+        road_graph,
+        station_type: str = "rooftop",
+    ) -> gpd.GeoDataFrame:
+        """
+        Точки-кандидаты для размещения станций (центроиды зданий WGS84).
+        rooftop — крыши МКД/жилые многоэтажки (source=building);
+        ground — наземные площадки / коммерция (source=ground);
+        garage / to — промзоны и склады (для гаража и ТО).
+        """
+        from shapely.geometry import Point
+
+        if buildings is None or len(buildings) == 0:
+            return gpd.GeoDataFrame()
+        b = buildings.to_crs("EPSG:4326").copy()
+        no_fly_union = None
+        if no_fly_zones is not None:
+            try:
+                if isinstance(no_fly_zones, gpd.GeoDataFrame) and len(no_fly_zones) > 0:
+                    try:
+                        no_fly_union = no_fly_zones.geometry.union_all()
+                    except Exception:
+                        no_fly_union = no_fly_zones.geometry.unary_union
+                elif isinstance(no_fly_zones, list) and len(no_fly_zones) > 0:
+                    no_fly_union = unary_union(no_fly_zones)
+                if no_fly_union is not None and (getattr(no_fly_union, "is_empty", True) or not getattr(no_fly_union, "is_valid", True)):
+                    no_fly_union = None
+            except Exception:
+                no_fly_union = None
+        if no_fly_union is not None:
+            try:
+                b = b[~b.geometry.intersects(no_fly_union)].copy()
+            except Exception:
+                pass
+        if city_boundary is not None and getattr(city_boundary, "is_valid", True):
+            try:
+                crs_utm = b.estimate_utm_crs()
+                bp = b.to_crs(crs_utm)
+                cb = gpd.GeoSeries([city_boundary], crs="EPSG:4326").to_crs(crs_utm).iloc[0]
+                mask = bp.geometry.centroid.within(cb)
+                b = b[mask].copy()
+            except Exception:
+                pass
+
+        if "height_m" not in b.columns:
+            b = self._compute_building_heights(b)
+        try:
+            crs_utm = b.estimate_utm_crs()
+            b["area_m2"] = b.to_crs(crs_utm).geometry.area.astype(float)
+        except Exception:
+            b["area_m2"] = 0.0
+
+        rows = []
+        for idx, row in b.iterrows():
+            g = row.geometry
+            if g is None or not getattr(g, "is_valid", True) or g.is_empty:
+                continue
+            c = g.centroid
+            lon, lat = float(c.x), float(c.y)
+            tag_raw = row.get("building")
+            tag = str(tag_raw).lower().strip() if tag_raw is not None and not (isinstance(tag_raw, float) and pd.isna(tag_raw)) else ""
+            area = float(row.get("area_m2", 0) or 0)
+            levels = None
+            for key in ("building:levels", "levels"):
+                v = row.get(key)
+                if v is not None and str(v).strip():
+                    try:
+                        levels = int(float(str(v).split()[0].replace(",", ".")))
+                        break
+                    except (ValueError, TypeError):
+                        pass
+            is_mkd = self._is_apartment(row) or tag in self._ROOFTOP_BUILDING_TAGS
+            is_residential_high = tag in ("residential", "yes", "house") and levels is not None and levels >= 3
+            is_rooftop = is_mkd or is_residential_high
+
+            if station_type == "rooftop":
+                if not is_rooftop and not (tag in ("yes", "residential") and area > 800):
+                    continue
+                rows.append({"geometry": Point(lon, lat), "source": "building", "osm_index": idx})
+            elif station_type == "ground":
+                if is_rooftop:
+                    continue
+                if tag in self._GROUND_BUILDING_TAGS or tag in ("office",) or area > 400:
+                    rows.append({"geometry": Point(lon, lat), "source": "ground", "osm_index": idx})
+            elif station_type in ("garage", "to"):
+                if tag not in self._INDUSTRIAL_BUILDING_TAGS and area < 300:
+                    continue
+                rows.append(
+                    {
+                        "geometry": Point(lon, lat),
+                        "source": "industrial",
+                        "osm_index": idx,
+                    }
+                )
+            else:
+                continue
+
+        if not rows:
+            return gpd.GeoDataFrame()
+        return gpd.GeoDataFrame(rows, crs="EPSG:4326")
+
+    def get_power_substation_buffer_union(self, buildings: gpd.GeoDataFrame):
+        """Объединённая геометрия подстанций (power=substation) с буфером ~50 м — зоны, где не ставим гараж/ТО."""
+        if buildings is None or len(buildings) == 0:
+            return None
+        try:
+            import osmnx as ox
+
+            b = buildings.to_crs("EPSG:4326").total_bounds
+            north, south, east, west = b[3], b[1], b[2], b[0]
+            subs = ox.features_from_bbox(bbox=(north, south, east, west), tags={"power": "substation"})
+            if subs is None or len(subs) == 0:
+                return None
+            geoms = []
+            buf_deg = 0.00045
+            for g in subs.geometry:
+                if g is None or not getattr(g, "is_valid", True) or g.is_empty:
+                    continue
+                try:
+                    geoms.append(g.buffer(buf_deg))
+                except Exception:
+                    pass
+            if not geoms:
+                return None
+            return unary_union(geoms)
+        except Exception as e:
+            self.logger.debug("Подстанции OSM: %s", e)
+            return None
+
     def get_redis_client(self):
         """Возвращает Redis клиент для использования в других сервисах"""
         return self._redis

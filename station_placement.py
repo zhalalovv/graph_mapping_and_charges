@@ -16,15 +16,15 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
-import pandas as pd
 import geopandas as gpd
 import networkx as nx
-from shapely.geometry import Point
-from shapely.ops import unary_union
+import numpy as np
+import pandas as pd
 from scipy.spatial import cKDTree
+from shapely.geometry import LineString, Point
+from shapely.ops import unary_union
 
 # Радиус Земли в км
 EARTH_R_KM = 6371.0
@@ -32,9 +32,9 @@ EARTH_R_KM = 6371.0
 # FlyCart 30 с грузом: D_max = 16 км (радиусы уменьшены в 4 раза для отображения/расчёта)
 D_MAX_KM = 16.0
 # Зарядка + ожидание (туда-обратно): R = 0.4 * D_max / 4 = 1.6 км
-R_CHARGE_KM = 0.4 * D_MAX_KM / 4.0  # 1.6 км
+R_CHARGE_KM = 0.4 * D_MAX_KM / 4.0
 # Гаражи и ТО (в одну сторону): R = 0.8 * D_max / 4 = 3.2 км
-R_GARAGE_TO_KM = 0.8 * D_MAX_KM / 4.0  # 3.2 км
+R_GARAGE_TO_KM = 0.8 * D_MAX_KM / 4.0
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -49,7 +49,6 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def _coords_from_geom(g) -> Tuple[float, float]:
-    """(lon, lat) из геометрии (Point или centroid)."""
     if g is None:
         return (0.0, 0.0)
     if hasattr(g, "x") and hasattr(g, "y"):
@@ -61,7 +60,6 @@ def _coords_from_geom(g) -> Tuple[float, float]:
 
 
 def _points_array(gdf: gpd.GeoDataFrame) -> np.ndarray:
-    """Массив (N, 2) lon, lat из GeoDataFrame."""
     if gdf is None or len(gdf) == 0:
         return np.empty((0, 2))
     coords = []
@@ -87,12 +85,13 @@ def km_to_deg_approx(km: float, lat_center: float) -> float:
     deg_lat = km / 111.0
     deg_lon = km / (111.0 * max(0.2, np.cos(np.radians(lat_center))))
     return max(deg_lat, deg_lon)
+
+
 class StationPlacement:
     def __init__(self, data_service, logger=None):
         self.data_service = data_service
         self.logger = logger or logging.getLogger(__name__)
 
-    # --- Шаг 1: точки спроса ---
     def build_demand_points(
         self,
         buildings: gpd.GeoDataFrame,
@@ -105,13 +104,9 @@ class StationPlacement:
         dbscan_min_samples: int = 15,
         use_all_buildings: bool = False,
         no_fly_zones=None,
-        # При method="dbscan": дополнительно заполнять полигоны кластеров сеткой точек спроса,
-        # чтобы размещение станций стремилось покрыть всю область кластера.
         fill_clusters: bool = False,
-        # Пользовательский шаг сетки для заполнения кластеров (в метрах); по умолчанию = dbscan_eps_m.
         cluster_fill_step_m: Optional[float] = None,
     ) -> gpd.GeoDataFrame:
-        """Точки спроса: DBSCAN-кластеры или сеточные ячейки с весом. При use_all_buildings=True — по всем зданиям вне беспилотных зон."""
         return self.data_service.get_demand_points_weighted(
             buildings,
             road_graph,
@@ -126,7 +121,6 @@ class StationPlacement:
             cluster_fill_step_m=cluster_fill_step_m,
         )
 
-    # --- Кандидаты зарядок относительно кластеров DBSCAN ---
     def build_charge_candidates_from_clusters(
         self,
         demand: gpd.GeoDataFrame,
@@ -143,10 +137,7 @@ class StationPlacement:
         if demand is None or len(demand) == 0 or full_candidates is None or len(full_candidates) == 0:
             return full_candidates if full_candidates is not None else gpd.GeoDataFrame()
 
-        # На большие кластеры можно ставить несколько кандидатов:
-        # считаем квантиль по весу и даём больше ближайших точек крупным кластерам.
         weights = demand["weight"].values if "weight" in demand.columns else np.ones(len(demand))
-        # Адаптивные пороги: нижняя/верхняя медиана по весу
         w_med = float(np.median(weights)) if len(weights) > 0 else 1.0
         w_p75 = float(np.percentile(weights, 75)) if len(weights) > 0 else w_med
 
@@ -156,7 +147,6 @@ class StationPlacement:
         chosen_indices = set()
         for i in range(len(dem_pts)):
             lat_d, lon_d = dem_pts[i, 1], dem_pts[i, 0]
-            # Сколько кандидатов хотим для этого кластера в зависимости от веса
             w = float(weights[i]) if i < len(weights) else 1.0
             if w >= w_p75:
                 n_for_cluster = 3
@@ -165,7 +155,6 @@ class StationPlacement:
             else:
                 n_for_cluster = 1
 
-            # Список (j, dist) кандидатов в пределах max_dist
             dists = []
             for j in range(len(cand_pts)):
                 d_km = haversine_km(lat_d, lon_d, cand_pts[j, 1], cand_pts[j, 0])
@@ -173,7 +162,6 @@ class StationPlacement:
                     dists.append((j, d_km))
             if not dists:
                 continue
-            # Берём ближайшие n_for_cluster ещё не выбранных кандидатов
             dists.sort(key=lambda t: t[1])
             added = 0
             for j, _ in dists:
@@ -187,10 +175,11 @@ class StationPlacement:
             self.logger.warning("Нет кандидатов в радиусе от кластеров — используем все кандидаты")
             return full_candidates
         out = full_candidates.iloc[sorted(chosen_indices)].copy()
-        self.logger.info(f"Кандидаты зарядки относительно кластеров: {len(out)} из {len(full_candidates)} (по кластерам DBSCAN)")
+        self.logger.info(
+            f"Кандидаты зарядки относительно кластеров: {len(out)} из {len(full_candidates)} (по кластерам DBSCAN)"
+        )
         return out
 
-    # --- Шаг 2: зарядки — тип А (основное покрытие) + дополнительные (до 100%, поддержка развозки) ---
     def place_charging_stations(
         self,
         candidates: gpd.GeoDataFrame,
@@ -199,29 +188,16 @@ class StationPlacement:
         *,
         radius_km: float = R_CHARGE_KM,
         max_stations: Optional[int] = None,
-        # Для типа А целимся покрыть почти весь «тяжёлый» спрос ядра
         type_a_coverage_ratio: float = 0.95,
-        # По умолчанию расставляем только станции типа А; тип Б можно включить отдельно.
         enable_type_b: bool = False,
         type_b_coverage_ratio: float = 1.0,
-        # Минимальное расстояние между центрами станций (в радиусах).
-        # Для типа А по умолчанию допускаем частичное перекрытие (1.0 * R),
-        # чтобы на большой зоне спроса можно было поставить несколько станций.
         min_center_distance_factor_a: float = 1.0,
         min_center_distance_factor_b: float = 2.0,
-        # В ядре города (в радиусе core_dense_radius_factor * radius_km от центра спроса)
-        # разрешаем ещё плотнее: min_center_distance_factor_core_a * radius_km.
         min_center_distance_factor_core_a: Optional[float] = None,
         core_dense_radius_factor: float = 5.0,
-        # Станции типа А ограничиваем «ядром» города: не дальше core_radius_factor_a * radius_km
         core_radius_factor_a: float = 4.0,
-        # Только "тяжёлый" спрос (квантили по весу) считается ядром для станций типа А.
         core_weight_quantile_a: float = 0.7,
-        # Минимальный прирост покрытия ядра (доля от total_core_weight),
-        # при котором ещё есть смысл добавлять новую станцию типа А.
         min_core_gain_ratio_a: float = 0.01,
-        # Стохастичность: random_state=None -> каждый запуск чуть разный;
-        # при фиксированном random_state результат воспроизводим.
         random_state: Optional[int] = None,
     ) -> Tuple[gpd.GeoDataFrame, Dict[str, Any]]:
         """
@@ -239,7 +215,9 @@ class StationPlacement:
                 "placed_type_a": 0,
                 "placed_type_b": 0,
                 "placed_extra": 0,
-                "demand_covered": 0, "demand_total": 0, "coverage_ratio": 0.0,
+                "demand_covered": 0,
+                "demand_total": 0,
+                "coverage_ratio": 0.0,
             }
 
         cand_pts = _points_array(candidates)
@@ -248,20 +226,15 @@ class StationPlacement:
         n_demand = len(dem_pts)
         total_weight = float(weights.sum())
         covered = np.zeros(n_demand, dtype=bool)
-        selected = []
-        selected_indices: List[int] = []  # индексы кандидатов (и тип А, и доп)
-        selected_types: List[str] = []    # типы уже выбранных станций
-
-        # ГПСЧ для стохастического выбора среди почти лучших кандидатов
+        selected: List[dict] = []
+        selected_indices: List[int] = []
+        selected_types: List[str] = []
         rng = np.random.default_rng(random_state)
 
-        # Взвешенный центр спроса — используется как «ядро» города для станций типа А.
         core_lon = float(np.average(dem_pts[:, 0], weights=weights)) if n_demand > 0 else 0.0
         core_lat = float(np.average(dem_pts[:, 1], weights=weights)) if n_demand > 0 else 0.0
         max_core_dist_a_km = max(0.0, float(core_radius_factor_a)) * radius_km
 
-        # Ядро спроса по весу: по умолчанию — самые «тяжёлые» точки.
-        # При core_weight_quantile_a <= 0 берём весь спрос как ядро (тип А по всему городу).
         if n_demand > 0:
             if core_weight_quantile_a is None or core_weight_quantile_a <= 0.0:
                 is_core_demand = np.ones(n_demand, dtype=bool)
@@ -287,11 +260,6 @@ class StationPlacement:
         )
 
         def _too_close_to_existing(idx: int, station_type: str) -> bool:
-            """
-            Проверка геометрического ограничения: станции не должны перекрываться.
-            Центры окружностей должны быть не ближе, чем min_center_distance_factor * radius_km
-            друг к другу. В ядре города (около центра спроса) разрешено плотнее.
-            """
             if not selected_indices:
                 return False
             lon_c, lat_c = cand_pts[idx, 0], cand_pts[idx, 1]
@@ -321,29 +289,22 @@ class StationPlacement:
             while True:
                 best_idx = -1
                 best_new_weight = 0.0
-                # Для стохастики храним несколько почти лучших кандидатов
                 top_indices: List[int] = []
                 for i in range(len(cand_pts)):
                     if i in selected_indices:
                         continue
-                    # Станции типа А — только крыши МКД (source == "building"); тип Б — любые кандидаты
                     if station_type == "charge_a" and "source" in candidates.columns:
                         if candidates.iloc[i].get("source") != "building":
                             continue
                     lon_c, lat_c = cand_pts[i, 0], cand_pts[i, 1]
-                    # Для станций типа А жёстко ограничиваемся ядром: далеко в сёла не уходим.
                     if station_type == "charge_a" and max_core_dist_a_km > 0.0:
                         d_core = haversine_km(lat_c, lon_c, core_lat, core_lon)
                         if d_core > max_core_dist_a_km:
                             continue
-                    # Геометрическое ограничение: станции не должны "впадать" друг в друга.
-                    # Разрешаем только такие кандидаты, которые достаточно далеко от уже выбранных.
                     if _too_close_to_existing(i, station_type):
                         continue
                     new_weight = 0.0
                     for j in range(n_demand):
-                        # Фаза А: учитываем только «ядро» спроса (is_core_demand),
-                        # фаза Б: весь оставшийся спрос.
                         if station_type == "charge_a" and not is_core_demand[j]:
                             continue
                         if not ignore_covered_in_score and covered[j]:
@@ -351,8 +312,6 @@ class StationPlacement:
                         d_km = haversine_km(lat_c, lon_c, dem_pts[j, 1], dem_pts[j, 0])
                         if d_km <= radius_km:
                             new_weight += weights[j]
-                    # Для станций типа Б даём приоритет крышам МКД:
-                    # кандидаты с source == "building" получают небольшой бонус к "выигрышу" по спросу.
                     if (
                         station_type == "charge_b"
                         and "source" in candidates.columns
@@ -366,14 +325,10 @@ class StationPlacement:
                         best_new_weight = new_weight
                         best_idx = i
                         top_indices = [i]
-                    else:
-                        # Кандидаты, которые дают почти такой же прирост (например, не хуже 95% от лучшего),
-                        # тоже добавляем в список для случайного выбора.
-                        if best_new_weight > 0 and new_weight >= 0.95 * best_new_weight:
-                            top_indices.append(i)
+                    elif best_new_weight > 0 and new_weight >= 0.95 * best_new_weight:
+                        top_indices.append(i)
                 if best_new_weight <= 0:
                     break
-                # Если есть несколько почти эквивалентных по весу кандидатов — выбираем случайно один из них.
                 if top_indices:
                     best_idx = int(rng.choice(top_indices))
                 elif best_idx < 0:
@@ -384,16 +339,17 @@ class StationPlacement:
                 for j in range(n_demand):
                     d_km = haversine_km(lat_c, lon_c, dem_pts[j, 1], dem_pts[j, 0])
                     if d_km <= radius_km:
-                        # В фазе А помечаем покрытие только для точек ядра спроса.
                         if station_type == "charge_a" and not is_core_demand[j]:
                             continue
                         if not covered[j]:
                             covered[j] = True
-                selected.append({
-                    "geometry": Point(cand_pts[best_idx, 0], cand_pts[best_idx, 1]),
-                    "station_type": station_type,
-                    "source_index": best_idx,
-                })
+                selected.append(
+                    {
+                        "geometry": Point(cand_pts[best_idx, 0], cand_pts[best_idx, 1]),
+                        "station_type": station_type,
+                        "source_index": best_idx,
+                    }
+                )
                 if max_stations is not None and len(selected) >= max_stations:
                     return
                 ratio = (weights[covered].sum() / total_weight) if total_weight > 0 else 0.0
@@ -402,11 +358,10 @@ class StationPlacement:
 
         # Фаза 1: зарядки типа А — покрывают основную часть спроса.
         # В оценке кандидата берём весь спрос в радиусе (ignore_covered_in_score=True),
-        # чтобы станции А “обнима́ли” основную зону спроса, а не разлетались по мелким островкам.
+        # чтобы станции А «обнимали» основную зону спроса, а не разлетались по мелким островкам.
         run_phase("charge_a", type_a_coverage_ratio, ignore_covered_in_score=True)
 
         # Фаза 2: станции типа Б (дополняют покрытие оставшегося спроса).
-        # Для них действует то же ограничение на неперекрытие окружностей.
         if enable_type_b and (max_stations is None or len(selected) < max_stations):
             run_phase("charge_b", type_b_coverage_ratio, ignore_covered_in_score=False)
 
@@ -418,7 +373,6 @@ class StationPlacement:
             "placed": len(selected),
             "placed_type_a": n_a,
             "placed_type_b": n_b,
-            # Совместимость со старым ключом: считаем тип Б "дополнительными" станциями
             "placed_extra": n_b,
             "demand_covered": covered_weight,
             "demand_total": total_weight,
@@ -429,7 +383,6 @@ class StationPlacement:
         )
         return gdf, metrics
 
-    # --- Шаг 3: магистральный граф (только А–А, макс. 4 связи на станцию, без Delaunay) ---
     def build_trunk_graph(
         self,
         charge_stations: gpd.GeoDataFrame,
@@ -456,7 +409,6 @@ class StationPlacement:
         (A* по весу рёбер). Полученная полилиния сохраняется в атрибуте geometry_coords ребра.
         """
         nodes_list = []
-        # Зарядки типа А, гаражи и ТО — все считаются станциями типа А для магистрали
         trunk_nodes = []
         for i, row in (charge_stations.iterrows() if charge_stations is not None and len(charge_stations) > 0 else []):
             if row.get("station_type") != "charge_a":
@@ -483,12 +435,10 @@ class StationPlacement:
         if len(trunk_nodes) < 2:
             return G
 
-        # Геометрия беспилотных зон (WGS84) для проверки: проходит ли магистральный отрезок через зону
         nfz_union = None
         if obstacles is not None and getattr(obstacles, "is_empty", True) is False and getattr(obstacles, "is_valid", True):
             nfz_union = obstacles
 
-        # Подготовка структур для A* по воздушному графу
         air_coords = None
         air_ids = None
         air_tree = None
@@ -504,7 +454,6 @@ class StationPlacement:
                 else:
                     pts.append((float(lon), float(lat)))
             air_coords = np.array(pts, dtype=float)
-            # Фильтруем узлы без координат
             valid_mask = ~np.isnan(air_coords[:, 0]) & ~np.isnan(air_coords[:, 1])
             if not np.any(valid_mask):
                 air_coords = None
@@ -529,7 +478,6 @@ class StationPlacement:
                 line = _Line([(float(lon1), float(lat1)), (float(lon2), float(lat2))])
                 if not line.is_valid:
                     return False
-                # пересекает границу или лежит внутри зоны
                 return nfz_union.intersects(line)
             except Exception:
                 return False
@@ -542,7 +490,6 @@ class StationPlacement:
             if air_graph is None or air_tree is None or air_coords is None or not air_ids:
                 return None, None
             try:
-                # Находим ближайшие узлы воздушного графа к концам магистрали
                 d_start, idx_start = air_tree.query([lon1, lat1], k=1)
                 d_end, idx_end = air_tree.query([lon2, lat2], k=1)
                 start_id = air_ids[int(idx_start)]
@@ -582,50 +529,55 @@ class StationPlacement:
             except Exception:
                 return None, None
 
-        # Рёбра между всеми станциями типа А: каждая станция соединяется с макс. max_neighbors_a
-        # ближайшими соседями в пределах max_edge_km.
         pts = np.array([[lon, lat] for _, lon, lat in trunk_nodes])
         ids = [nid for nid, _, _ in trunk_nodes]
-        # Не более 2 соседей на станцию, даже если max_neighbors_a больше.
         k = min(max(1, int(max_neighbors_a)), 2, len(trunk_nodes) - 1)
         if k <= 0:
             return G
         for i in range(len(trunk_nodes)):
             nid_i = ids[i]
             lat_i, lon_i = pts[i, 1], pts[i, 0]
-            candidates = []
+            cand = []
             for j in range(len(trunk_nodes)):
                 if j == i:
                     continue
                 d_km = haversine_km(lat_i, lon_i, pts[j, 1], pts[j, 0])
                 if d_km <= max_edge_km:
-                    candidates.append((d_km, j))
-            candidates.sort(key=lambda x: x[0])
-            for d_km, j in candidates[:k]:
+                    cand.append((d_km, j))
+            cand.sort(key=lambda x: x[0])
+            for d_km, j in cand[:k]:
                 nid_j = ids[j]
-                if not G.has_edge(nid_i, nid_j):
-                    lon_j, lat_j = pts[j, 0], pts[j, 1]
-                    # Проверяем: проходит ли прямая между станциями через беспилотную зону
-                    if not _edge_intersects_nfz(lon_i, lat_i, lon_j, lat_j):
-                        G.add_edge(nid_i, nid_j, weight=d_km, length=d_km)
-                        continue
-                    # Отрезок пересекает беспилотную зону — строим обход по воздушному графу (A*)
-                    self.logger.debug("Магистраль пересекает беспилотную зону %s–%s, строим обход A*", nid_i, nid_j)
-                    if air_graph is not None and air_tree is not None:
-                        detour_coords, detour_len = _astar_detour(lon_i, lat_i, lon_j, lat_j)
-                        if detour_coords is not None and detour_len is not None:
-                            G.add_edge(
-                                nid_i,
-                                nid_j,
-                                weight=detour_len,
-                                length=detour_len,
-                                geometry_coords=detour_coords,
-                            )
-                            self.logger.info("Обход беспилотной зоны: %s–%s, точек маршрута %s", nid_i, nid_j, len(detour_coords))
-                            continue
-                    self.logger.warning("Обход не построен для %s–%s, оставлена прямая", nid_i, nid_j)
+                if G.has_edge(nid_i, nid_j):
+                    continue
+                lon_j, lat_j = pts[j, 0], pts[j, 1]
+                # Проверяем: проходит ли прямая между станциями через беспилотную зону
+                if not _edge_intersects_nfz(lon_i, lat_i, lon_j, lat_j):
                     G.add_edge(nid_i, nid_j, weight=d_km, length=d_km)
-        # Связность: объединяем компоненты всех узлов магистрали
+                    continue
+                # Отрезок пересекает беспилотную зону — строим обход по воздушному графу (A*)
+                self.logger.debug(
+                    "Магистраль пересекает беспилотную зону %s–%s, строим обход A*", nid_i, nid_j
+                )
+                if air_graph is not None and air_tree is not None:
+                    detour_coords, detour_len = _astar_detour(lon_i, lat_i, lon_j, lat_j)
+                    if detour_coords is not None and detour_len is not None:
+                        G.add_edge(
+                            nid_i,
+                            nid_j,
+                            weight=detour_len,
+                            length=detour_len,
+                            geometry_coords=detour_coords,
+                        )
+                        self.logger.info(
+                            "Обход беспилотной зоны: %s–%s, точек маршрута %s",
+                            nid_i,
+                            nid_j,
+                            len(detour_coords),
+                        )
+                        continue
+                self.logger.warning("Обход не построен для %s–%s, оставлена прямая", nid_i, nid_j)
+                G.add_edge(nid_i, nid_j, weight=d_km, length=d_km)
+
         trunk_node_ids = list(G.nodes())
         if len(trunk_node_ids) > 1:
             sub = G.subgraph(trunk_node_ids).copy()
@@ -659,7 +611,9 @@ class StationPlacement:
                         G.add_edge(u, v, weight=best_dist, length=best_dist)
                     base_comp |= remaining[best_idx]
                     del remaining[best_idx]
-        self.logger.info(f"Trunk (А–А, макс. {max_neighbors_a} соседей): {G.number_of_nodes()} узлов, {G.number_of_edges()} рёбер")
+        self.logger.info(
+            f"Trunk (А–А, макс. {max_neighbors_a} соседей): {G.number_of_nodes()} узлов, {G.number_of_edges()} рёбер"
+        )
         return G
 
     def build_branch_edges(
@@ -677,13 +631,20 @@ class StationPlacement:
         """
         if charge_stations is None or len(charge_stations) == 0:
             return []
-        type_a = charge_stations["station_type"] == "charge_a" if "station_type" in charge_stations.columns else pd.Series([True] * len(charge_stations))
-        type_b = charge_stations["station_type"] == "charge_b" if "station_type" in charge_stations.columns else pd.Series([False] * len(charge_stations))
+        type_a = (
+            charge_stations["station_type"] == "charge_a"
+            if "station_type" in charge_stations.columns
+            else pd.Series([True] * len(charge_stations))
+        )
+        type_b = (
+            charge_stations["station_type"] == "charge_b"
+            if "station_type" in charge_stations.columns
+            else pd.Series([False] * len(charge_stations))
+        )
         a_indices = [i for i in charge_stations.index[type_a]]
         b_indices = [i for i in charge_stations.index[type_b]]
         if not b_indices:
             return []
-        # Цели: тип А + гаражи + ТО (id: charge_i, garage_i, to_i)
         targets_pts: List[Tuple[float, float, str]] = []
         for i in a_indices:
             lon, lat = _coords_from_geom(charge_stations.loc[i].geometry)
@@ -700,27 +661,29 @@ class StationPlacement:
             return []
         b_pts = np.array([_coords_from_geom(charge_stations.loc[i].geometry) for i in b_indices])
         features = []
-        k = min(k_nearest, len(targets_pts))
+        kk = min(k_nearest, len(targets_pts))
         for bi, idx_b in enumerate(b_indices):
             lon_b, lat_b = b_pts[bi, 0], b_pts[bi, 1]
-            candidates = []
+            cand = []
             for lon_t, lat_t, tid in targets_pts:
                 d_km = haversine_km(lat_b, lon_b, lat_t, lon_t)
                 if d_km <= max_branch_km:
-                    candidates.append((d_km, lon_t, lat_t, tid))
-            candidates.sort(key=lambda x: x[0])
-            for d_km, lon_t, lat_t, tid in candidates[:k]:
-                features.append({
-                    "type": "Feature",
-                    "geometry": {"type": "LineString", "coordinates": [[lon_b, lat_b], [lon_t, lat_t]]},
-                    "properties": {
-                        "edge_type": "branch",
-                        "source_id": str(idx_b),
-                        "target_id": tid,
-                        "weight_km": round(d_km, 4),
-                    },
-                })
-        self.logger.info(f"Ветки Б→А/гараж/ТО (макс. {k} на станцию): {len(features)} рёбер")
+                    cand.append((d_km, lon_t, lat_t, tid))
+            cand.sort(key=lambda x: x[0])
+            for d_km, lon_t, lat_t, tid in cand[:kk]:
+                features.append(
+                    {
+                        "type": "Feature",
+                        "geometry": {"type": "LineString", "coordinates": [[lon_b, lat_b], [lon_t, lat_t]]},
+                        "properties": {
+                            "edge_type": "branch",
+                            "source_id": str(idx_b),
+                            "target_id": tid,
+                            "weight_km": round(d_km, 4),
+                        },
+                    }
+                )
+        self.logger.info(f"Ветки Б→А/гараж/ТО (макс. {kk} на станцию): {len(features)} рёбер")
         return features
 
     def build_local_edges(
@@ -749,37 +712,38 @@ class StationPlacement:
         k = min(max_neighbors_b, len(b_indices) - 1)
         seen_edges = set()
         for i in range(len(b_indices)):
-            candidates = []
+            cand = []
             for j in range(len(b_indices)):
                 if j == i:
                     continue
                 d_km = haversine_km(b_pts[i, 1], b_pts[i, 0], b_pts[j, 1], b_pts[j, 0])
                 if d_km <= max_edge_km:
-                    candidates.append((d_km, j))
-            candidates.sort(key=lambda x: x[0])
-            for d_km, j in candidates[:k]:
+                    cand.append((d_km, j))
+            cand.sort(key=lambda x: x[0])
+            for d_km, j in cand[:k]:
                 ui, vi = b_indices[i], b_indices[j]
                 edge_key = (min(ui, vi), max(ui, vi))
                 if edge_key in seen_edges:
                     continue
                 seen_edges.add(edge_key)
-                features.append({
-                    "type": "Feature",
-                    "geometry": {
-                        "type": "LineString",
-                        "coordinates": [[b_pts[i, 0], b_pts[i, 1]], [b_pts[j, 0], b_pts[j, 1]]],
-                    },
-                    "properties": {
-                        "edge_type": "local",
-                        "source_id": str(ui),
-                        "target_id": str(vi),
-                        "weight_km": round(d_km, 4),
-                    },
-                })
+                features.append(
+                    {
+                        "type": "Feature",
+                        "geometry": {
+                            "type": "LineString",
+                            "coordinates": [[b_pts[i, 0], b_pts[i, 1]], [b_pts[j, 0], b_pts[j, 1]]],
+                        },
+                        "properties": {
+                            "edge_type": "local",
+                            "source_id": str(ui),
+                            "target_id": str(vi),
+                            "weight_km": round(d_km, 4),
+                        },
+                    }
+                )
         self.logger.info(f"Локальные рёбра Б↔Б (макс. {max_neighbors_b} на станцию): {len(features)}")
         return features
 
-    # --- Шаг 4: гаражи (k-median или жадно по покрытию спроса) ---
     def place_garages(
         self,
         demand: gpd.GeoDataFrame,
@@ -795,7 +759,9 @@ class StationPlacement:
         if garage_candidates is None or len(garage_candidates) == 0:
             return gpd.GeoDataFrame()
         if demand is None or len(demand) == 0:
-            return garage_candidates.iloc[:k].copy()
+            out = garage_candidates.iloc[:k].copy()
+            out["station_type"] = "garage"
+            return out
 
         dem_pts = _points_array(demand)
         weights = demand["weight"].values if "weight" in demand.columns else np.ones(len(demand))
@@ -803,7 +769,6 @@ class StationPlacement:
         n_cand = len(cand_pts)
         total_weight = float(weights.sum()) if len(weights) > 0 else 0.0
 
-        # Режим покрытия: жадно добавляем гаражи, пока не покроем долю спроса (как зарядки типа А)
         if coverage_ratio_target is not None and total_weight > 0:
             min_dist_km = max(0.0, float(min_distance_factor)) * radius_km
             covered = np.zeros(len(dem_pts), dtype=bool)
@@ -818,7 +783,8 @@ class StationPlacement:
                         continue
                     if chosen and min_dist_km > 0:
                         if any(
-                            haversine_km(cand_pts[c, 1], cand_pts[c, 0], cand_pts[prev, 1], cand_pts[prev, 0]) < min_dist_km
+                            haversine_km(cand_pts[c, 1], cand_pts[c, 0], cand_pts[prev, 1], cand_pts[prev, 0])
+                            < min_dist_km
                             for prev in chosen
                         ):
                             continue
@@ -848,9 +814,7 @@ class StationPlacement:
             )
             return out
 
-        # Режим k-median: фиксированное число гаражей
-        chosen = []
-        # Ближайший выбранный гараж для каждого спроса (индекс в chosen)
+        chosen: List[int] = []
         nearest = np.full(len(dem_pts), -1)
         best_dist = np.full(len(dem_pts), np.inf)
 
@@ -860,10 +824,10 @@ class StationPlacement:
             for c in range(n_cand):
                 if c in chosen:
                     continue
-                # Гараж не должен попадать в радиус другого уже выбранного гаража
                 if chosen:
                     if any(
-                        haversine_km(cand_pts[c, 1], cand_pts[c, 0], cand_pts[prev, 1], cand_pts[prev, 0]) <= radius_km
+                        haversine_km(cand_pts[c, 1], cand_pts[c, 0], cand_pts[prev, 1], cand_pts[prev, 0])
+                        <= radius_km
                         for prev in chosen
                     ):
                         continue
@@ -872,7 +836,7 @@ class StationPlacement:
                 for j in range(len(dem_pts)):
                     d = haversine_km(lat_c, lon_c, dem_pts[j, 1], dem_pts[j, 0])
                     if d > radius_km:
-                        cost += weights[j] * radius_km * 2  # штраф за непокрытие
+                        cost += weights[j] * radius_km * 2
                     else:
                         cost += weights[j] * min(d, best_dist[j])
                 if cost < best_cost:
@@ -887,9 +851,7 @@ class StationPlacement:
                 if d < best_dist[j]:
                     best_dist[j] = d
                     nearest[j] = len(chosen) - 1
-        # Пост-фильтр: убираем "лишние" гаражи, которые почти не обслуживают спрос.
-        # Считаем, какой вес спроса реально обслуживает каждый выбранный гараж
-        # (точки спроса, для которых он является ближайшим и в радиусе radius_km).
+
         rows = []
         total_weight = float(weights.sum()) if len(weights) > 0 else 0.0
         served_weight = np.zeros(len(chosen), dtype=float) if chosen else np.array([])
@@ -901,17 +863,13 @@ class StationPlacement:
             if len(chosen) > 1:
                 max_served = float(served_weight.max()) if served_weight.size > 0 else 0.0
                 keep_positions = []
-                # Минимальная доля спроса для "осмысленного" гаража (от общего веса)
-                min_share_total = 0.05  # 5% от всего спроса
+                min_share_total = 0.05
                 for pos in range(len(chosen)):
                     share_total = (served_weight[pos] / total_weight) if total_weight > 0 else 0.0
                     share_rel = (served_weight[pos] / max_served) if max_served > 0 else 0.0
-                    # Оставляем гараж, если он покрывает заметную часть спроса сам по себе
-                    # или хотя бы не намного хуже лучшего (чтобы не удалить все).
                     if share_total >= min_share_total or share_rel >= 0.3:
                         keep_positions.append(pos)
                 if not keep_positions:
-                    # Если порог слишком строгий и никого не оставили — оставляем лучший по покрытию.
                     best_pos = int(np.argmax(served_weight)) if served_weight.size > 0 else 0
                     keep_positions = [best_pos]
                 chosen = [chosen[pos] for pos in keep_positions]
@@ -924,7 +882,6 @@ class StationPlacement:
         self.logger.info(f"Гаражи: размещено {len(out)}")
         return out
 
-    # --- Шаг 5: станции ТО (покрытие спроса или betweenness по trunk) ---
     def place_to_stations(
         self,
         trunk_graph: nx.Graph,
@@ -937,10 +894,8 @@ class StationPlacement:
         min_distance_factor: float = 2.0,
         max_to_stations: int = 100,
     ) -> gpd.GeoDataFrame:
-        """Размещение ТО: либо до k станций, либо жадно по покрытию спроса до coverage_ratio_target (как зарядки/гаражи)."""
         if to_candidates is None or len(to_candidates) == 0:
             return gpd.GeoDataFrame()
-        # Trunk может быть пустым при режиме покрытия
         if trunk_graph is None:
             trunk_graph = nx.Graph()
 
@@ -957,7 +912,6 @@ class StationPlacement:
             total_weight = float(weights.sum())
             covered = np.zeros(n_demand, dtype=bool)
 
-            # Режим покрытия: жадно до целевой доли спроса (как гаражи)
             if coverage_ratio_target is not None and total_weight > 0:
                 min_dist_km = max(0.0, float(min_distance_factor)) * radius_km
                 chosen_idx: List[int] = []
@@ -972,16 +926,21 @@ class StationPlacement:
                         if chosen_idx and min_dist_km > 0:
                             if any(
                                 haversine_km(
-                                    cand_pts[i, 1], cand_pts[i, 0],
-                                    cand_pts[j, 1], cand_pts[j, 0],
-                                ) < min_dist_km
+                                    cand_pts[i, 1],
+                                    cand_pts[i, 0],
+                                    cand_pts[j, 1],
+                                    cand_pts[j, 0],
+                                )
+                                < min_dist_km
                                 for j in chosen_idx
                             ):
                                 continue
                         lat_i, lon_i = cand_pts[i, 1], cand_pts[i, 0]
                         new_weight = 0.0
                         for d_idx in range(n_demand):
-                            if not covered[d_idx] and haversine_km(lat_i, lon_i, dem_pts[d_idx, 1], dem_pts[d_idx, 0]) <= radius_km:
+                            if not covered[d_idx] and haversine_km(
+                                lat_i, lon_i, dem_pts[d_idx, 1], dem_pts[d_idx, 0]
+                            ) <= radius_km:
                                 new_weight += weights[d_idx]
                         if new_weight > best_new_weight:
                             best_new_weight = new_weight
@@ -991,7 +950,9 @@ class StationPlacement:
                     chosen_idx.append(best_i)
                     lat_i, lon_i = cand_pts[best_i, 1], cand_pts[best_i, 0]
                     for d_idx in range(n_demand):
-                        if not covered[d_idx] and haversine_km(lat_i, lon_i, dem_pts[d_idx, 1], dem_pts[d_idx, 0]) <= radius_km:
+                        if not covered[d_idx] and haversine_km(
+                            lat_i, lon_i, dem_pts[d_idx, 1], dem_pts[d_idx, 0]
+                        ) <= radius_km:
                             covered[d_idx] = True
                 rows = [to_candidates.iloc[i].copy() for i in chosen_idx]
                 for r in rows:
@@ -1002,7 +963,6 @@ class StationPlacement:
                 )
                 return out
 
-            # Обычный режим: до k станций по покрытию
             chosen_idx = []
             for _ in range(min(k, len(cand_pts))):
                 best_i = -1
@@ -1012,16 +972,21 @@ class StationPlacement:
                         continue
                     if chosen_idx and any(
                         haversine_km(
-                            cand_pts[i, 1], cand_pts[i, 0],
-                            cand_pts[j, 1], cand_pts[j, 0],
-                        ) <= radius_km
+                            cand_pts[i, 1],
+                            cand_pts[i, 0],
+                            cand_pts[j, 1],
+                            cand_pts[j, 0],
+                        )
+                        <= radius_km
                         for j in chosen_idx
                     ):
                         continue
                     lat_i, lon_i = cand_pts[i, 1], cand_pts[i, 0]
                     new_weight = 0.0
                     for d_idx in range(n_demand):
-                        if not covered[d_idx] and haversine_km(lat_i, lon_i, dem_pts[d_idx, 1], dem_pts[d_idx, 0]) <= radius_km:
+                        if not covered[d_idx] and haversine_km(
+                            lat_i, lon_i, dem_pts[d_idx, 1], dem_pts[d_idx, 0]
+                        ) <= radius_km:
                             new_weight += weights[d_idx]
                     if new_weight > best_new_weight:
                         best_new_weight = new_weight
@@ -1031,7 +996,9 @@ class StationPlacement:
                 chosen_idx.append(best_i)
                 lat_i, lon_i = cand_pts[best_i, 1], cand_pts[best_i, 0]
                 for d_idx in range(n_demand):
-                    if not covered[d_idx] and haversine_km(lat_i, lon_i, dem_pts[d_idx, 1], dem_pts[d_idx, 0]) <= radius_km:
+                    if not covered[d_idx] and haversine_km(
+                        lat_i, lon_i, dem_pts[d_idx, 1], dem_pts[d_idx, 0]
+                    ) <= radius_km:
                         covered[d_idx] = True
 
             rows = [to_candidates.iloc[i].copy() for i in chosen_idx]
@@ -1044,13 +1011,11 @@ class StationPlacement:
             if len(out) > 0:
                 return out
 
-        # Фоллбэк: betweenness по trunk, если спроса нет или граф не пустой
         try:
             between = nx.betweenness_centrality(trunk_graph, weight="weight")
         except Exception:
             between = {n: 0.0 for n in trunk_graph.nodes()}
 
-        # Привязываем кандидатов ТО к ближайшим узлам trunk и наследуют их betweenness
         cand_pts = _points_array(to_candidates)
         trunk_node_ids = []
         trunk_pts = []
@@ -1063,7 +1028,9 @@ class StationPlacement:
             trunk_node_ids.append(n)
             trunk_pts.append((lon, lat))
         if not trunk_pts:
-            return to_candidates.iloc[:k].copy()
+            out = to_candidates.iloc[:k].copy()
+            out["station_type"] = "to"
+            return out
 
         trunk_pts = np.array(trunk_pts)
         tree = cKDTree(trunk_pts)
@@ -1077,7 +1044,6 @@ class StationPlacement:
             else:
                 scores.append((i, 0.0))
         scores.sort(key=lambda x: -x[1])
-        # Жадно берём по убыванию betweenness, но не добавляем ТО в радиус уже выбранной ТО
         chosen_idx = []
         for i, _ in scores:
             if len(chosen_idx) >= k:
@@ -1096,7 +1062,6 @@ class StationPlacement:
         self.logger.info(f"ТО: размещено {len(out)}")
         return out
 
-    # --- Шаг 6: метрики (покрытие, средняя стоимость, связность) ---
     def compute_metrics(
         self,
         demand: gpd.GeoDataFrame,
@@ -1115,14 +1080,21 @@ class StationPlacement:
         covered_weight = 0.0
         sum_dist = 0.0
         for j in range(len(dem_pts)):
-            d_min = np.min([haversine_km(charge_pts[i, 1], charge_pts[i, 0], dem_pts[j, 1], dem_pts[j, 0]) for i in range(len(charge_pts))])
+            d_min = np.min(
+                [
+                    haversine_km(charge_pts[i, 1], charge_pts[i, 0], dem_pts[j, 1], dem_pts[j, 0])
+                    for i in range(len(charge_pts))
+                ]
+            )
             if d_min <= radius_charge_km:
                 covered_weight += weights[j]
             sum_dist += weights[j] * d_min
         metrics["coverage_ratio"] = covered_weight / total_weight if total_weight > 0 else 0.0
         metrics["avg_distance_to_charge_km"] = sum_dist / total_weight if total_weight > 0 else None
         if trunk_graph is not None:
-            metrics["trunk_connected"] = nx.is_connected(trunk_graph) if trunk_graph.number_of_nodes() > 0 else False
+            metrics["trunk_connected"] = (
+                nx.is_connected(trunk_graph) if trunk_graph.number_of_nodes() > 0 else False
+            )
         return metrics
 
 
@@ -1145,8 +1117,6 @@ def run_full_pipeline(
     Запускает полный пайплайн: данные города → спрос (DBSCAN или сетка) → зарядки → гаражи/ТО → метрики.
     """
     logger = logging.getLogger(__name__)
-    from graph_service import GraphService
-
     data = data_service.get_city_data(city_name, network_type=network_type, simplify=simplify, load_no_fly_zones=True)
     buildings = data.get("buildings")
     road_graph = data.get("road_graph")
@@ -1155,24 +1125,30 @@ def run_full_pipeline(
 
     placement = StationPlacement(data_service, logger=logger)
 
-    # Шаг 1: спрос (DBSCAN по умолчанию)
     demand = placement.build_demand_points(
-        buildings, road_graph, city_boundary,
+        buildings,
+        road_graph,
+        city_boundary,
         method=demand_method,
         cell_size_m=demand_cell_m,
         dbscan_eps_m=dbscan_eps_m,
         dbscan_min_samples=dbscan_min_samples,
         use_all_buildings=use_all_buildings,
         no_fly_zones=no_fly_zones,
-        # При method="dbscan" дополнительно заполняем полигоны кластеров сеткой точек спроса,
-        # чтобы размещение станций стремилось закрывать весь кластер.
         fill_clusters=(demand_method == "dbscan"),
         cluster_fill_step_m=None,
     )
     if demand is None or len(demand) == 0:
-        return {"error": "Нет точек спроса", "demand": None, "charge_stations": None, "garages": None, "to_stations": None, "trunk_graph": None, "metrics": {}}
+        return {
+            "error": "Нет точек спроса",
+            "demand": None,
+            "charge_stations": None,
+            "garages": None,
+            "to_stations": None,
+            "trunk_graph": None,
+            "metrics": {},
+        }
 
-    # Кандидаты зарядок: крыши МКД (для типа А) + наземные (для типа Б — полное покрытие, в т.ч. отдалённые зоны)
     candidates_rooftop = data_service.get_station_candidates(
         buildings, city_boundary, no_fly_zones, road_graph, station_type="rooftop"
     )
@@ -1190,7 +1166,6 @@ def run_full_pipeline(
         else gpd.GeoDataFrame()
     )
 
-    # При спросе по DBSCAN: кандидаты зарядки строим относительно кластеров (ближайшая крыша/площадка к каждому кластеру)
     if demand_method == "dbscan" and charge_candidates_full is not None and len(charge_candidates_full) > 0:
         charge_candidates = placement.build_charge_candidates_from_clusters(
             demand, charge_candidates_full, radius_km=R_CHARGE_KM, max_distance_km=R_CHARGE_KM * 2.0
@@ -1198,7 +1173,6 @@ def run_full_pipeline(
     else:
         charge_candidates = charge_candidates_full
 
-    # Для вспомогательных станций (тип Б) нужен расширенный набор кандидатов, чтобы покрыть незанятые зоны спроса
     candidates_for_placement = (
         charge_candidates_full
         if (charge_candidates_full is not None and len(charge_candidates_full) > 0)
@@ -1207,7 +1181,6 @@ def run_full_pipeline(
     if candidates_for_placement is None or len(candidates_for_placement) == 0:
         candidates_for_placement = charge_candidates
 
-    # Шаг 2: зарядки тип А (R=1.6 км), в радиусе 3.2 км от А — только тип Б; тип Б добивают остальное.
     charge_stations, charge_metrics = placement.place_charging_stations(
         candidates_for_placement,
         demand,
@@ -1217,15 +1190,14 @@ def run_full_pipeline(
         enable_type_b=True,
         type_a_coverage_ratio=0.95,
         type_b_coverage_ratio=1.0,
-        min_center_distance_factor_a=2.0,    # А не ближе 2*1.6=3.2 км — в 3.2 км только Б
+        min_center_distance_factor_a=2.0,
         min_center_distance_factor_core_a=2.0,
         core_dense_radius_factor=5.0,
         core_radius_factor_a=0.0,
         core_weight_quantile_a=0.0,
-        min_center_distance_factor_b=0.75,   # Б плотнее — дозаполняют слабо заполненные кластеры
+        min_center_distance_factor_b=0.75,
     )
 
-    # Кандидаты гаражи и ТО (промзоны)
     garage_candidates = data_service.get_station_candidates(
         buildings, city_boundary, no_fly_zones, road_graph, station_type="garage"
     )
@@ -1237,14 +1209,14 @@ def run_full_pipeline(
     if to_candidates is None or len(to_candidates) == 0:
         to_candidates = gpd.GeoDataFrame()
 
-    # Жёстко убираем из кандидатов все точки внутри буфера подстанций (гаражи и ТО не должны там стоять)
     power_buffer_union = data_service.get_power_substation_buffer_union(buildings)
     if power_buffer_union is not None:
+
         def _drop_inside_power_buffer(cand_gdf):
             if cand_gdf is None or len(cand_gdf) == 0:
                 return cand_gdf
             keep = []
-            for idx, row in cand_gdf.iterrows():
+            for _, row in cand_gdf.iterrows():
                 pt = getattr(row.geometry, "centroid", row.geometry)
                 if pt is None:
                     keep.append(True)
@@ -1260,13 +1232,22 @@ def run_full_pipeline(
         garage_candidates = _drop_inside_power_buffer(garage_candidates)
         to_candidates = _drop_inside_power_buffer(to_candidates)
 
-    # Заглушки гаражи/ТО для trunk (если num_garages/num_to > 0 — берём первых кандидатов; при 0 — пусто)
-    garage_placeholder = (garage_candidates.iloc[:num_garages].copy() if num_garages > 0 and garage_candidates is not None and len(garage_candidates) > 0 else gpd.GeoDataFrame())
-    to_placeholder = (to_candidates.iloc[:num_to].copy() if num_to > 0 and to_candidates is not None and len(to_candidates) > 0 else gpd.GeoDataFrame())
+    garage_placeholder = (
+        garage_candidates.iloc[:num_garages].copy()
+        if num_garages > 0 and garage_candidates is not None and len(garage_candidates) > 0
+        else gpd.GeoDataFrame()
+    )
+    to_placeholder = (
+        to_candidates.iloc[:num_to].copy()
+        if num_to > 0 and to_candidates is not None and len(to_candidates) > 0
+        else gpd.GeoDataFrame()
+    )
 
     # Воздушный граф для обхода бесполётных зон и препятствий (используется в магистрали при необходимости обхода)
     air_graph = None
     try:
+        from graph_service import GraphService
+
         if city_boundary is not None:
             gs = GraphService()
             air_graph = gs.build_air_graph(
@@ -1301,12 +1282,13 @@ def run_full_pipeline(
                         geoms.append(g)
         if geoms:
             no_fly_zones_union = unary_union(geoms)
-            if no_fly_zones_union is not None and (getattr(no_fly_zones_union, "is_empty", True) or not getattr(no_fly_zones_union, "is_valid", True)):
+            if no_fly_zones_union is not None and (
+                getattr(no_fly_zones_union, "is_empty", True) or not getattr(no_fly_zones_union, "is_valid", True)
+            ):
                 no_fly_zones_union = None
     except Exception:
         no_fly_zones_union = None
 
-    # Шаг 3: trunk (с заглушками)
     trunk = placement.build_trunk_graph(
         charge_stations,
         garage_placeholder,
@@ -1316,40 +1298,30 @@ def run_full_pipeline(
         max_edge_km=R_GARAGE_TO_KM,
     )
 
-    # Шаг 4–5: гаражи и ТО размещаем по покрытию спроса (как зарядки) до 95%
     garages = placement.place_garages(
         demand,
         garage_candidates,
         k=num_garages,
         radius_km=R_GARAGE_TO_KM,
         coverage_ratio_target=0.95,
-        min_distance_factor=1.2,  # плотнее: гаражи могут быть ближе друг к другу
+        min_distance_factor=1.2,
         max_garages=100,
     )
 
-    # Чтобы станция ТО не попадала в то же здание/точку, что и гараж,
-    # отфильтруем кандидатов ТО, которые слишком близко к уже выбранным гаражам.
     filtered_to_candidates = to_candidates
-    if (
-        to_candidates is not None
-        and len(to_candidates) > 0
-        and garages is not None
-        and len(garages) > 0
-    ):
+    if to_candidates is not None and len(to_candidates) > 0 and garages is not None and len(garages) > 0:
         try:
             to_pts = _points_array(to_candidates)
             gar_pts = _points_array(garages)
             if len(to_pts) > 0 and len(gar_pts) > 0:
                 keep_indices = []
-                # Минимальное расстояние между станцией ТО и гаражом (км)
-                min_sep_km = 0.2  # ~200 м, чтобы точно не одно и то же здание
+                min_sep_km = 0.2
                 for i in range(len(to_pts)):
                     lon_t, lat_t = to_pts[i, 0], to_pts[i, 1]
                     too_close = False
                     for j in range(len(gar_pts)):
                         lon_g, lat_g = gar_pts[j, 0], gar_pts[j, 1]
-                        d_km = haversine_km(lat_t, lon_t, lat_g, lon_g)
-                        if d_km < min_sep_km:
+                        if haversine_km(lat_t, lon_t, lat_g, lon_g) < min_sep_km:
                             too_close = True
                             break
                     if not too_close:
@@ -1357,7 +1329,6 @@ def run_full_pipeline(
                 if keep_indices:
                     filtered_to_candidates = to_candidates.iloc[keep_indices].copy()
                 else:
-                    # Если всех отфильтровали — оставляем исходных кандидатов, чтобы не потерять ТО вообще.
                     filtered_to_candidates = to_candidates
         except Exception:
             filtered_to_candidates = to_candidates
@@ -1369,11 +1340,10 @@ def run_full_pipeline(
         k=num_to,
         radius_km=R_GARAGE_TO_KM,
         coverage_ratio_target=0.95,
-        min_distance_factor=1.2,  # плотнее: станции ТО могут быть ближе друг к другу
+        min_distance_factor=1.2,
         max_to_stations=100,
     )
 
-    # Пересобираем trunk с уже выбранными гаражами и ТО
     trunk = placement.build_trunk_graph(
         charge_stations,
         garages,
@@ -1383,7 +1353,6 @@ def run_full_pipeline(
         max_edge_km=R_GARAGE_TO_KM,
     )
 
-    # Ветки: Б → (А / гараж / ТО), макс. 3 связи на станцию Б
     branch_edges = placement.build_branch_edges(
         charge_stations,
         garages,
@@ -1391,12 +1360,10 @@ def run_full_pipeline(
         k_nearest=3,
         max_branch_km=R_GARAGE_TO_KM,
     )
-    # Локальная сеть Б↔Б, макс. 2 связи на станцию
     local_edges = placement.build_local_edges(
         charge_stations, max_edge_km=R_GARAGE_TO_KM, max_neighbors_b=2
     )
 
-    # Шаг 6: метрики
     metrics = placement.compute_metrics(demand, charge_stations, trunk, radius_charge_km=R_CHARGE_KM)
     metrics["charge"] = charge_metrics
 
@@ -1418,3 +1385,107 @@ def run_full_pipeline(
             "D_max_km": D_MAX_KM,
         },
     }
+
+
+def _empty_fc() -> Dict[str, Any]:
+    return {"type": "FeatureCollection", "features": []}
+
+
+def _gdf_to_fc(gdf: Optional[gpd.GeoDataFrame]) -> Dict[str, Any]:
+    """GeoDataFrame → GeoJSON FeatureCollection (сериализуемые свойства)."""
+    if gdf is None or len(gdf) == 0:
+        return _empty_fc()
+    from shapely.geometry import mapping
+
+    features: List[Dict[str, Any]] = []
+    for _, row in gdf.iterrows():
+        geom = row.geometry
+        if geom is None or getattr(geom, "is_empty", True):
+            continue
+        props: Dict[str, Any] = {}
+        for col in gdf.columns:
+            if col == "geometry":
+                continue
+            val = row[col]
+            if pd.isna(val):
+                props[col] = None
+            elif hasattr(val, "item"):
+                try:
+                    props[col] = val.item()
+                except Exception:
+                    props[col] = str(val)
+            else:
+                props[col] = val
+        features.append({"type": "Feature", "geometry": mapping(geom), "properties": props})
+    return {"type": "FeatureCollection", "features": features}
+
+
+def _list_features_to_fc(features: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
+    if not features:
+        return _empty_fc()
+    return {"type": "FeatureCollection", "features": list(features)}
+
+
+def trunk_graph_to_geojson_features(trunk_graph: Optional[nx.Graph]) -> List[Dict[str, Any]]:
+    """Рёбра магистрали → GeoJSON Features (LineString); при наличии geometry_coords — полилиния."""
+    if trunk_graph is None or trunk_graph.number_of_edges() == 0:
+        return []
+    feats: List[Dict[str, Any]] = []
+    for u, v, data in trunk_graph.edges(data=True):
+        coords = data.get("geometry_coords")
+        if coords is not None and len(coords) >= 2:
+            line_coords = [[float(c[0]), float(c[1])] for c in coords]
+        else:
+            du = trunk_graph.nodes[u]
+            dv = trunk_graph.nodes[v]
+            lon1 = du.get("lon")
+            lat1 = du.get("lat")
+            lon2 = dv.get("lon")
+            lat2 = dv.get("lat")
+            if lon1 is None or lat1 is None or lon2 is None or lat2 is None:
+                continue
+            line_coords = [[float(lon1), float(lat1)], [float(lon2), float(lat2)]]
+        w = data.get("weight", data.get("length"))
+        feats.append(
+            {
+                "type": "Feature",
+                "geometry": {"type": "LineString", "coordinates": line_coords},
+                "properties": {
+                    "source": str(u),
+                    "target": str(v),
+                    "weight_km": float(w) if w is not None else None,
+                },
+            }
+        )
+    return feats
+
+
+def pipeline_result_to_geojson(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Ответ API `/api/stations/placement`: слои для карты + метрики и параметры."""
+    err = raw.get("error")
+    charge = raw.get("charge_stations")
+    if charge is not None and len(charge) > 0 and "station_type" in charge.columns:
+        charging_a = charge[charge["station_type"] == "charge_a"]
+        charging_b = charge[charge["station_type"] == "charge_b"]
+    elif charge is not None and len(charge) > 0:
+        charging_a = charge
+        charging_b = gpd.GeoDataFrame()
+    else:
+        charging_a = gpd.GeoDataFrame()
+        charging_b = gpd.GeoDataFrame()
+
+    trunk_feats = trunk_graph_to_geojson_features(raw.get("trunk_graph"))
+    out: Dict[str, Any] = {
+        "charging_type_a": _gdf_to_fc(charging_a),
+        "charging_type_b": _gdf_to_fc(charging_b),
+        "garages": _gdf_to_fc(raw.get("garages")),
+        "to_stations": _gdf_to_fc(raw.get("to_stations")),
+        "trunk": {"type": "FeatureCollection", "features": trunk_feats},
+        "branch_edges": _list_features_to_fc(raw.get("branch_edges")),
+        "local_edges": _list_features_to_fc(raw.get("local_edges")),
+        "metrics": raw.get("metrics") or {},
+        "params": raw.get("params") or {},
+    }
+    if err:
+        out["error"] = err
+    return out

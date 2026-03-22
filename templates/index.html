@@ -205,6 +205,24 @@
             </button>
         </div>
         <div class="flight-levels-panel" style="margin-top:12px">
+            <h3 style="margin:0 0 8px">Зарядка / гараж / ТО (правила R)</h3>
+            <p style="font-size:11px; color:#6b7280; margin:0 0 8px; line-height:1.4">
+                Зарядка тип А — крыши МКД, ядро спроса; тип Б — доп. покрытие. Гараж и ТО — промзоны.
+                Магистраль: зарядки А + гаражи + ТО. Радиусы: R_charge и R_garage/TO в ответе API (<code>params</code>).
+            </p>
+            <div class="height-legend" style="flex-wrap:wrap; gap:4px 8px">
+                <span><span class="swatch" style="background:#7c3aed"></span> Зарядка А</span>
+                <span><span class="swatch" style="background:#06b6d4"></span> Зарядка Б</span>
+                <span><span class="swatch" style="background:#92400e"></span> Гараж</span>
+                <span><span class="swatch" style="background:#db2777"></span> ТО</span>
+                <span><span class="swatch" style="background:#ea580c"></span> Магистраль</span>
+            </div>
+            <button class="floating-btn btn-secondary" id="loadStationsRulesBtn" style="width:100%; margin-top:8px" onclick="loadStationsRulesPlacement()">
+                Рассчитать зарядки, гаражи, ТО
+            </button>
+            <div id="stationsRulesStats" style="font-size:12px; color:#6b7280; margin-top:8px"></div>
+        </div>
+        <div class="flight-levels-panel" style="margin-top:12px">
             <h3 style="margin:0 0 8px">Высота зданий</h3>
             <div class="height-legend">
                 <span><span class="swatch" style="background:#22c55e"></span> &lt;15 м</span>
@@ -222,59 +240,11 @@
                 <span id="buildingsLabel">Скрыть здания</span>
             </button>
         </div>
-        <div class="flight-levels-panel" style="margin-top:12px; border-top:1px solid #e5e7eb; padding-top:12px">
-            <h3 style="margin:0 0 8px">Станции (зарядка, гаражи, ТО)</h3>
-            <p style="font-size:12px; color:#6b7280; margin:0 0 8px">
-                R_charge = 1.6 км, R_garage/TO = 3.2 км (×1/4 от базовых)
-            </p>
-            <button class="floating-btn" style="width:100%" onclick="loadStationsPlacement()">Разместить станции</button>
-            <button class="floating-btn btn-secondary" style="width:100%; margin-top:6px" onclick="loadSavedPlacement()" title="Загрузить последнее сохранённое размещение (после перезапуска сервера)">Загрузить сохранённое</button>
-            <div id="radiusVisibilityPanel" style="margin-top:10px; display:none; padding:8px; background:#f8fafc; border-radius:8px; border:1px solid #e2e8f0">
-                <div style="font-size:13px; font-weight:600; color:#374151; margin-bottom:6px">Радиус обслуживания</div>
-                <label style="display:flex; align-items:center; gap:6px; margin-bottom:4px; cursor:pointer; font-size:13px">
-                    <input type="checkbox" id="radiusCharge" onchange="applyRadiusVisibility()" />
-                    <span style="color:#16a34a">Зарядки</span>
-                </label>
-                <label style="display:flex; align-items:center; gap:6px; margin-bottom:4px; cursor:pointer; font-size:13px">
-                    <input type="checkbox" id="radiusGarage" onchange="applyRadiusVisibility()" />
-                    <span style="color:#2563eb">Гаражи</span>
-                </label>
-                <label style="display:flex; align-items:center; gap:6px; margin-bottom:6px; cursor:pointer; font-size:13px">
-                    <input type="checkbox" id="radiusTO" onchange="applyRadiusVisibility()" />
-                    <span style="color:#d97706">ТО</span>
-                </label>
-                <div style="display:flex; gap:6px; margin-top:4px">
-                    <button type="button" class="floating-btn btn-secondary" style="padding:6px 10px; font-size:12px" onclick="setAllRadiusVisibility(true)">Все</button>
-                    <button type="button" class="floating-btn btn-secondary" style="padding:6px 10px; font-size:12px" onclick="setAllRadiusVisibility(false)">Снять все</button>
-                </div>
-            </div>
-            <div id="routesVisibilityPanel" style="margin-top:10px; display:none; padding:8px; background:#f9fafb; border-radius:8px; border:1px solid #e2e8f0">
-                <div style="font-size:13px; font-weight:600; color:#374151; margin-bottom:6px">Маршруты</div>
-                <label style="display:flex; align-items:center; gap:6px; margin-bottom:4px; cursor:pointer; font-size:13px">
-                    <input type="checkbox" id="routesTrunk" onchange="applyRoutesVisibility()" />
-                    <span style="color:#4f46e5">Магистраль</span>
-                </label>
-                <label style="display:flex; align-items:center; gap:6px; margin-bottom:4px; cursor:pointer; font-size:13px">
-                    <input type="checkbox" id="routesBranch" onchange="applyRoutesVisibility()" />
-                    <span style="color:#0d9488">Ветки Б→А/гараж/ТО</span>
-                </label>
-                <label style="display:flex; align-items:center; gap:6px; margin-bottom:6px; cursor:pointer; font-size:13px">
-                    <input type="checkbox" id="routesLocal" onchange="applyRoutesVisibility()" />
-                    <span style="color:#14b8a6">Локальная сеть Б↔Б</span>
-                </label>
-                <div style="display:flex; gap:6px; margin-top:4px">
-                    <button type="button" class="floating-btn btn-secondary" style="padding:6px 10px; font-size:12px" onclick="setAllRoutesVisibility(true)">Все</button>
-                    <button type="button" class="floating-btn btn-secondary" style="padding:6px 10px; font-size:12px" onclick="setAllRoutesVisibility(false)">Снять все</button>
-                </div>
-            </div>
-            <div id="stationsMetrics" style="margin-top:8px; font-size:12px; color:#374151; display:none"></div>
-        </div>
     </div>
 
     <script>
         let map, boundaryLayer, noFlyZonesLayer, buildingsLayer, clustersLayer, clusterHullsLayer, clusterPointsLayer;
-        let demandLayer, chargeStationsLayer, garagesLayer, toStationsLayer, trunkEdgesLayer, branchEdgesLayer, localEdgesLayer;
-        let chargeRadiusLayer, garageRadiusLayer, toRadiusLayer;
+        let stationsRulesLayerGroup = null;
         let clusterHullsVisible = true;
         let clusterPointsVisible = false; // точки кластеров (центроиды/точки спроса) по умолчанию скрыты
         let buildingsVisible = true;
@@ -419,47 +389,43 @@
                 }
                 const epsM = data.dbscan_eps_m != null ? Number(data.dbscan_eps_m) : 180;
                 const hullsFc = data.cluster_hulls || { type: 'FeatureCollection', features: [] };
+                /** Устойчивый отличающийся цвет по id кластера (золотой угол в HSL). */
+                function colorForClusterId(cid) {
+                    const n = Math.max(0, parseInt(cid, 10) || 0);
+                    const h = (n * 137.508) % 360;
+                    return {
+                        fill: 'hsl(' + h + ', 70%, 50%)',
+                        stroke: 'hsl(' + h + ', 70%, 28%)',
+                    };
+                }
                 clustersLayer = L.layerGroup();
                 if (hullsFc.features && hullsFc.features.length > 0) {
-                    const demandTypeColor = {
-                        apartment: '#22c55e',
-                        private: '#f97316',
-                        retail: '#a855f7',
-                        office: '#0ea5e9',
-                        public: '#eab308',
-                        industrial: '#64748b',
-                        other: '#6366f1'
-                    };
-                    const demandTypeLabel = {
-                        apartment: 'МКД',
-                        private: 'Частный сектор',
-                        retail: 'Магазины / ТЦ',
-                        office: 'Офисы / коммерция',
-                        public: 'Общественные',
-                        industrial: 'Промзона',
-                        other: 'Прочее'
-                    };
                     clusterHullsLayer = L.geoJSON(hullsFc, {
                         style: function(feature) {
-                            const t = feature.properties && feature.properties.demand_type;
-                            const color = demandTypeColor[t] || demandTypeColor.other;
+                            const cid = feature.properties && feature.properties.cluster_id != null
+                                ? feature.properties.cluster_id
+                                : 0;
+                            const c = colorForClusterId(cid);
                             return {
-                                color: color,
-                                weight: 1,
-                                opacity: 0.45,
-                                fillColor: color,
-                                fillOpacity: 0.10,
+                                color: c.stroke,
+                                weight: 3,
+                                opacity: 1,
+                                fillColor: c.fill,
+                                fillOpacity: 0.18,
+                                lineCap: 'round',
+                                lineJoin: 'round',
                             };
                         },
                         onEachFeature: function(feature, layer) {
                             const p = feature.properties || {};
                             const w = p.weight != null ? p.weight : '—';
-                            const t = p.demand_type || 'other';
-                            const label = demandTypeLabel[t] || t;
+                            const cid = p.cluster_id != null ? p.cluster_id : '—';
+                            const nb = p.n_buildings != null ? p.n_buildings : '—';
                             layer.bindPopup(
                                 '<strong>Область спроса</strong>'
-                                + '<br>Тип: ' + label
+                                + '<br>Кластер №' + cid
                                 + '<br>Вес (агр. точек): ' + w
+                                + '<br>Зданий: ' + nb
                             );
                         }
                     });
@@ -467,32 +433,32 @@
                 } else {
                     clusterHullsLayer = null;
                 }
-                const pointColors = { apartment: '#22c55e', private: '#f97316', retail: '#a855f7', office: '#0ea5e9', public: '#eab308', industrial: '#64748b', other: '#6366f1' };
-                const pointLabels = { apartment: 'МКД', private: 'Частный сектор', retail: 'Магазины / ТЦ', office: 'Офисы', public: 'Общественные', industrial: 'Промзона', other: 'Прочее' };
                 clusterPointsLayer = L.geoJSON(fc, {
                     pointToLayer: function(feature, latlng) {
                         const p = feature.properties || {};
                         const w = p.weight != null ? p.weight : 1;
-                        const t = p.demand_type || 'other';
+                        const cid = p.cluster_id != null ? p.cluster_id : 0;
                         const r = Math.min(10, Math.max(3, 3 + Math.log2(w)));
-                        const color = pointColors[t] || pointColors.other;
+                        const c = colorForClusterId(cid);
                         return L.circleMarker(latlng, {
                             radius: r,
-                            fillColor: color,
-                            color: color,
-                            weight: 2,
-                            fillOpacity: 0.9,
+                            fillColor: c.fill,
+                            color: c.stroke,
+                            weight: 3,
+                            fillOpacity: 0.92,
+                            opacity: 1,
                         });
                     },
                     onEachFeature: function(feature, layer) {
                         const p = feature.properties || {};
                         const w = p.weight != null ? p.weight : '—';
-                        const t = p.demand_type || 'other';
-                        const label = pointLabels[t] || t;
+                        const cid = p.cluster_id != null ? p.cluster_id : '—';
+                        const nb = p.n_buildings != null ? p.n_buildings : '—';
                         layer.bindPopup(
                             '<strong>Точка спроса</strong>'
-                            + '<br>Тип: ' + label
+                            + '<br>Кластер №' + cid
                             + '<br>Вес (агр. точек): ' + w
+                            + '<br>Зданий: ' + nb
                         );
                     }
                 });
@@ -519,19 +485,9 @@
                 alert('Выберите или введите город');
                 return;
             }
-            statusEl.textContent = 'Загрузка данных города...';
+            statusEl.textContent = 'Загрузка границ и зданий...';
             statsEl.textContent = '';
             try {
-                const cityUrl = new URL('/api/city', window.location.origin);
-                cityUrl.searchParams.set('city', city);
-                cityUrl.searchParams.set('network_type', network);
-                cityUrl.searchParams.set('simplify', simplify);
-                const cityResp = await fetch(cityUrl);
-                if (!cityResp.ok) {
-                    const err = await cityResp.json().catch(() => ({}));
-                    throw new Error(err.detail || 'Ошибка загрузки города');
-                }
-                statusEl.textContent = 'Загрузка границ и зданий...';
                 const mapUrl = new URL('/api/city/map', window.location.origin);
                 mapUrl.searchParams.set('city', city);
                 mapUrl.searchParams.set('network_type', network);
@@ -563,9 +519,14 @@
                     map.removeLayer(clusterHullsLayer);
                     clusterHullsLayer = null;
                 }
+                if (stationsRulesLayerGroup) {
+                    map.removeLayer(stationsRulesLayerGroup);
+                    stationsRulesLayerGroup = null;
+                }
+                const srsEl = document.getElementById('stationsRulesStats');
+                if (srsEl) srsEl.textContent = '';
                 const toggleClusterBtn = document.getElementById('toggleClusterHullsBtn');
                 if (toggleClusterBtn) toggleClusterBtn.style.display = 'none';
-                removeStationLayers();
                 if (mapData.no_fly_zones) {
                     noFlyZonesLayer = L.geoJSON(mapData.no_fly_zones, {
                         style: {
@@ -609,284 +570,6 @@
                 statusEl.textContent = '✗ Ошибка: ' + e.message;
                 statsEl.textContent = '';
             }
-        }
-
-        function removeStationLayers() {
-            for (const l of [demandLayer, chargeStationsLayer, garagesLayer, toStationsLayer, trunkEdgesLayer,
-                branchEdgesLayer, localEdgesLayer, chargeRadiusLayer, garageRadiusLayer, toRadiusLayer]) {
-                if (l && map && map.hasLayer && map.hasLayer(l)) map.removeLayer(l);
-            }
-            demandLayer = chargeStationsLayer = garagesLayer = toStationsLayer = trunkEdgesLayer = branchEdgesLayer = localEdgesLayer = null;
-            chargeRadiusLayer = garageRadiusLayer = toRadiusLayer = null;
-            const m = document.getElementById('stationsMetrics');
-            if (m) { m.style.display = 'none'; m.innerHTML = ''; }
-            const panel = document.getElementById('radiusVisibilityPanel');
-            if (panel) panel.style.display = 'none';
-            ['radiusCharge','radiusGarage','radiusTO'].forEach(id => { const c = document.getElementById(id); if (c) c.checked = false; });
-            const routesPanel = document.getElementById('routesVisibilityPanel');
-            if (routesPanel) routesPanel.style.display = 'none';
-            ['routesTrunk','routesBranch','routesLocal'].forEach(id => { const c = document.getElementById(id); if (c) c.checked = false; });
-        }
-
-        function applyPlacementData(data) {
-            ensureMap();
-            const R_CHARGE_M = 1600;
-            const R_GARAGE_TO_M = 3200;
-            // Слой точек спроса (серые точки) отключён по умолчанию,
-            // чтобы при загрузке размещения не захламлять карту.
-            // Если понадобится вернуть — можно быстро включить, выставив window.SHOW_DEMAND_POINTS = true в консоли.
-            if (window.SHOW_DEMAND_POINTS && data.demand && data.demand.features && data.demand.features.length) {
-                demandLayer = L.geoJSON(data.demand, {
-                    filter: (f) => !(f.properties && f.properties.is_cluster_fill),
-                    style: { color: '#94a3b8', fillColor: '#94a3b8', weight: 1, radius: 4 },
-                    pointToLayer: (f, latlng) =>
-                        L.circleMarker(latlng, {
-                            radius: 4,
-                            fillColor: '#94a3b8',
-                            color: '#64748b',
-                            weight: 1,
-                            fillOpacity: 0.7
-                        }),
-                }).addTo(map);
-            }
-                if (data.charge_stations && data.charge_stations.features && data.charge_stations.features.length) {
-                    chargeRadiusLayer = L.layerGroup();
-                    data.charge_stations.features.forEach(f => {
-                        const coords = f.geometry && f.geometry.coordinates;
-                        const typeA = (f.properties && f.properties.station_type === 'charge_a');
-                        if (coords && coords.length >= 2) {
-                            L.circle([coords[1], coords[0]], {
-                                radius: R_CHARGE_M,
-                                color: typeA ? '#16a34a' : '#0d9488',
-                                weight: 1,
-                                fillColor: typeA ? '#22c55e' : '#14b8a6',
-                                fillOpacity: typeA ? 0.14 : 0.08
-                            }).addTo(chargeRadiusLayer);
-                        }
-                    });
-                    chargeStationsLayer = L.geoJSON(data.charge_stations, {
-                        pointToLayer: (f, latlng) => {
-                            const typeA = (f.properties && f.properties.station_type === 'charge_a');
-                            return L.circleMarker(latlng, {
-                                radius: typeA ? 10 : 7,
-                                fillColor: typeA ? '#22c55e' : '#14b8a6',
-                                color: typeA ? '#16a34a' : '#0d9488',
-                                weight: 2,
-                                fillOpacity: 0.9
-                            });
-                        },
-                        onEachFeature: (f, layer) => {
-                            const typeA = (f.properties && f.properties.station_type === 'charge_a');
-                            const p = f.properties || {};
-                            let roofInfo = '';
-                            if (p.roof_posts_total != null) {
-                                const a = (p.roof_area_m2 != null) ? (Number(p.roof_area_m2).toLocaleString('ru-RU', { maximumFractionDigits: 0 }) + ' м²') : '—';
-                                const aCh = (p.roof_area_charge_m2 != null) ? (Number(p.roof_area_charge_m2).toLocaleString('ru-RU', { maximumFractionDigits: 0 }) + ' м²') : '—';
-                                const aW = (p.roof_area_wait_m2 != null) ? (Number(p.roof_area_wait_m2).toLocaleString('ru-RU', { maximumFractionDigits: 0 }) + ' м²') : '—';
-                                roofInfo = '<br><br><strong>Крыша (оценка вместимости)</strong>'
-                                    + '<br>Площадь крыши: ' + a
-                                    + '<br>Площадь под зарядку/ожидание (60/40 от 50% крыши): ' + aCh + ' / ' + aW
-                                    + '<br>Постов всего: ' + p.roof_posts_total
-                                    + '<br>Зарядка/ожидание: ' + p.roof_posts_charge + ' / ' + p.roof_posts_wait;
-                            }
-                            layer.bindPopup(
-                                (typeA
-                                    ? 'Зарядка тип А (основное покрытие)<br>R = 1.6 км'
-                                    : 'Вспомогательная зарядка (тип Б)<br>Покрытие остального спроса, связь с тип А, не магистраль<br>R = 1.6 км'
-                                ) + roofInfo
-                            );
-                        }
-                    }).addTo(map);
-                }
-                if (data.garages && data.garages.features && data.garages.features.length) {
-                    garageRadiusLayer = L.layerGroup();
-                    data.garages.features.forEach(f => {
-                        const coords = f.geometry && f.geometry.coordinates;
-                        if (coords && coords.length >= 2) {
-                            L.circle([coords[1], coords[0]], {
-                                radius: R_GARAGE_TO_M,
-                                color: '#2563eb',
-                                weight: 1,
-                                fillColor: '#3b82f6',
-                                fillOpacity: 0.08
-                            }).addTo(garageRadiusLayer);
-                        }
-                    });
-                    garagesLayer = L.geoJSON(data.garages, {
-                        pointToLayer: (f, latlng) => L.circleMarker(latlng, { radius: 10, fillColor: '#3b82f6', color: '#2563eb', weight: 2, fillOpacity: 0.9 }),
-                        onEachFeature: (f, layer) => layer.bindPopup('Гараж<br>R = 3.2 км')
-                    }).addTo(map);
-                }
-                if (data.to_stations && data.to_stations.features && data.to_stations.features.length) {
-                    toRadiusLayer = L.layerGroup();
-                    data.to_stations.features.forEach(f => {
-                        const coords = f.geometry && f.geometry.coordinates;
-                        if (coords && coords.length >= 2) {
-                            L.circle([coords[1], coords[0]], {
-                                radius: R_GARAGE_TO_M,
-                                color: '#d97706',
-                                weight: 1,
-                                fillColor: '#f59e0b',
-                                fillOpacity: 0.08
-                            }).addTo(toRadiusLayer);
-                        }
-                    });
-                    toStationsLayer = L.geoJSON(data.to_stations, {
-                        pointToLayer: (f, latlng) => L.circleMarker(latlng, { radius: 10, fillColor: '#f59e0b', color: '#d97706', weight: 2, fillOpacity: 0.9 }),
-                        onEachFeature: (f, layer) => layer.bindPopup('Станция ТО<br>R = 12.8 км')
-                    }).addTo(map);
-                }
-                if (data.trunk_edges && data.trunk_edges.features && data.trunk_edges.features.length) {
-                    trunkEdgesLayer = L.geoJSON(data.trunk_edges, {
-                        style: { color: '#6366f1', weight: 3, opacity: 0.8 }
-                    });
-                    trunkEdgesLayer.addTo(map);
-                }
-                const localPathsStyle = { color: '#0d9488', weight: 2, opacity: 0.85 };
-                if (data.branch_edges && data.branch_edges.features && data.branch_edges.features.length) {
-                    branchEdgesLayer = L.geoJSON(data.branch_edges, { style: localPathsStyle });
-                    branchEdgesLayer.addTo(map);
-                }
-                if (data.local_edges && data.local_edges.features && data.local_edges.features.length) {
-                    localEdgesLayer = L.geoJSON(data.local_edges, { style: localPathsStyle });
-                    localEdgesLayer.addTo(map);
-                }
-                const m = document.getElementById('stationsMetrics');
-                if (m && data.metrics) {
-                    const charge = data.metrics.charge || {};
-                    const typeA = charge.placed_type_a != null ? charge.placed_type_a : (charge.placed != null ? charge.placed : '—');
-                    const extra = charge.placed_extra != null ? charge.placed_extra : '—';
-                    m.innerHTML = [
-                        'Покрытие спроса: ' + (data.metrics.coverage_ratio != null ? (data.metrics.coverage_ratio * 100).toFixed(1) + '%' : (charge.coverage_ratio != null ? (charge.coverage_ratio * 100).toFixed(1) + '%' : '—')),
-                        'Зарядок тип А: ' + typeA + ', вспом. (Б): ' + extra,
-                        'Связность магистрали: ' + (data.metrics.trunk_connected ? 'да' : 'нет')
-                    ].join('<br>');
-                    m.style.display = 'block';
-                }
-                const panel = document.getElementById('radiusVisibilityPanel');
-                if (panel) { panel.style.display = 'block'; applyRadiusVisibility(); }
-                const routesPanel = document.getElementById('routesVisibilityPanel');
-                if (routesPanel) {
-                    routesPanel.style.display = 'block';
-                    // По умолчанию показываем только магистраль, локальные можно включить отдельно
-                    setAllRoutesVisibility(false);
-                    const trunkCheckbox = document.getElementById('routesTrunk');
-                    if (trunkCheckbox) trunkCheckbox.checked = true;
-                    applyRoutesVisibility();
-                }
-        }
-
-        async function loadStationsPlacement() {
-            const city = getCityQuery();
-            if (!city) {
-                alert('Сначала выберите город и нажмите «Загрузить»');
-                return;
-            }
-            const statusEl = document.getElementById('status');
-            statusEl.textContent = 'Расчёт размещения станций...';
-            removeStationLayers();
-            try {
-                const url = new URL('/api/stations/placement', window.location.origin);
-                url.searchParams.set('city', city);
-                url.searchParams.set('network_type', 'drive');
-                url.searchParams.set('simplify', 'true');
-                url.searchParams.set('demand_cell_m', '250');
-                url.searchParams.set('num_garages', '1');
-                url.searchParams.set('num_to', '1');
-                const resp = await fetch(url);
-                if (!resp.ok) {
-                    const err = await resp.json().catch(() => ({}));
-                    throw new Error(err.error || err.detail || 'Ошибка API');
-                }
-                const data = await resp.json();
-                if (data.error) throw new Error(data.error);
-                applyPlacementData(data);
-                statusEl.textContent = '✓ Станции размещены';
-            } catch (e) {
-                console.error(e);
-                document.getElementById('status').textContent = '✗ Ошибка: ' + e.message;
-            }
-        }
-
-        async function loadSavedPlacement() {
-            const city = getCityQuery();
-            if (!city) {
-                alert('Сначала выберите город и нажмите «Загрузить»');
-                return;
-            }
-            const statusEl = document.getElementById('status');
-            statusEl.textContent = 'Загрузка сохранённого размещения...';
-            removeStationLayers();
-            try {
-                const url = new URL('/api/stations/placement', window.location.origin);
-                url.searchParams.set('city', city);
-                url.searchParams.set('load_saved', 'true');
-                const resp = await fetch(url);
-                if (resp.status === 404) {
-                    const err = await resp.json().catch(() => ({}));
-                    alert(err.error || 'Нет сохранённого размещения для этого города. Нажмите «Разместить станции».');
-                    statusEl.textContent = '';
-                    return;
-                }
-                if (!resp.ok) {
-                    const err = await resp.json().catch(() => ({}));
-                    throw new Error(err.error || err.detail || 'Ошибка API');
-                }
-                const data = await resp.json();
-                applyPlacementData(data);
-                statusEl.textContent = '✓ Загружено сохранённое размещение';
-            } catch (e) {
-                console.error(e);
-                document.getElementById('status').textContent = '✗ Ошибка: ' + e.message;
-            }
-        }
-
-        function applyRadiusVisibility() {
-            if (!map) return;
-            const charge = document.getElementById('radiusCharge');
-            const garage = document.getElementById('radiusGarage');
-            const to = document.getElementById('radiusTO');
-            if (chargeRadiusLayer) {
-                if (charge && charge.checked) chargeRadiusLayer.addTo(map); else map.removeLayer(chargeRadiusLayer);
-            }
-            if (garageRadiusLayer) {
-                if (garage && garage.checked) garageRadiusLayer.addTo(map); else map.removeLayer(garageRadiusLayer);
-            }
-            if (toRadiusLayer) {
-                if (to && to.checked) toRadiusLayer.addTo(map); else map.removeLayer(toRadiusLayer);
-            }
-        }
-
-        function setAllRadiusVisibility(visible) {
-            ['radiusCharge','radiusGarage','radiusTO'].forEach(id => {
-                const c = document.getElementById(id);
-                if (c) c.checked = visible;
-            });
-            applyRadiusVisibility();
-        }
-
-        function applyRoutesVisibility() {
-            if (!map) return;
-            const trunk = document.getElementById('routesTrunk');
-            const branch = document.getElementById('routesBranch');
-            const local = document.getElementById('routesLocal');
-            if (trunkEdgesLayer) {
-                if (trunk && trunk.checked) trunkEdgesLayer.addTo(map); else map.removeLayer(trunkEdgesLayer);
-            }
-            if (branchEdgesLayer) {
-                if (branch && branch.checked) branchEdgesLayer.addTo(map); else map.removeLayer(branchEdgesLayer);
-            }
-            if (localEdgesLayer) {
-                if (local && local.checked) localEdgesLayer.addTo(map); else map.removeLayer(localEdgesLayer);
-            }
-        }
-
-        function setAllRoutesVisibility(visible) {
-            ['routesTrunk','routesBranch','routesLocal'].forEach(id => {
-                const c = document.getElementById(id);
-                if (c) c.checked = visible;
-            });
-            applyRoutesVisibility();
         }
 
         function updateBuildingsButtonLabel() {
@@ -948,6 +631,90 @@
                 if (clusterPointsLayer) clustersLayer.removeLayer(clusterPointsLayer);
             }
             updateClusterPointsButtonLabel();
+        }
+
+        async function loadStationsRulesPlacement() {
+            const city = getCityQuery();
+            const network = 'drive';
+            const simplify = true;
+            const statsEl = document.getElementById('stationsRulesStats');
+            if (!city) {
+                alert('Сначала выберите город');
+                return;
+            }
+            if (statsEl) statsEl.textContent = 'Расчёт зарядок / гаражей / ТО…';
+            try {
+                const url = new URL('/api/stations/placement', window.location.origin);
+                url.searchParams.set('city', city);
+                url.searchParams.set('network_type', network);
+                url.searchParams.set('simplify', simplify);
+                url.searchParams.set('demand_method', 'dbscan');
+                const resp = await fetch(url);
+                if (!resp.ok) {
+                    const err = await resp.json().catch(() => ({}));
+                    throw new Error(err.detail || 'Ошибка ' + resp.status);
+                }
+                const data = await resp.json();
+                if (data.error) {
+                    if (statsEl) statsEl.textContent = data.error;
+                    return;
+                }
+                if (stationsRulesLayerGroup) {
+                    map.removeLayer(stationsRulesLayerGroup);
+                    stationsRulesLayerGroup = null;
+                }
+                stationsRulesLayerGroup = L.layerGroup();
+
+                function addLines(fc, style, popupTitle) {
+                    if (!fc || !fc.features || !fc.features.length) return;
+                    L.geoJSON(fc, {
+                        style: style,
+                        onEachFeature: function(feature, layer) {
+                            const p = feature.properties || {};
+                            layer.bindPopup(popupTitle + '<br>' + JSON.stringify(p).slice(0, 200));
+                        },
+                    }).addTo(stationsRulesLayerGroup);
+                }
+                function addPoints(fc, color, border, r, title) {
+                    if (!fc || !fc.features || !fc.features.length) return;
+                    L.geoJSON(fc, {
+                        pointToLayer: function(feature, latlng) {
+                            return L.circleMarker(latlng, {
+                                radius: r,
+                                fillColor: color,
+                                color: border,
+                                weight: 2,
+                                fillOpacity: 0.92,
+                            });
+                        },
+                        onEachFeature: function(feature, layer) {
+                            const p = feature.properties || {};
+                            layer.bindPopup('<strong>' + title + '</strong><br>' + JSON.stringify(p).replace(/,/g, ', '));
+                        },
+                    }).addTo(stationsRulesLayerGroup);
+                }
+
+                addPoints(data.charging_type_a, '#7c3aed', '#4c1d95', 9, 'Зарядка тип А');
+                addPoints(data.charging_type_b, '#06b6d4', '#155e75', 7, 'Зарядка тип Б');
+                addPoints(data.garages, '#92400e', '#451a03', 10, 'Гараж');
+                addPoints(data.to_stations, '#db2777', '#831843', 10, 'Станция ТО');
+                addLines(data.trunk, { color: '#ea580c', weight: 4, opacity: 0.95 }, 'Магистраль');
+                addLines(data.branch_edges, { color: '#94a3b8', weight: 1, opacity: 0.7, dashArray: '5, 5' }, 'Ветвь B→…');
+                addLines(data.local_edges, { color: '#a78bfa', weight: 1, opacity: 0.65, dashArray: '2, 4' }, 'Локально B↔B');
+
+                stationsRulesLayerGroup.addTo(map);
+                const m = data.metrics || {};
+                const p = data.params || {};
+                if (statsEl) {
+                    statsEl.textContent = 'R_charge≈' + (p.R_charge_km != null ? p.R_charge_km.toFixed(2) : '—') + ' км, R_гараж/ТО≈'
+                        + (p.R_garage_to_km != null ? p.R_garage_to_km.toFixed(2) : '—') + ' км | '
+                        + 'покрытие зарядками: ' + (m.coverage_ratio != null ? (100 * m.coverage_ratio).toFixed(0) + '%' : '—')
+                        + ', магистраль связна: ' + (m.trunk_connected ? 'да' : 'нет');
+                }
+            } catch (e) {
+                console.error(e);
+                if (statsEl) statsEl.textContent = 'Ошибка: ' + e.message;
+            }
         }
 
         // Инициализация
