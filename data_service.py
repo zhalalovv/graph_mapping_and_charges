@@ -1066,7 +1066,9 @@ class DataService:
                 # За один вызов KMeans не дробим на тысячи кластеров — только порциями, иначе 80k+ точек «висит» часами.
                 MAX_K_PER_SPLIT = 48
                 # Доп. порог по разбросу центроидов зданий (без буфера hull): только при очень вытянутых группах.
-                MAX_RADIUS_PER_HULL_M = max(500.0, float(eps_m) * 4.0)
+                # Фиксированный порог геометрического разброса кластера (м).
+                # По запросу: целевой порог 1500 м (в пределах 1200–1800).
+                MAX_RADIUS_PER_HULL_M = 1500.0
                 REGION_EPS_M = max(600.0, float(eps_m) * 6.0)
                 REGION_MIN_SAMPLES = max(6, int(dbscan_min_samples) * 2)
 
@@ -1102,8 +1104,8 @@ class DataService:
                 def _partition_by_target_weight(indices):
                     """
                     Рекурсивно режем набор зданий так, чтобы итоговые кластеры:
-                    - по весу не превышали 10000 (сумма весов зданий);
-                    - по возможности были ~ ceil(W/10000) штук на район (KMeans в метрах).
+                    - по весу не превышали MAX_WEIGHT_PER_HULL;
+                    - по возможности были ~ ceil(W/MAX_WEIGHT_PER_HULL) штук на район (KMeans в метрах).
                     """
                     if len(indices) == 0:
                         return []
@@ -1136,7 +1138,7 @@ class DataService:
                     return out
 
                 def _merge_neighboring_weight_groups(groups):
-                    """Сливаем ближайшие по центроиду группы, если суммарный вес ≤ 10000 (меньше кластеров)."""
+                    """Сливаем ближайшие по центроиду группы, если суммарный вес ≤ MAX_WEIGHT_PER_HULL."""
                     if len(groups) <= 1:
                         return groups
                     groups = [np.asarray(g, dtype=int) for g in groups if len(g) > 0]
@@ -1275,7 +1277,7 @@ class DataService:
                 except TypeError:
                     _dbscan_kw.pop("n_jobs", None)
                     region_labels = np.array(DBSCAN(**_dbscan_kw).fit(pts_utm).labels_, dtype=int)
-                self.logger.info("DBSCAN районов завершён, разбиение по весу 10000…")
+                self.logger.info("DBSCAN районов завершён, разбиение по весу %.0f…", MAX_WEIGHT_PER_HULL)
                 region_ids = sorted(set(region_labels) - {-1})
                 if not region_ids:
                     # Если город разрежен — считаем весь набор одним районом и далее режем вторым уровнем.
@@ -1301,7 +1303,8 @@ class DataService:
                         continue
 
                     # Уровень 2: без DBSCAN — иначе получается слишком много мелких кластеров.
-                    # Целимся в ~10000 веса на подкластер: k ≈ ceil(W/10000), KMeans в метрах + рекурсия + слияние соседей.
+                    # Целимся в ~MAX_WEIGHT_PER_HULL веса на подкластер:
+                    # k ≈ ceil(W/MAX_WEIGHT_PER_HULL), KMeans в метрах + рекурсия + слияние соседей.
                     groups = _partition_by_target_weight(region_indices)
                     groups = _merge_neighboring_weight_groups(groups)
                     for g_idx in groups:
@@ -1434,9 +1437,10 @@ class DataService:
                     hulls_gdf = gpd.GeoDataFrame(hull_rows, crs="EPSG:4326")
             else:
                 hulls_gdf = gpd.GeoDataFrame()
-            # Вес областей спроса не должен превышать 10000
+
+            # Вес областей спроса ограничиваем тем же порогом, что и при разбиении.
             if not hulls_gdf.empty and "weight" in hulls_gdf.columns:
-                hulls_gdf["weight"] = hulls_gdf["weight"].clip(upper=10000).astype(int)
+                hulls_gdf["weight"] = hulls_gdf["weight"].clip(upper=int(MAX_WEIGHT_PER_HULL)).astype(int)
             return (gdf, hulls_gdf)
 
         return gdf

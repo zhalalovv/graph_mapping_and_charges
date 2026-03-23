@@ -184,19 +184,10 @@
             </div>
         </div>
         <div class="flight-levels-panel" style="margin-top:12px">
-            <h3 style="margin:0 0 8px">Кластеры по типам</h3>
-            <p style="font-size:12px; color:#6b7280; margin:0 0 8px">
-                Области выделены по типу: МКД, частный сектор, магазины, офисы и т.д. Клик по области — подсказка.
+            <h3 style="margin:0 0 8px">Кластеры</h3>
+            <p style="font-size:12px; color:#6b7280; margin:0 0 8px; line-height:1.4">
+                Цвета соответствуют `cluster_id`. Клик по области/точке показывает номер кластера и агрегированный вес.
             </p>
-            <div class="height-legend" style="flex-wrap:wrap; gap:4px 10px">
-                <span><span class="swatch" style="background:#22c55e"></span> МКД</span>
-                <span><span class="swatch" style="background:#f97316"></span> Частный сектор</span>
-                <span><span class="swatch" style="background:#a855f7"></span> Магазины/ТЦ</span>
-                <span><span class="swatch" style="background:#0ea5e9"></span> Офисы</span>
-                <span><span class="swatch" style="background:#eab308"></span> Общественные</span>
-                <span><span class="swatch" style="background:#64748b"></span> Промзона</span>
-                <span><span class="swatch" style="background:#6366f1"></span> Прочее</span>
-            </div>
             <button class="floating-btn btn-secondary" id="toggleClusterHullsBtn" style="width:100%; margin-top:6px; display:none" onclick="toggleClusterHulls()" title="Включить/выключить отображение областей кластеров">
                 <span id="clusterHullsLabel">Скрыть область кластера</span>
             </button>
@@ -205,20 +196,20 @@
             </button>
         </div>
         <div class="flight-levels-panel" style="margin-top:12px">
-            <h3 style="margin:0 0 8px">Зарядка / гараж / ТО (правила R)</h3>
+            <h3 style="margin:0 0 8px">Зарядка (кластерная привязка)</h3>
             <p style="font-size:11px; color:#6b7280; margin:0 0 8px; line-height:1.4">
-                Зарядка тип А — крыши МКД, ядро спроса; тип Б — доп. покрытие. Гараж и ТО — промзоны.
-                Магистраль: зарядки А + гаражи + ТО. Радиусы: R_charge и R_garage/TO в ответе API (<code>params</code>).
+                Покрытие demand считаем по `cluster_id`: каждая станция привязана к кластеру спроса,
+                поэтому радиусы в ответе API не используются.
             </p>
             <div class="height-legend" style="flex-wrap:wrap; gap:4px 8px">
-                <span><span class="swatch" style="background:#7c3aed"></span> Зарядка А</span>
-                <span><span class="swatch" style="background:#06b6d4"></span> Зарядка Б</span>
-                <span><span class="swatch" style="background:#92400e"></span> Гараж</span>
-                <span><span class="swatch" style="background:#db2777"></span> ТО</span>
+                <span><span class="swatch" style="background:#16a34a"></span> Зарядка A</span>
+                <span><span class="swatch" style="background:#16a34a"></span> Зарядка B</span>
+                <span><span class="swatch" style="background:#3b82f6"></span> Гараж</span>
+                <span><span class="swatch" style="background:#f97316"></span> ТО</span>
                 <span><span class="swatch" style="background:#ea580c"></span> Магистраль</span>
             </div>
             <button class="floating-btn btn-secondary" id="loadStationsRulesBtn" style="width:100%; margin-top:8px" onclick="loadStationsRulesPlacement()">
-                Рассчитать зарядки, гаражи, ТО
+                Рассчитать зарядки
             </button>
             <div id="stationsRulesStats" style="font-size:12px; color:#6b7280; margin-top:8px"></div>
         </div>
@@ -408,7 +399,7 @@
                             const c = colorForClusterId(cid);
                             return {
                                 color: c.stroke,
-                                weight: 3,
+                                weight: 2,
                                 opacity: 1,
                                 fillColor: c.fill,
                                 fillOpacity: 0.18,
@@ -444,7 +435,7 @@
                             radius: r,
                             fillColor: c.fill,
                             color: c.stroke,
-                            weight: 3,
+                            weight: 2,
                             fillOpacity: 0.92,
                             opacity: 1,
                         });
@@ -665,6 +656,16 @@
                 }
                 stationsRulesLayerGroup = L.layerGroup();
 
+                /** Устойчивый цвет по id кластера (золотой угол в HSL). */
+                function colorForClusterId(cid) {
+                    const n = Math.max(0, parseInt(cid, 10) || 0);
+                    const h = (n * 137.508) % 360;
+                    return {
+                        fill: 'hsl(' + h + ', 70%, 50%)',
+                        stroke: 'hsl(' + h + ', 70%, 28%)',
+                    };
+                }
+
                 function addLines(fc, style, popupTitle) {
                     if (!fc || !fc.features || !fc.features.length) return;
                     L.geoJSON(fc, {
@@ -679,37 +680,92 @@
                     if (!fc || !fc.features || !fc.features.length) return;
                     L.geoJSON(fc, {
                         pointToLayer: function(feature, latlng) {
+                            const p = feature.properties || {};
+                            const cid = p.cluster_id != null ? p.cluster_id : null;
+                            const c = cid != null ? colorForClusterId(cid) : { fill: color, stroke: border };
                             return L.circleMarker(latlng, {
                                 radius: r,
-                                fillColor: color,
-                                color: border,
+                                fillColor: c.fill,
+                                color: c.stroke,
                                 weight: 2,
                                 fillOpacity: 0.92,
                             });
                         },
                         onEachFeature: function(feature, layer) {
                             const p = feature.properties || {};
-                            layer.bindPopup('<strong>' + title + '</strong><br>' + JSON.stringify(p).replace(/,/g, ', '));
+                            const cid = p.cluster_id != null ? p.cluster_id : '—';
+                            layer.bindPopup(title + '<br>Кластер №' + cid);
                         },
                     }).addTo(stationsRulesLayerGroup);
                 }
 
-                addPoints(data.charging_type_a, '#7c3aed', '#4c1d95', 9, 'Зарядка тип А');
-                addPoints(data.charging_type_b, '#06b6d4', '#155e75', 7, 'Зарядка тип Б');
-                addPoints(data.garages, '#92400e', '#451a03', 10, 'Гараж');
-                addPoints(data.to_stations, '#db2777', '#831843', 10, 'Станция ТО');
+                addPoints(data.charging_type_a, '#16a34a', '#14532d', 9, 'Зарядка + ожидание (тип A)');
+                addPoints(data.charging_type_b, '#16a34a', '#14532d', 7, 'Зарядка + ожидание (тип B)');
+                addPoints(data.garages, '#3b82f6', '#1d4ed8', 10, 'Гараж');
+                addPoints(data.to_stations, '#f97316', '#9a3412', 10, 'Станция ТО');
                 addLines(data.trunk, { color: '#ea580c', weight: 4, opacity: 0.95 }, 'Магистраль');
                 addLines(data.branch_edges, { color: '#94a3b8', weight: 1, opacity: 0.7, dashArray: '5, 5' }, 'Ветвь B→…');
                 addLines(data.local_edges, { color: '#a78bfa', weight: 1, opacity: 0.65, dashArray: '2, 4' }, 'Локально B↔B');
 
+                // Явные линии "кластер ↔ зарядка" (по cluster_id зарядки и cluster_centroids из API).
+                try {
+                    if (data.cluster_centroids && data.cluster_centroids.features && data.cluster_centroids.features.length > 0) {
+                        const centroidByCid = new Map();
+                        data.cluster_centroids.features.forEach(f => {
+                            const p = f.properties || {};
+                            const cid = p.cluster_id;
+                            if (cid == null) return;
+                            const coords = f.geometry && f.geometry.coordinates;
+                            if (!coords || coords.length < 2) return;
+                            centroidByCid.set(String(cid), coords);
+                        });
+
+                        const links = [];
+                        function addLinksForFc(fc, stationKind) {
+                            if (!fc || !fc.features || !fc.features.length) return;
+                            fc.features.forEach(f => {
+                                const p = f.properties || {};
+                                const cid = p.cluster_id;
+                                if (cid == null) return;
+                                const centroid = centroidByCid.get(String(cid));
+                                const stationCoords = f.geometry && f.geometry.coordinates;
+                                if (!centroid || !stationCoords) return;
+                                links.push({
+                                    type: 'Feature',
+                                    geometry: {
+                                        type: 'LineString',
+                                        coordinates: [stationCoords, centroid]
+                                    },
+                                    properties: { cluster_id: cid, station_kind: stationKind }
+                                });
+                            });
+                        }
+
+                        addLinksForFc(data.charging_type_a, 'charge_a');
+                        addLinksForFc(data.charging_type_b, 'charge_b');
+
+                        if (links.length > 0) {
+                            const linksFc = { type: 'FeatureCollection', features: links };
+                            L.geoJSON(linksFc, {
+                                style: function(feature) {
+                                    const cid = feature.properties && feature.properties.cluster_id != null ? feature.properties.cluster_id : 0;
+                                    const c = colorForClusterId(cid);
+                                    return { color: c.stroke, weight: 1, opacity: 0.55, dashArray: '4, 4' };
+                                }
+                            }).addTo(stationsRulesLayerGroup);
+                        }
+                    }
+                } catch (e) {
+                    console.warn('Линии "кластер ↔ зарядка" не построены:', e);
+                }
+
                 stationsRulesLayerGroup.addTo(map);
                 const m = data.metrics || {};
-                const p = data.params || {};
                 if (statsEl) {
-                    statsEl.textContent = 'R_charge≈' + (p.R_charge_km != null ? p.R_charge_km.toFixed(2) : '—') + ' км, R_гараж/ТО≈'
-                        + (p.R_garage_to_km != null ? p.R_garage_to_km.toFixed(2) : '—') + ' км | '
-                        + 'покрытие зарядками: ' + (m.coverage_ratio != null ? (100 * m.coverage_ratio).toFixed(0) + '%' : '—')
-                        + ', магистраль связна: ' + (m.trunk_connected ? 'да' : 'нет');
+                    statsEl.textContent =
+                        'покрытие зарядками: ' + (m.coverage_ratio != null ? (100 * m.coverage_ratio).toFixed(0) + '%' : '—')
+                        + ' | кластеров: ' + (m.cluster_count != null ? m.cluster_count : '—')
+                        + ', зданий в кластерах: ' + (m.charging_buildings_in_clusters != null ? m.charging_buildings_in_clusters : '—');
                 }
             } catch (e) {
                 console.error(e);

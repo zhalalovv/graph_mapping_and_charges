@@ -126,12 +126,14 @@ class StationPlacement:
         demand: gpd.GeoDataFrame,
         full_candidates: gpd.GeoDataFrame,
         *,
-        radius_km: float = R_CHARGE_KM,
         max_distance_km: Optional[float] = None,
     ) -> gpd.GeoDataFrame:
         """
         Строит кандидатов зарядки относительно кластеров DBSCAN: для каждого кластера (центроид спроса)
-        выбирается ближайшая точка из full_candidates (крыши/площадки) в пределах max_distance_km.
+        выбираются ближайшие точки из `full_candidates` (крыши/площадки).
+
+        В режиме “без радиусов” ограничение `max_distance_km` обычно выключено
+        (тогда выбираются ближайшие без дальностного отсечения).
         Возвращает уникальный набор кандидатов — по одному месту на кластер (лучшая позиция для кластера).
         """
         if demand is None or len(demand) == 0 or full_candidates is None or len(full_candidates) == 0:
@@ -141,7 +143,7 @@ class StationPlacement:
         w_med = float(np.median(weights)) if len(weights) > 0 else 1.0
         w_p75 = float(np.percentile(weights, 75)) if len(weights) > 0 else w_med
 
-        max_dist = max_distance_km if max_distance_km is not None else radius_km * 2.0
+        max_dist = max_distance_km if max_distance_km is not None else float("inf")
         dem_pts = _points_array(demand)
         cand_pts = _points_array(full_candidates)
         chosen_indices = set()
@@ -172,7 +174,7 @@ class StationPlacement:
                 if added >= n_for_cluster:
                     break
         if not chosen_indices:
-            self.logger.warning("Нет кандидатов в радиусе от кластеров — используем все кандидаты")
+            self.logger.warning("Нет кандидатов при заданном max_distance_km — используем все кандидаты")
             return full_candidates
         out = full_candidates.iloc[sorted(chosen_indices)].copy()
         self.logger.info(
@@ -199,6 +201,18 @@ class StationPlacement:
         core_weight_quantile_a: float = 0.7,
         min_core_gain_ratio_a: float = 0.01,
         random_state: Optional[int] = None,
+        force_type_b_per_cluster: bool = False,
+        force_type_a_per_region: bool = False,
+        cluster_id_col: str = "subcluster_id",
+        region_id_col: str = "region_id",
+        cluster_centroid_is_fill_col: str = "is_cluster_fill",
+        mandatory_a_max_distance_km: Optional[float] = None,
+        mandatory_b_max_distance_km: Optional[float] = None,
+        skip_greedy_after_forced: bool = True,
+        # При наличии hull-полигонов кластера выбираем кандидатов строго внутри "своей" геометрии,
+        # чтобы станция не оказалась внутри/на пересечении hulls соседних кластеров.
+        cluster_hulls: Optional[gpd.GeoDataFrame] = None,
+        cluster_hulls_id_col: str = "cluster_id",
     ) -> Tuple[gpd.GeoDataFrame, Dict[str, Any]]:
         """
         Два типа зарядок:
@@ -355,6 +369,303 @@ class StationPlacement:
                 ratio = (weights[covered].sum() / total_weight) if total_weight > 0 else 0.0
                 if ratio >= stop_at_ratio:
                     return
+
+        # --- Принудительная логика по районам ---
+        # Новая логика пользователя:
+        # 1) В каждом районе выделяем ОДИН главный большой кластер (самый тяжёлый).
+        # 2) Станция для магистрали trunk ставится только в главный кластер (charge_a).
+        # 3) В главный кластер станцию charge_b НЕ ставим (если включён режим charge_b по кластерам).
+        # 4) Чтобы не добавлялось “лишнее” жадным алгоритмом — можно пропустить greedy-фазы после forced-размещения.
+        cluster_col = None
+        if force_type_b_per_cluster:
+            if cluster_id_col in demand.columns:
+                cluster_col = cluster_id_col
+            elif "cluster_id" in demand.columns:
+                cluster_col = "cluster_id"
+
+        region_col = None
+        if force_type_a_per_region and region_id_col in demand.columns:
+            region_col = region_id_col
+
+        forced_activated = bool(region_col is not None and force_type_a_per_region)
+        if forced_activated or (force_type_b_per_cluster and cluster_col is not None):
+            centroid_df = demand
+            if cluster_centroid_is_fill_col in centroid_df.columns:
+                centroid_df = centroid_df[~centroid_df[cluster_centroid_is_fill_col].fillna(False).astype(bool)].copy()
+
+            if centroid_df is not None and len(centroid_df) > 0:
+                used_candidate_indices: set[int] = set()
+
+                # Предрасчет принадлежности кандидатов hull'ам кластеров.
+                # Правило:
+                # - если точка попала ровно в один hull -> membership = cluster_id этого hull
+                # - если в ноль hull или в несколько hull -> membership = None
+                # Это гарантирует, что станция "строго" будет принадлежать hull геометрии своего кластера,
+                # а в случае пересечений hull не будет размещена в неоднозначной области.
+                candidate_membership: List[Optional[Any]] = [None] * len(cand_pts)
+                candidate_covered_any: List[bool] = [False] * len(cand_pts)
+                candidates_by_cluster: Dict[Any, List[int]] = {}
+                outside_no_hull_indices: List[int] = list(range(len(cand_pts)))
+
+                if (
+                    cluster_hulls is not None
+                    and len(cluster_hulls) > 0
+                    and cluster_hulls_id_col in cluster_hulls.columns
+                    and "geometry" in cluster_hulls.columns
+                ):
+                    try:
+                        hulls_gdf = cluster_hulls.copy()
+                        hulls_gdf = hulls_gdf[~hulls_gdf["geometry"].isna() & ~hulls_gdf["geometry"].is_empty].copy()
+                        if len(hulls_gdf) > 0:
+                            sindex = getattr(hulls_gdf, "sindex", None)
+                            for ci in range(len(cand_pts)):
+                                lon_c, lat_c = cand_pts[ci, 0], cand_pts[ci, 1]
+                                pt = Point(lon_c, lat_c)
+                                idxs = None
+                                if sindex is not None:
+                                    try:
+                                        idxs = list(sindex.query(pt, predicate="covers"))
+                                    except Exception:
+                                        idxs = None
+                                if idxs is None:
+                                    idxs = range(len(hulls_gdf))
+
+                                match_cids: List[int] = []
+                                for hi in idxs:
+                                    geom = hulls_gdf.geometry.iloc[int(hi)]
+                                    if geom is None or not geom.is_valid:
+                                        continue
+                                    try:
+                                        if bool(geom.covers(pt)):
+                                            match_cids.append(int(hulls_gdf.iloc[int(hi)][cluster_hulls_id_col]))
+                                    except Exception:
+                                        # В редких случаях shapely может падать на covers/contains
+                                        try:
+                                            if bool(geom.contains(pt)):
+                                                match_cids.append(int(hulls_gdf.iloc[int(hi)][cluster_hulls_id_col]))
+                                        except Exception:
+                                            pass
+
+                                if len(match_cids) == 0:
+                                    candidate_covered_any[ci] = False
+                                    continue
+
+                                candidate_covered_any[ci] = True
+                                unique_cids = set(match_cids)
+                                if len(unique_cids) == 1:
+                                    cid_val = next(iter(unique_cids))
+                                    candidate_membership[ci] = cid_val
+                                    candidates_by_cluster.setdefault(cid_val, []).append(ci)
+
+                                # ambiguous (multiple hulls) остаётся membership=None
+
+                            outside_no_hull_indices = [i for i, covered in enumerate(candidate_covered_any) if not covered]
+                    except Exception:
+                        # Если hull-based принадлежность не сработала — оставляем fallback без строгой геометрии.
+                        candidate_membership = [None] * len(cand_pts)
+                        outside_no_hull_indices = list(range(len(cand_pts)))
+                        candidates_by_cluster = {}
+
+                # Радиусы отсутствуют: покрытие demand-точек делаем по cluster_id.
+                # Станция в кластере покрывает все demand-точки этого кластера.
+                demand_cluster_vals_for_coverage = None
+                if cluster_col is not None and cluster_col in demand.columns:
+                    demand_cluster_vals_for_coverage = demand[cluster_col].values
+
+                def _update_covered(served_cluster_id: Any) -> None:
+                    if demand_cluster_vals_for_coverage is None:
+                        return
+                    # Важно: работаем через срез, чтобы не было augmented-assignment на переменную
+                    # в замыкании (иначе возможен UnboundLocalError).
+                    covered[:] = covered | (demand_cluster_vals_for_coverage == served_cluster_id)
+
+                def _place_one_station(
+                    station_type: str, cand_idx: int, *, served_cluster_id: Any
+                ) -> None:
+                    selected_indices.append(cand_idx)
+                    selected_types.append(station_type)
+                    used_candidate_indices.add(cand_idx)
+                    selected.append(
+                        {
+                            "geometry": Point(cand_pts[cand_idx, 0], cand_pts[cand_idx, 1]),
+                            "station_type": station_type,
+                            "source_index": cand_idx,
+                            "cluster_id": served_cluster_id,
+                        }
+                    )
+                    _update_covered(served_cluster_id)
+
+                def _choose_nearest_candidate(
+                    lon_target: float,
+                    lat_target: float,
+                    candidate_indices: List[int],
+                    *,
+                    max_dist_km: float,
+                ) -> Optional[int]:
+                    # Сначала среди неиспользованных в пределах max_dist_km.
+                    best = None
+                    best_d = float("inf")
+                    for ci in candidate_indices:
+                        if ci in used_candidate_indices:
+                            continue
+                        lon_i, lat_i = cand_pts[ci, 0], cand_pts[ci, 1]
+                        d = haversine_km(lat_target, lon_target, lat_i, lon_i)
+                        if d <= max_dist_km and d < best_d:
+                            best_d = d
+                            best = ci
+                    if best is not None:
+                        return int(best)
+                    # Fallback: ближайший неиспользованный вообще (без ограничения).
+                    for ci in candidate_indices:
+                        if ci in used_candidate_indices:
+                            continue
+                        lon_i, lat_i = cand_pts[ci, 0], cand_pts[ci, 1]
+                        d = haversine_km(lat_target, lon_target, lat_i, lon_i)
+                        if d < best_d:
+                            best_d = d
+                            best = ci
+                    if best is not None:
+                        return int(best)
+                    # Последний fallback: ближайший из любых.
+                    for ci in candidate_indices:
+                        lon_i, lat_i = cand_pts[ci, 0], cand_pts[ci, 1]
+                        d = haversine_km(lat_target, lon_target, lat_i, lon_i)
+                        if d < best_d:
+                            best_d = d
+                            best = ci
+                    return int(best) if best is not None else None
+
+                # Вычисляем главный кластер по району: максимальный weight у кластер-центроида.
+                # Текущие данные demand включают по одной centroid-точке на кластер, поэтому weight уже агрегированный.
+                main_cluster_by_region: Dict[Any, Any] = {}
+                if region_col is not None and cluster_col is not None and cluster_col in centroid_df.columns:
+                    for rid, sub_r in centroid_df.groupby(region_col):
+                        if len(sub_r) == 0:
+                            continue
+                        # центр района (для tie-break по “центральности”)
+                        w_r = sub_r["weight"].values if "weight" in sub_r.columns else np.ones(len(sub_r))
+                        coords_r = np.array([_coords_from_geom(g) for g in sub_r.geometry], dtype=float)  # lon, lat
+                        if len(coords_r) == 0:
+                            continue
+                        lon_r = float(np.average(coords_r[:, 0], weights=w_r))
+                        lat_r = float(np.average(coords_r[:, 1], weights=w_r))
+
+                        # главный кластер = max weight, при равенстве — ближе к центру района
+                        best_cid = None
+                        best_w = -1.0
+                        best_d = float("inf")
+                        for cid, sub_c in sub_r.groupby(cluster_col):
+                            if len(sub_c) == 0:
+                                continue
+                            w_c = float(sub_c["weight"].values[0]) if "weight" in sub_c.columns else float(len(sub_c))
+                            # centroid точки кластера:
+                            lon_c, lat_c = _coords_from_geom(sub_c.iloc[0].geometry)
+                            d_c = haversine_km(lat_r, lon_r, lat_c, lon_c)
+                            if w_c > best_w or (w_c == best_w and d_c < best_d):
+                                best_w = w_c
+                                best_d = d_c
+                                best_cid = cid
+                        if best_cid is not None:
+                            main_cluster_by_region[rid] = best_cid
+
+                # 1) charge_a: по району ставим ровно 1 станцию в главный кластер.
+                if region_col is not None and force_type_a_per_region and cluster_col is not None:
+                    max_a_dist = (
+                        mandatory_a_max_distance_km if mandatory_a_max_distance_km is not None else float("inf")
+                    )
+                    allowed_a = list(range(len(cand_pts)))
+                    if "source" in candidates.columns:
+                        allowed_a = [i for i in allowed_a if candidates.iloc[i].get("source") == "building"]
+                        if len(allowed_a) == 0:
+                            allowed_a = list(range(len(cand_pts)))
+
+                    for rid, sub_r in centroid_df.groupby(region_col):
+                        if len(sub_r) == 0:
+                            continue
+                        if rid not in main_cluster_by_region:
+                            continue
+                        main_cid = main_cluster_by_region[rid]
+
+                        # Строго: кандидат должен лежать внутри hull своего main_cid кластера.
+                        # Если кандидатов внутри hull не нашлось — станцию не ставим, чтобы не нарушить правило
+                        # "нельзя допускать, чтобы станция оказывалась ближе/внутри другого кластера".
+                        target_allowed_a = [i for i in candidates_by_cluster.get(main_cid, []) if i in allowed_a]
+                        if not target_allowed_a:
+                            # Если точка-кандидат кластера нигде не попала в hull (часто из-за усечения hull'ов),
+                            # то хотя бы не допускаем попадания внутрь hull других кластеров:
+                            # разрешаем кандидаты только с принадлежностью "снаружи всех hull".
+                            target_allowed_a = [i for i in outside_no_hull_indices if i in allowed_a]
+                        if not target_allowed_a:
+                            continue
+
+                        sub_main = sub_r[sub_r[cluster_col] == main_cid]
+                        if len(sub_main) == 0:
+                            continue
+                        lon_m, lat_m = _coords_from_geom(sub_main.iloc[0].geometry)
+                        cand_idx = _choose_nearest_candidate(
+                            lon_m,
+                            lat_m,
+                            target_allowed_a,
+                            max_dist_km=max_a_dist,
+                        )
+                        if cand_idx is None:
+                            continue
+                        _place_one_station("charge_a", cand_idx, served_cluster_id=main_cid)
+
+                # 2) charge_b: по кластерам, но НЕ в главный кластер каждого района.
+                if cluster_col is not None and force_type_b_per_cluster:
+                    max_b_dist = (
+                        mandatory_b_max_distance_km if mandatory_b_max_distance_km is not None else float("inf")
+                    )
+                    for cid, sub_c in centroid_df.groupby(cluster_col):
+                        if len(sub_c) == 0:
+                            continue
+                        # определяем район для этого кластера (берём region_id из centroid_df)
+                        if region_col is None or region_col not in sub_c.columns:
+                            rid = None
+                        else:
+                            rid = sub_c[region_col].values[0] if len(sub_c[region_col].values) > 0 else None
+                        if rid is not None and rid in main_cluster_by_region and main_cluster_by_region[rid] == cid:
+                            continue  # в главный кластер charge_b не ставим
+                        lon_c, lat_c = _coords_from_geom(sub_c.iloc[0].geometry)
+
+                        # Строго: кандидат должен лежать внутри hull своего cid кластера.
+                        target_allowed_b = candidates_by_cluster.get(cid, [])
+                        if not target_allowed_b:
+                            # Если кандидаты внутрь hull отсутствуют — разрешаем только кандидатов снаружи всех hull,
+                            # иначе есть риск "попасть в другой кластер".
+                            target_allowed_b = outside_no_hull_indices
+                            if not target_allowed_b:
+                                continue
+
+                        cand_idx = _choose_nearest_candidate(
+                            lon_c,
+                            lat_c,
+                            target_allowed_b,
+                            max_dist_km=max_b_dist,
+                        )
+                        if cand_idx is None:
+                            continue
+                        _place_one_station("charge_b", cand_idx, served_cluster_id=cid)
+
+                if skip_greedy_after_forced and (force_type_a_per_region or force_type_b_per_cluster):
+                    gdf = gpd.GeoDataFrame(selected, crs=candidates.crs) if selected else gpd.GeoDataFrame()
+                    covered_weight = float(weights[covered].sum())
+                    n_a = sum(1 for r in selected if r["station_type"] == "charge_a")
+                    n_b = sum(1 for r in selected if r["station_type"] == "charge_b")
+                    metrics = {
+                        "placed": len(selected),
+                        "placed_type_a": n_a,
+                        "placed_type_b": n_b,
+                        "placed_extra": n_b,
+                        "demand_covered": covered_weight,
+                        "demand_total": total_weight,
+                        "coverage_ratio": covered_weight / total_weight if total_weight > 0 else 0.0,
+                    }
+                    self.logger.info(
+                        f"[forced] Зарядки: тип А {n_a}, тип Б {n_b}, покрытие {metrics['coverage_ratio']:.2%}"
+                    )
+                    return gdf, metrics
 
         # Фаза 1: зарядки типа А — покрывают основную часть спроса.
         # В оценке кандидата берём весь спрос в радиусе (ignore_covered_in_score=True),
@@ -1067,30 +1378,35 @@ class StationPlacement:
         demand: gpd.GeoDataFrame,
         charge_stations: gpd.GeoDataFrame,
         trunk_graph: nx.Graph,
-        radius_charge_km: float = R_CHARGE_KM,
     ) -> Dict[str, Any]:
-        """Покрытие спроса зарядками, средняя взвешенная дистанция до ближайшей зарядки, связность trunk."""
-        metrics = {"coverage_ratio": 0.0, "avg_distance_to_charge_km": None, "trunk_connected": False}
+        """Покрытие demand точек зарядками по `cluster_id`, связность trunk."""
+        metrics = {"coverage_ratio": 0.0, "trunk_connected": False}
         if demand is None or len(demand) == 0 or charge_stations is None or len(charge_stations) == 0:
             return metrics
-        dem_pts = _points_array(demand)
         weights = demand["weight"].values if "weight" in demand.columns else np.ones(len(demand))
-        charge_pts = _points_array(charge_stations)
         total_weight = float(weights.sum())
-        covered_weight = 0.0
-        sum_dist = 0.0
-        for j in range(len(dem_pts)):
-            d_min = np.min(
-                [
-                    haversine_km(charge_pts[i, 1], charge_pts[i, 0], dem_pts[j, 1], dem_pts[j, 0])
-                    for i in range(len(charge_pts))
-                ]
-            )
-            if d_min <= radius_charge_km:
-                covered_weight += weights[j]
-            sum_dist += weights[j] * d_min
-        metrics["coverage_ratio"] = covered_weight / total_weight if total_weight > 0 else 0.0
-        metrics["avg_distance_to_charge_km"] = sum_dist / total_weight if total_weight > 0 else None
+
+        demand_cluster_cols: List[str] = []
+        if "cluster_id" in demand.columns:
+            demand_cluster_cols.append("cluster_id")
+        if "subcluster_id" in demand.columns:
+            demand_cluster_cols.append("subcluster_id")
+
+        if not demand_cluster_cols or "cluster_id" not in charge_stations.columns:
+            # Фоллбэк: раз радиусы отключены, считаем, что наличие станций достаточно.
+            metrics["coverage_ratio"] = 1.0 if total_weight > 0 else 0.0
+        else:
+            station_ids = charge_stations["cluster_id"].dropna().values
+            best_ratio = 0.0
+            for demand_cluster_col in demand_cluster_cols:
+                demand_ids = demand[demand_cluster_col].values
+                covered_mask = np.isin(demand_ids, station_ids)
+                covered_weight = float(weights[covered_mask].sum())
+                ratio = covered_weight / total_weight if total_weight > 0 else 0.0
+                if ratio > best_ratio:
+                    best_ratio = ratio
+            metrics["coverage_ratio"] = best_ratio
+
         if trunk_graph is not None:
             metrics["trunk_connected"] = (
                 nx.is_connected(trunk_graph) if trunk_graph.number_of_nodes() > 0 else False
@@ -1125,19 +1441,31 @@ def run_full_pipeline(
 
     placement = StationPlacement(data_service, logger=logger)
 
-    demand = placement.build_demand_points(
-        buildings,
-        road_graph,
-        city_boundary,
-        method=demand_method,
-        cell_size_m=demand_cell_m,
-        dbscan_eps_m=dbscan_eps_m,
-        dbscan_min_samples=dbscan_min_samples,
-        use_all_buildings=use_all_buildings,
-        no_fly_zones=no_fly_zones,
-        fill_clusters=(demand_method == "dbscan"),
-        cluster_fill_step_m=None,
-    )
+    # Важно: если demand_method=dbscan и в get_city_data уже есть demand_points/demand_hulls,
+    # то не пересчитываем demand заново (иначе логически будет "DBSCAN районов" второй раз).
+    demand = None
+    if demand_method == "dbscan":
+        try:
+            cached = data.get("demand_points") if isinstance(data, dict) else None
+            if cached is not None and len(cached) > 0:
+                demand = cached
+        except Exception:
+            demand = None
+
+    if demand is None or len(demand) == 0:
+        demand = placement.build_demand_points(
+            buildings,
+            road_graph,
+            city_boundary,
+            method=demand_method,
+            cell_size_m=demand_cell_m,
+            dbscan_eps_m=dbscan_eps_m,
+            dbscan_min_samples=dbscan_min_samples,
+            use_all_buildings=use_all_buildings,
+            no_fly_zones=no_fly_zones,
+            fill_clusters=(demand_method == "dbscan"),
+            cluster_fill_step_m=None,
+        )
     if demand is None or len(demand) == 0:
         return {
             "error": "Нет точек спроса",
@@ -1168,10 +1496,36 @@ def run_full_pipeline(
 
     if demand_method == "dbscan" and charge_candidates_full is not None and len(charge_candidates_full) > 0:
         charge_candidates = placement.build_charge_candidates_from_clusters(
-            demand, charge_candidates_full, radius_km=R_CHARGE_KM, max_distance_km=R_CHARGE_KM * 2.0
+            demand, charge_candidates_full
         )
     else:
         charge_candidates = charge_candidates_full
+
+    # Hull-полигоны кластеров нужны для строгой и устойчивой привязки станций к "своей" геометрии.
+    cluster_hulls_gdf = None
+    if demand_method == "dbscan":
+        try:
+            cluster_hulls_gdf = data.get("demand_hulls") if isinstance(data, dict) else None
+        except Exception:
+            cluster_hulls_gdf = None
+        if cluster_hulls_gdf is None:
+            try:
+                _, cluster_hulls_gdf = data_service.get_demand_points_weighted(
+                    buildings,
+                    road_graph,
+                    city_boundary,
+                    method=demand_method,
+                    cell_size_m=demand_cell_m,
+                    dbscan_eps_m=dbscan_eps_m,
+                    dbscan_min_samples=dbscan_min_samples,
+                    use_all_buildings=use_all_buildings,
+                    no_fly_zones=no_fly_zones,
+                    return_hulls=True,
+                    fill_clusters=True,
+                    cluster_fill_step_m=None,
+                )
+            except Exception:
+                cluster_hulls_gdf = None
 
     candidates_for_placement = (
         charge_candidates_full
@@ -1186,6 +1540,7 @@ def run_full_pipeline(
         demand,
         no_fly_zones,
         radius_km=R_CHARGE_KM,
+        cluster_hulls=cluster_hulls_gdf,
         max_stations=max_charge_stations,
         enable_type_b=True,
         type_a_coverage_ratio=0.95,
@@ -1196,176 +1551,172 @@ def run_full_pipeline(
         core_radius_factor_a=0.0,
         core_weight_quantile_a=0.0,
         min_center_distance_factor_b=0.75,
+        force_type_b_per_cluster=True,
+        force_type_a_per_region=True,
     )
+    # --- Корректная привязка зарядок к "своей" геометрии кластера ---
+    # Мы делаем hull-first привязку:
+    # - если точка станции попадает ровно в один hull -> cluster_id = cluster_id этого hull
+    # - если точка попала в 0 или несколько hull -> cluster_id ставим через fallback ближайшего demand-центроида
+    cluster_col = None
+    if demand is not None and len(demand) > 0:
+        if "cluster_id" in demand.columns:
+            cluster_col = "cluster_id"
+        elif "subcluster_id" in demand.columns:
+            cluster_col = "subcluster_id"
 
-    garage_candidates = data_service.get_station_candidates(
-        buildings, city_boundary, no_fly_zones, road_graph, station_type="garage"
-    )
-    to_candidates = data_service.get_station_candidates(
-        buildings, city_boundary, no_fly_zones, road_graph, station_type="to"
-    )
-    if garage_candidates is None or len(garage_candidates) == 0:
-        garage_candidates = gpd.GeoDataFrame()
-    if to_candidates is None or len(to_candidates) == 0:
-        to_candidates = gpd.GeoDataFrame()
+    if cluster_col is not None and charge_stations is not None and len(charge_stations) > 0:
+        def _as_int_or_none(v: Any) -> Optional[int]:
+            try:
+                if v is None:
+                    return None
+                if isinstance(v, float) and np.isnan(v):
+                    return None
+                return int(v)
+            except Exception:
+                return None
 
-    power_buffer_union = data_service.get_power_substation_buffer_union(buildings)
-    if power_buffer_union is not None:
+        assigned: List[Optional[int]] = [None] * len(charge_stations)
+        # Если forced-логика уже записала cluster_id, используем это как начальное значение.
+        if "cluster_id" in charge_stations.columns:
+            try:
+                assigned = [_as_int_or_none(charge_stations.iloc[pos].get("cluster_id")) for pos in range(len(charge_stations))]
+            except Exception:
+                assigned = [None] * len(charge_stations)
 
-        def _drop_inside_power_buffer(cand_gdf):
-            if cand_gdf is None or len(cand_gdf) == 0:
-                return cand_gdf
-            keep = []
-            for _, row in cand_gdf.iterrows():
-                pt = getattr(row.geometry, "centroid", row.geometry)
-                if pt is None:
-                    keep.append(True)
-                    continue
-                try:
-                    keep.append(not (power_buffer_union.contains(pt) or power_buffer_union.intersects(pt)))
-                except Exception:
-                    keep.append(True)
-            if not any(keep):
-                return gpd.GeoDataFrame(crs=cand_gdf.crs)
-            return cand_gdf.iloc[[i for i, k in enumerate(keep) if k]].copy()
+        # Верификация по геометрии hull'ов:
+        # - если точка станции попала ровно в один hull -> cluster_id ставим по этому hull
+        # - иначе -> cluster_id=None (не привязываем к соседнему кластеру)
+        if cluster_hulls_gdf is not None and len(cluster_hulls_gdf) > 0 and "cluster_id" in cluster_hulls_gdf.columns:
+            try:
+                hulls_gdf = cluster_hulls_gdf
+                hulls_gdf = hulls_gdf[~hulls_gdf["geometry"].isna() & ~hulls_gdf["geometry"].is_empty].copy()
+                if len(hulls_gdf) > 0:
+                    sindex = getattr(hulls_gdf, "sindex", None)
+                    for pos, (_, srow) in enumerate(charge_stations.iterrows()):
+                        lon_s, lat_s = _coords_from_geom(srow.geometry)
+                        pt = Point(lon_s, lat_s)
 
-        garage_candidates = _drop_inside_power_buffer(garage_candidates)
-        to_candidates = _drop_inside_power_buffer(to_candidates)
+                        idxs = None
+                        if sindex is not None:
+                            try:
+                                idxs = list(sindex.query(pt, predicate="covers"))
+                            except Exception:
+                                idxs = None
+                        if idxs is None:
+                            idxs = range(len(hulls_gdf))
 
-    garage_placeholder = (
-        garage_candidates.iloc[:num_garages].copy()
-        if num_garages > 0 and garage_candidates is not None and len(garage_candidates) > 0
-        else gpd.GeoDataFrame()
-    )
-    to_placeholder = (
-        to_candidates.iloc[:num_to].copy()
-        if num_to > 0 and to_candidates is not None and len(to_candidates) > 0
-        else gpd.GeoDataFrame()
-    )
+                        match_cids: List[int] = []
+                        for hi in idxs:
+                            geom = hulls_gdf.geometry.iloc[int(hi)]
+                            if geom is None or not geom.is_valid:
+                                continue
+                            try:
+                                if bool(geom.covers(pt)):
+                                    match_cids.append(int(hulls_gdf.iloc[int(hi)]["cluster_id"]))
+                            except Exception:
+                                try:
+                                    if bool(geom.contains(pt)):
+                                        match_cids.append(int(hulls_gdf.iloc[int(hi)]["cluster_id"]))
+                                except Exception:
+                                    pass
 
-    # Воздушный граф для обхода бесполётных зон и препятствий (используется в магистрали при необходимости обхода)
-    air_graph = None
-    try:
-        from graph_service import GraphService
+                        unique_cids = set(match_cids)
+                        if len(unique_cids) == 1:
+                            assigned[pos] = next(iter(unique_cids))
+                        elif len(unique_cids) == 0:
+                            # Точка не попала ни в один hull: назначаем ближайший hull по расстоянию,
+                            # но только если он заметно ближе второго.
+                            try:
+                                best_cid: Optional[int] = None
+                                best_d: Optional[float] = None
+                                second_d: Optional[float] = None
+                                for hi in range(len(hulls_gdf)):
+                                    geom = hulls_gdf.geometry.iloc[int(hi)]
+                                    if geom is None or not geom.is_valid:
+                                        continue
+                                    d = float(geom.distance(pt))
+                                    cid = int(hulls_gdf.iloc[int(hi)]["cluster_id"])
+                                    if best_d is None or d < best_d:
+                                        second_d = best_d
+                                        best_d = d
+                                        best_cid = cid
+                                    elif second_d is None or d < second_d:
+                                        second_d = d
+                                if best_cid is not None and best_d is not None and second_d is not None:
+                                    # Условие "заметно ближе": минимум на 5% меньше расстояния до второго.
+                                    if second_d <= 0:
+                                        assigned[pos] = None
+                                    elif best_d < second_d * 0.95:
+                                        assigned[pos] = best_cid
+                                    else:
+                                        assigned[pos] = None
+                                else:
+                                    assigned[pos] = None
+                            except Exception:
+                                assigned[pos] = None
+                        else:
+                            assigned[pos] = None
+            except Exception:
+                pass
 
-        if city_boundary is not None:
-            gs = GraphService()
-            air_graph = gs.build_air_graph(
-                city_boundary=city_boundary,
-                buildings=buildings,
-                no_fly_zones=no_fly_zones,
-                building_buffer_deg=0.00025,
-                min_distance_deg=0.0003,
-                max_points=3000,
-                k_neighbors=6,
+        # Если точка станции не однозначно попала в hull — cluster_id=None, чтобы не допускать "привязку к соседнему кластеру".
+
+        charge_stations = charge_stations.copy()
+        charge_stations["cluster_id"] = assigned
+
+        # Гарантия: максимум одна зарядка на один cluster_id.
+        # При конфликте оставляем приоритетно charge_a, затем charge_b.
+        if "cluster_id" in charge_stations.columns and len(charge_stations) > 0:
+            stype = (
+                charge_stations["station_type"]
+                if "station_type" in charge_stations.columns
+                else pd.Series([""] * len(charge_stations), index=charge_stations.index)
             )
-    except Exception:
-        air_graph = None
+            priority = np.where(stype == "charge_a", 0, np.where(stype == "charge_b", 1, 2))
+            charge_stations = charge_stations.assign(_cluster_priority=priority)
+            non_null = charge_stations[charge_stations["cluster_id"].notna()]
+            nulls = charge_stations[~charge_stations["cluster_id"].notna()]
+            non_null = non_null.sort_values(by="_cluster_priority").drop_duplicates(
+                subset=["cluster_id"], keep="first"
+            )
+            charge_stations = pd.concat([non_null, nulls], ignore_index=True).drop(
+                columns=["_cluster_priority"], errors="ignore"
+            )
 
-    # Объединённая геометрия беспилотных зон (только они) для проверки магистрали и A* обхода
-    no_fly_zones_union = None
-    try:
-        geoms = []
-        if no_fly_zones is not None:
-            if isinstance(no_fly_zones, gpd.GeoDataFrame) and len(no_fly_zones) > 0:
-                try:
-                    nfz_4326 = no_fly_zones.to_crs("EPSG:4326")
-                except Exception:
-                    nfz_4326 = no_fly_zones
-                for g in nfz_4326.geometry:
-                    if g is not None and not getattr(g, "is_empty", True):
-                        geoms.append(g)
-            elif isinstance(no_fly_zones, list) and len(no_fly_zones) > 0:
-                for z in no_fly_zones:
-                    g = getattr(z, "geometry", z)
-                    if g is not None and hasattr(g, "is_valid") and g.is_valid and not getattr(g, "is_empty", True):
-                        geoms.append(g)
-        if geoms:
-            no_fly_zones_union = unary_union(geoms)
-            if no_fly_zones_union is not None and (
-                getattr(no_fly_zones_union, "is_empty", True) or not getattr(no_fly_zones_union, "is_valid", True)
-            ):
-                no_fly_zones_union = None
-    except Exception:
-        no_fly_zones_union = None
+        # Сохраняем станции даже при None cluster_id:
+        # - иначе можно полностью потерять размещение, если hull'ы не покрывают точные координаты кандидатов
+        # - UI/линии привязки при None просто не смогут построиться корректно, что безопаснее неверного cluster_id.
 
-    trunk = placement.build_trunk_graph(
-        charge_stations,
-        garage_placeholder,
-        to_placeholder,
-        no_fly_zones_union,
-        air_graph=air_graph,
-        max_edge_km=R_GARAGE_TO_KM,
-    )
+    # --- Информация о кластерах и “зданиях зарядки” ---
+    cluster_count = 0
+    charging_buildings_in_clusters = 0
+    if demand is not None and len(demand) > 0:
+        if "cluster_id" in demand.columns:
+            cluster_count = int(demand["cluster_id"].nunique())
+        elif "subcluster_id" in demand.columns:
+            cluster_count = int(demand["subcluster_id"].nunique())
+        else:
+            cluster_count = int(len(demand))
 
-    garages = placement.place_garages(
-        demand,
-        garage_candidates,
-        k=num_garages,
-        radius_km=R_GARAGE_TO_KM,
-        coverage_ratio_target=0.95,
-        min_distance_factor=1.2,
-        max_garages=100,
-    )
+        if "n_buildings" in demand.columns:
+            if "is_cluster_fill" in demand.columns:
+                mask = ~demand["is_cluster_fill"].fillna(False).astype(bool)
+                charging_buildings_in_clusters = int(demand.loc[mask, "n_buildings"].sum())
+            else:
+                charging_buildings_in_clusters = int(demand["n_buildings"].sum())
 
-    filtered_to_candidates = to_candidates
-    if to_candidates is not None and len(to_candidates) > 0 and garages is not None and len(garages) > 0:
-        try:
-            to_pts = _points_array(to_candidates)
-            gar_pts = _points_array(garages)
-            if len(to_pts) > 0 and len(gar_pts) > 0:
-                keep_indices = []
-                min_sep_km = 0.2
-                for i in range(len(to_pts)):
-                    lon_t, lat_t = to_pts[i, 0], to_pts[i, 1]
-                    too_close = False
-                    for j in range(len(gar_pts)):
-                        lon_g, lat_g = gar_pts[j, 0], gar_pts[j, 1]
-                        if haversine_km(lat_t, lon_t, lat_g, lon_g) < min_sep_km:
-                            too_close = True
-                            break
-                    if not too_close:
-                        keep_indices.append(i)
-                if keep_indices:
-                    filtered_to_candidates = to_candidates.iloc[keep_indices].copy()
-                else:
-                    filtered_to_candidates = to_candidates
-        except Exception:
-            filtered_to_candidates = to_candidates
+    # --- Отключаем гаражи/ТО и магистраль (trunk) по запросу пользователя ---
+    garages = gpd.GeoDataFrame()
+    to_stations = gpd.GeoDataFrame()
+    trunk = None
+    branch_edges: List[Dict[str, Any]] = []
+    local_edges: List[Dict[str, Any]] = []
 
-    to_stations = placement.place_to_stations(
-        trunk,
-        filtered_to_candidates,
-        demand,
-        k=num_to,
-        radius_km=R_GARAGE_TO_KM,
-        coverage_ratio_target=0.95,
-        min_distance_factor=1.2,
-        max_to_stations=100,
-    )
-
-    trunk = placement.build_trunk_graph(
-        charge_stations,
-        garages,
-        to_stations,
-        no_fly_zones_union,
-        air_graph=air_graph,
-        max_edge_km=R_GARAGE_TO_KM,
-    )
-
-    branch_edges = placement.build_branch_edges(
-        charge_stations,
-        garages,
-        to_stations,
-        k_nearest=3,
-        max_branch_km=R_GARAGE_TO_KM,
-    )
-    local_edges = placement.build_local_edges(
-        charge_stations, max_edge_km=R_GARAGE_TO_KM, max_neighbors_b=2
-    )
-
-    metrics = placement.compute_metrics(demand, charge_stations, trunk, radius_charge_km=R_CHARGE_KM)
+    metrics = placement.compute_metrics(demand, charge_stations, trunk)
     metrics["charge"] = charge_metrics
+    metrics["cluster_count"] = cluster_count
+    metrics["charging_buildings_in_clusters"] = charging_buildings_in_clusters
 
     return {
         "buildings": buildings,
@@ -1380,9 +1731,7 @@ def run_full_pipeline(
         "city_boundary": city_boundary,
         "no_fly_zones": no_fly_zones,
         "params": {
-            "R_charge_km": R_CHARGE_KM,
-            "R_garage_to_km": R_GARAGE_TO_KM,
-            "D_max_km": D_MAX_KM,
+            # Радиусы отсутствуют: покрытие и привязка делаются по `cluster_id`.
         },
     }
 
@@ -1475,6 +1824,35 @@ def pipeline_result_to_geojson(raw: Dict[str, Any]) -> Dict[str, Any]:
         charging_b = gpd.GeoDataFrame()
 
     trunk_feats = trunk_graph_to_geojson_features(raw.get("trunk_graph"))
+    demand = raw.get("demand")
+    cluster_centroids = None
+    if demand is not None and len(demand) > 0:
+        demand_for_link = demand
+        if "is_cluster_fill" in demand_for_link.columns:
+            demand_for_link = demand_for_link[~demand_for_link["is_cluster_fill"].fillna(False).astype(bool)].copy()
+
+        cid_col = None
+        if "cluster_id" in demand_for_link.columns:
+            cid_col = "cluster_id"
+        elif "subcluster_id" in demand_for_link.columns:
+            cid_col = "subcluster_id"
+
+        if cid_col is not None and cid_col in demand_for_link.columns and len(demand_for_link) > 0:
+            demand_for_link = demand_for_link[demand_for_link[cid_col].notna()].copy()
+            if len(demand_for_link) > 0:
+                if "weight" in demand_for_link.columns:
+                    demand_for_link = demand_for_link.sort_values(by="weight", ascending=False)
+                # Оставляем по 1 точке на кластер (для UI достаточно координат центра).
+                demand_for_link = demand_for_link.drop_duplicates(subset=[cid_col])
+                if cid_col != "cluster_id":
+                    demand_for_link = demand_for_link.rename(columns={cid_col: "cluster_id"})
+
+                keep_cols = ["cluster_id"]
+                for extra in ("weight", "n_buildings", "region_id"):
+                    if extra in demand_for_link.columns:
+                        keep_cols.append(extra)
+                cluster_centroids = demand_for_link[[*keep_cols, "geometry"]]
+
     out: Dict[str, Any] = {
         "charging_type_a": _gdf_to_fc(charging_a),
         "charging_type_b": _gdf_to_fc(charging_b),
@@ -1485,6 +1863,7 @@ def pipeline_result_to_geojson(raw: Dict[str, Any]) -> Dict[str, Any]:
         "local_edges": _list_features_to_fc(raw.get("local_edges")),
         "metrics": raw.get("metrics") or {},
         "params": raw.get("params") or {},
+        "cluster_centroids": _gdf_to_fc(cluster_centroids),
     }
     if err:
         out["error"] = err
