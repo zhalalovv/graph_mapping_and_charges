@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import hashlib
 
 import geopandas as gpd
 import pandas as pd
@@ -23,6 +24,29 @@ app.add_middleware(
 
 data_service = DataService()
 logger = logging.getLogger(__name__)
+
+
+def _placement_cache_key(
+    city: str,
+    network_type: str,
+    simplify: bool,
+    demand_method: str,
+    dbscan_eps_m: float,
+    dbscan_min_samples: int,
+    a_by_admin_districts: bool,
+) -> str:
+    payload = {
+        "city": city.strip(),
+        "network_type": network_type,
+        "simplify": bool(simplify),
+        "demand_method": demand_method,
+        "dbscan_eps_m": float(dbscan_eps_m),
+        "dbscan_min_samples": int(dbscan_min_samples),
+        "a_by_admin_districts": bool(a_by_admin_districts),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()
+    return f"drone_planner:placement:{digest}"
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -334,12 +358,35 @@ def get_stations_placement(
     demand_method: str = Query("dbscan", description="dbscan или grid"),
     dbscan_eps_m: float = Query(180.0, description="eps DBSCAN (м)"),
     dbscan_min_samples: int = Query(15, description="min_samples DBSCAN"),
+    a_by_admin_districts: bool = Query(True, description="Ставить станции A по административным районам"),
+    use_saved: bool = Query(True, description="Использовать сохранённую расстановку, если есть"),
+    save_result: bool = Query(True, description="Сохранять новую расстановку в Redis"),
 ):
     """
     Размещение зарядок (тип А/Б), гаражей и ТО по правилам R_charge / R_garage_TO;
     магистраль, ветви B→A и локальные B↔B. Слои разделены в ответе.
     """
     try:
+        cache_key = _placement_cache_key(
+            city=city,
+            network_type=network_type,
+            simplify=simplify,
+            demand_method=demand_method,
+            dbscan_eps_m=dbscan_eps_m,
+            dbscan_min_samples=dbscan_min_samples,
+            a_by_admin_districts=a_by_admin_districts,
+        )
+        redis_client = data_service.get_redis_client()
+        if use_saved and redis_client is not None:
+            try:
+                cached = redis_client.get(cache_key)
+                if cached:
+                    data = json.loads(cached.decode("utf-8"))
+                    data["from_saved"] = True
+                    return JSONResponse(data)
+            except Exception as e:
+                logger.warning("Не удалось прочитать сохранённую расстановку: %s", e)
+
         raw = run_full_pipeline(
             data_service,
             city,
@@ -348,14 +395,64 @@ def get_stations_placement(
             demand_method=demand_method,
             dbscan_eps_m=dbscan_eps_m,
             dbscan_min_samples=dbscan_min_samples,
+            a_by_admin_districts=a_by_admin_districts,
         )
         if raw.get("error"):
             return JSONResponse({**pipeline_result_to_geojson(raw), "error": raw["error"]})
         geo = pipeline_result_to_geojson(raw)
+        geo["from_saved"] = False
+        if save_result and redis_client is not None:
+            try:
+                redis_client.set(cache_key, json.dumps(geo, ensure_ascii=False).encode("utf-8"))
+            except Exception as e:
+                logger.warning("Не удалось сохранить расстановку: %s", e)
         return JSONResponse(geo)
     except Exception as e:
         logger.exception("stations placement")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/stations/export_saved")
+def export_saved_stations(
+    city: str = Query(..., description="Название города"),
+    network_type: str = Query("drive", description="Тип сети OSM"),
+    simplify: bool = Query(True, description="Упрощение графа"),
+    demand_method: str = Query("dbscan", description="dbscan или grid"),
+    dbscan_eps_m: float = Query(180.0, description="eps DBSCAN (м)"),
+    dbscan_min_samples: int = Query(15, description="min_samples DBSCAN"),
+    a_by_admin_districts: bool = Query(True, description="Режим размещения A по районам/группам"),
+):
+    """Выгрузка сохраненной расстановки станций из Redis в JSON."""
+    redis_client = data_service.get_redis_client()
+    if redis_client is None:
+        raise HTTPException(status_code=503, detail="Redis недоступен")
+    cache_key = _placement_cache_key(
+        city=city,
+        network_type=network_type,
+        simplify=simplify,
+        demand_method=demand_method,
+        dbscan_eps_m=dbscan_eps_m,
+        dbscan_min_samples=dbscan_min_samples,
+        a_by_admin_districts=a_by_admin_districts,
+    )
+    try:
+        cached = redis_client.get(cache_key)
+        if not cached:
+            raise HTTPException(status_code=404, detail="Сохраненная расстановка не найдена")
+        data = json.loads(cached.decode("utf-8"))
+        safe_city = city.replace(" ", "_").replace(",", "").replace("/", "_")
+        filename = f"stations_{safe_city}.json"
+        return JSONResponse(
+            data,
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Cache-Control": "no-store",
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка выгрузки: {e}")
 
 
 def _ensure_static_mount():

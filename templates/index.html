@@ -202,14 +202,17 @@
                 поэтому радиусы в ответе API не используются.
             </p>
             <div class="height-legend" style="flex-wrap:wrap; gap:4px 8px">
-                <span><span class="swatch" style="background:#16a34a"></span> Зарядка A</span>
+                <span><span class="swatch" style="background:#16a34a"></span> Зарядка A (магистраль)</span>
                 <span><span class="swatch" style="background:#16a34a"></span> Зарядка B</span>
                 <span><span class="swatch" style="background:#3b82f6"></span> Гараж</span>
                 <span><span class="swatch" style="background:#f97316"></span> ТО</span>
-                <span><span class="swatch" style="background:#ea580c"></span> Магистраль</span>
+                <span><span class="swatch" style="background:#16a34a"></span> Магистраль A</span>
             </div>
             <button class="floating-btn btn-secondary" id="loadStationsRulesBtn" style="width:100%; margin-top:8px" onclick="loadStationsRulesPlacement()">
                 Рассчитать зарядки
+            </button>
+            <button class="floating-btn btn-secondary" id="exportSavedStationsBtn" style="width:100%; margin-top:6px" onclick="exportSavedStations()">
+                Выгрузить станции из БД
             </button>
             <div id="stationsRulesStats" style="font-size:12px; color:#6b7280; margin-top:8px"></div>
         </div>
@@ -387,6 +390,17 @@
                     return {
                         fill: 'hsl(' + h + ', 70%, 50%)',
                         stroke: 'hsl(' + h + ', 70%, 28%)',
+                    };
+                }
+                function colorForRegionId(regionId) {
+                    const s = String(regionId || 'nearest_0');
+                    let acc = 0;
+                    for (let i = 0; i < s.length; i++) acc = ((acc << 5) - acc + s.charCodeAt(i)) | 0;
+                    const n = Math.abs(acc);
+                    const h = (n * 137.508) % 360;
+                    return {
+                        fill: 'hsl(' + h + ', 78%, 52%)',
+                        stroke: 'hsl(' + h + ', 78%, 30%)',
                     };
                 }
                 clustersLayer = L.layerGroup();
@@ -624,6 +638,39 @@
             updateClusterPointsButtonLabel();
         }
 
+        async function exportSavedStations() {
+            const city = getCityQuery();
+            if (!city) {
+                alert('Сначала выберите город');
+                return;
+            }
+            try {
+                const url = new URL('/api/stations/export_saved', window.location.origin);
+                url.searchParams.set('city', city);
+                url.searchParams.set('network_type', 'drive');
+                url.searchParams.set('simplify', 'true');
+                url.searchParams.set('demand_method', 'dbscan');
+                url.searchParams.set('a_by_admin_districts', 'true');
+                const resp = await fetch(url);
+                if (!resp.ok) {
+                    const err = await resp.json().catch(() => ({}));
+                    throw new Error(err.detail || ('Ошибка ' + resp.status));
+                }
+                const data = await resp.json();
+                const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json;charset=utf-8' });
+                const a = document.createElement('a');
+                const safeCity = city.replace(/\s+/g, '_').replace(/[^\w\-]/g, '');
+                a.href = URL.createObjectURL(blob);
+                a.download = `stations_${safeCity || 'city'}.json`;
+                document.body.appendChild(a);
+                a.click();
+                URL.revokeObjectURL(a.href);
+                document.body.removeChild(a);
+            } catch (e) {
+                alert('Не удалось выгрузить станции: ' + e.message);
+            }
+        }
+
         async function loadStationsRulesPlacement() {
             const city = getCityQuery();
             const network = 'drive';
@@ -640,6 +687,8 @@
                 url.searchParams.set('network_type', network);
                 url.searchParams.set('simplify', simplify);
                 url.searchParams.set('demand_method', 'dbscan');
+                url.searchParams.set('a_by_admin_districts', 'true');
+                url.searchParams.set('use_saved', 'false');
                 const resp = await fetch(url);
                 if (!resp.ok) {
                     const err = await resp.json().catch(() => ({}));
@@ -676,18 +725,27 @@
                         },
                     }).addTo(stationsRulesLayerGroup);
                 }
-                function addPoints(fc, color, border, r, title) {
+                function addPoints(fc, color, border, r, title, pointStyleResolver) {
                     if (!fc || !fc.features || !fc.features.length) return;
                     L.geoJSON(fc, {
                         pointToLayer: function(feature, latlng) {
                             const p = feature.properties || {};
                             const cid = p.cluster_id != null ? p.cluster_id : null;
-                            const c = cid != null ? colorForClusterId(cid) : { fill: color, stroke: border };
+                            let c = cid != null ? colorForClusterId(cid) : { fill: color, stroke: border };
+                            let rr = r;
+                            let ww = 2;
+                            if (typeof pointStyleResolver === 'function') {
+                                const custom = pointStyleResolver(p, c) || {};
+                                if (custom.fillColor) c.fill = custom.fillColor;
+                                if (custom.strokeColor) c.stroke = custom.strokeColor;
+                                if (custom.radius != null) rr = custom.radius;
+                                if (custom.weight != null) ww = custom.weight;
+                            }
                             return L.circleMarker(latlng, {
-                                radius: r,
+                                radius: rr,
                                 fillColor: c.fill,
                                 color: c.stroke,
-                                weight: 2,
+                                weight: ww,
                                 fillOpacity: 0.92,
                             });
                         },
@@ -699,18 +757,42 @@
                     }).addTo(stationsRulesLayerGroup);
                 }
 
-                addPoints(data.charging_type_a, '#16a34a', '#14532d', 9, 'Зарядка + ожидание (тип A)');
+                addPoints(
+                    data.charging_type_a,
+                    '#16a34a',
+                    '#14532d',
+                    10,
+                    'Зарядка + ожидание (тип A)',
+                    function(props) {
+                        const degree = Number(props.trunk_degree || 0);
+                        const radius = Math.max(9, Math.min(14, 9 + degree));
+                        return {
+                            fillColor: '#16a34a',
+                            strokeColor: '#14532d',
+                            radius: radius,
+                            weight: 3
+                        };
+                    }
+                );
                 addPoints(data.charging_type_b, '#16a34a', '#14532d', 7, 'Зарядка + ожидание (тип B)');
                 addPoints(data.garages, '#3b82f6', '#1d4ed8', 10, 'Гараж');
                 addPoints(data.to_stations, '#f97316', '#9a3412', 10, 'Станция ТО');
-                addLines(data.trunk, { color: '#ea580c', weight: 4, opacity: 0.95 }, 'Магистраль');
-                addLines(data.branch_edges, { color: '#94a3b8', weight: 1, opacity: 0.7, dashArray: '5, 5' }, 'Ветвь B→…');
-                addLines(data.local_edges, { color: '#a78bfa', weight: 1, opacity: 0.65, dashArray: '2, 4' }, 'Локально B↔B');
+                addLines(data.trunk, { color: '#16a34a', weight: 3, opacity: 0.95, lineCap: 'round', lineJoin: 'round' }, 'Магистраль');
+                addLines(data.branch_edges, { color: '#2563eb', weight: 2, opacity: 0.9 }, 'Ветвь B→A');
+                addLines(data.local_edges, { color: '#a78bfa', weight: 3, opacity: 0.75, dashArray: '2, 4' }, 'Локально B↔B');
 
                 // Явные линии "кластер ↔ зарядка" (по cluster_id зарядки и cluster_centroids из API).
                 try {
                     if (data.cluster_centroids && data.cluster_centroids.features && data.cluster_centroids.features.length > 0) {
                         const centroidByCid = new Map();
+                        const centroidsByRegion = new Map();
+                        const aClusterIds = new Set();
+                        if (data.charging_type_a && data.charging_type_a.features) {
+                            data.charging_type_a.features.forEach(f => {
+                                const p = f.properties || {};
+                                if (p.cluster_id != null) aClusterIds.add(String(p.cluster_id));
+                            });
+                        }
                         data.cluster_centroids.features.forEach(f => {
                             const p = f.properties || {};
                             const cid = p.cluster_id;
@@ -718,6 +800,14 @@
                             const coords = f.geometry && f.geometry.coordinates;
                             if (!coords || coords.length < 2) return;
                             centroidByCid.set(String(cid), coords);
+                            const rid = p.region_id != null ? String(p.region_id) : 'nearest_0';
+                            const arr = centroidsByRegion.get(rid) || [];
+                            arr.push({
+                                type: 'Feature',
+                                geometry: { type: 'Point', coordinates: coords },
+                                properties: p,
+                            });
+                            centroidsByRegion.set(rid, arr);
                         });
 
                         const links = [];
@@ -754,6 +844,37 @@
                                 }
                             }).addTo(stationsRulesLayerGroup);
                         }
+
+                        // Подсветка групп "по 5 ближайших кластеров":
+                        // одна и та же группа region_id = один цвет.
+                        centroidsByRegion.forEach((features, rid) => {
+                            const color = colorForRegionId(rid);
+                            const fc = { type: 'FeatureCollection', features: features };
+                            L.geoJSON(fc, {
+                                pointToLayer: function(feature, latlng) {
+                                    const p = feature.properties || {};
+                                    const isA = p.cluster_id != null && aClusterIds.has(String(p.cluster_id));
+                                    return L.circleMarker(latlng, {
+                                        radius: isA ? 8 : 6,
+                                        fillColor: color.fill,
+                                        color: color.stroke,
+                                        weight: 2,
+                                        fillOpacity: 0.35,
+                                        opacity: 0.9,
+                                        dashArray: isA ? null : '3, 3',
+                                    });
+                                },
+                                onEachFeature: function(feature, layer) {
+                                    const p = feature.properties || {};
+                                    layer.bindPopup(
+                                        '<strong>Группа кластеров (5 ближайших)</strong>'
+                                        + '<br>Группа: ' + rid
+                                        + '<br>Кластер №' + (p.cluster_id != null ? p.cluster_id : '—')
+                                        + '<br>Вес: ' + (p.weight != null ? p.weight : '—')
+                                    );
+                                }
+                            }).addTo(stationsRulesLayerGroup);
+                        });
                     }
                 } catch (e) {
                     console.warn('Линии "кластер ↔ зарядка" не построены:', e);
@@ -765,7 +886,8 @@
                     statsEl.textContent =
                         'покрытие зарядками: ' + (m.coverage_ratio != null ? (100 * m.coverage_ratio).toFixed(0) + '%' : '—')
                         + ' | кластеров: ' + (m.cluster_count != null ? m.cluster_count : '—')
-                        + ', зданий в кластерах: ' + (m.charging_buildings_in_clusters != null ? m.charging_buildings_in_clusters : '—');
+                        + ', зданий в кластерах: ' + (m.charging_buildings_in_clusters != null ? m.charging_buildings_in_clusters : '—')
+                        + (data.from_saved ? ' | загружено из сохранённой расстановки' : ' | сохранено');
                 }
             } catch (e) {
                 console.error(e);

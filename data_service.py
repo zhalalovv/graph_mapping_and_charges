@@ -1833,6 +1833,66 @@ class DataService:
             self.logger.debug("Подстанции OSM: %s", e)
             return None
 
+    def get_admin_districts(self, city_name: str, city_boundary=None) -> gpd.GeoDataFrame:
+        """
+        Загружает административные районы города из OSM.
+        Возвращает GeoDataFrame (EPSG:4326) c колонками:
+        - geometry
+        - district_name
+        - admin_level
+        """
+        try:
+            raw = ox.features_from_place(city_name, tags={"boundary": "administrative"})
+        except Exception as e:
+            self.logger.warning("Не удалось загрузить административные районы: %s", e)
+            return gpd.GeoDataFrame()
+
+        if raw is None or len(raw) == 0:
+            return gpd.GeoDataFrame()
+
+        try:
+            districts = raw.to_crs("EPSG:4326").copy()
+        except Exception:
+            districts = raw.copy()
+            if districts.crs is None:
+                districts = districts.set_crs("EPSG:4326", allow_override=True)
+
+        districts = districts[~districts.geometry.isna() & ~districts.geometry.is_empty].copy()
+        if len(districts) == 0:
+            return gpd.GeoDataFrame()
+
+        if "admin_level" in districts.columns:
+            districts["admin_level_num"] = pd.to_numeric(districts["admin_level"], errors="coerce")
+            districts = districts[districts["admin_level_num"].isin([6, 7, 8, 9, 10])].copy()
+            if len(districts) == 0:
+                return gpd.GeoDataFrame()
+            districts["admin_level"] = districts["admin_level_num"].astype("Int64")
+            districts = districts.drop(columns=["admin_level_num"], errors="ignore")
+        else:
+            districts["admin_level"] = None
+
+        if "name" in districts.columns:
+            districts["district_name"] = districts["name"].astype(str)
+        else:
+            districts["district_name"] = "district"
+
+        if city_boundary is not None and getattr(city_boundary, "is_valid", True):
+            try:
+                cb = city_boundary
+                districts = districts[districts.geometry.intersects(cb)].copy()
+            except Exception:
+                pass
+
+        if len(districts) == 0:
+            return gpd.GeoDataFrame()
+
+        # Убираем дубликаты по геометрии/названию.
+        keep_cols = ["district_name", "admin_level", "geometry"]
+        districts = districts[[c for c in keep_cols if c in districts.columns]].copy()
+        districts = districts.drop_duplicates(subset=["district_name", "admin_level"])
+        districts = districts.reset_index(drop=True)
+        return districts
+
     def get_redis_client(self):
         """Возвращает Redis клиент для использования в других сервисах"""
         return self._redis

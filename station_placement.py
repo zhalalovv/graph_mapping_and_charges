@@ -203,6 +203,7 @@ class StationPlacement:
         random_state: Optional[int] = None,
         force_type_b_per_cluster: bool = False,
         force_type_a_per_region: bool = False,
+        force_type_a_per_cluster: bool = False,
         cluster_id_col: str = "subcluster_id",
         region_id_col: str = "region_id",
         cluster_centroid_is_fill_col: str = "is_cluster_fill",
@@ -535,14 +536,14 @@ class StationPlacement:
                             best = ci
                     return int(best) if best is not None else None
 
-                # Вычисляем главный кластер по району: максимальный weight у кластер-центроида.
-                # Текущие данные demand включают по одной centroid-точке на кластер, поэтому weight уже агрегированный.
+                # Вычисляем главный (A) кластер по району: центральный кластер,
+                # т.е. ближайший к взвешенному центру района.
                 main_cluster_by_region: Dict[Any, Any] = {}
                 if region_col is not None and cluster_col is not None and cluster_col in centroid_df.columns:
                     for rid, sub_r in centroid_df.groupby(region_col):
                         if len(sub_r) == 0:
                             continue
-                        # центр района (для tie-break по “центральности”)
+                        # Взвешенный центр района.
                         w_r = sub_r["weight"].values if "weight" in sub_r.columns else np.ones(len(sub_r))
                         coords_r = np.array([_coords_from_geom(g) for g in sub_r.geometry], dtype=float)  # lon, lat
                         if len(coords_r) == 0:
@@ -550,10 +551,11 @@ class StationPlacement:
                         lon_r = float(np.average(coords_r[:, 0], weights=w_r))
                         lat_r = float(np.average(coords_r[:, 1], weights=w_r))
 
-                        # главный кластер = max weight, при равенстве — ближе к центру района
+                        # Главный кластер = ближайший к центру района;
+                        # при равенстве расстояния — более тяжёлый.
                         best_cid = None
-                        best_w = -1.0
                         best_d = float("inf")
+                        best_w = -1.0
                         for cid, sub_c in sub_r.groupby(cluster_col):
                             if len(sub_c) == 0:
                                 continue
@@ -561,15 +563,49 @@ class StationPlacement:
                             # centroid точки кластера:
                             lon_c, lat_c = _coords_from_geom(sub_c.iloc[0].geometry)
                             d_c = haversine_km(lat_r, lon_r, lat_c, lon_c)
-                            if w_c > best_w or (w_c == best_w and d_c < best_d):
-                                best_w = w_c
+                            if d_c < best_d or (d_c == best_d and w_c > best_w):
                                 best_d = d_c
+                                best_w = w_c
                                 best_cid = cid
                         if best_cid is not None:
                             main_cluster_by_region[rid] = best_cid
 
-                # 1) charge_a: по району ставим ровно 1 станцию в главный кластер.
-                if region_col is not None and force_type_a_per_region and cluster_col is not None:
+                # 1a) charge_a: по каждому кластеру ставим ровно 1 станцию в центр кластера.
+                if cluster_col is not None and force_type_a_per_cluster:
+                    max_a_dist = (
+                        mandatory_a_max_distance_km if mandatory_a_max_distance_km is not None else float("inf")
+                    )
+                    allowed_a = list(range(len(cand_pts)))
+                    if "source" in candidates.columns:
+                        allowed_a = [i for i in allowed_a if candidates.iloc[i].get("source") == "building"]
+                        if len(allowed_a) == 0:
+                            allowed_a = list(range(len(cand_pts)))
+
+                    for cid, sub_c in centroid_df.groupby(cluster_col):
+                        if len(sub_c) == 0:
+                            continue
+                        lon_c, lat_c = _coords_from_geom(sub_c.iloc[0].geometry)
+                        # Берем все точки кандидатов внутри hull этого кластера.
+                        target_allowed_a = [i for i in candidates_by_cluster.get(cid, []) if i in allowed_a]
+                        if not target_allowed_a:
+                            # Fallback: если нет в hull — берем только кандидаты вне всех hull,
+                            # чтобы не "прыгать" в соседние кластеры.
+                            target_allowed_a = [i for i in outside_no_hull_indices if i in allowed_a]
+                        if not target_allowed_a:
+                            continue
+
+                        cand_idx = _choose_nearest_candidate(
+                            lon_c,
+                            lat_c,
+                            target_allowed_a,
+                            max_dist_km=max_a_dist,
+                        )
+                        if cand_idx is None:
+                            continue
+                        _place_one_station("charge_a", cand_idx, served_cluster_id=cid)
+
+                # 1b) charge_a: по району ставим ровно 1 станцию в главный кластер.
+                elif region_col is not None and force_type_a_per_region and cluster_col is not None:
                     max_a_dist = (
                         mandatory_a_max_distance_km if mandatory_a_max_distance_km is not None else float("inf")
                     )
@@ -648,7 +684,9 @@ class StationPlacement:
                             continue
                         _place_one_station("charge_b", cand_idx, served_cluster_id=cid)
 
-                if skip_greedy_after_forced and (force_type_a_per_region or force_type_b_per_cluster):
+                if skip_greedy_after_forced and (
+                    force_type_a_per_region or force_type_b_per_cluster or force_type_a_per_cluster
+                ):
                     gdf = gpd.GeoDataFrame(selected, crs=candidates.crs) if selected else gpd.GeoDataFrame()
                     covered_weight = float(weights[covered].sum())
                     n_a = sum(1 for r in selected if r["station_type"] == "charge_a")
@@ -704,6 +742,8 @@ class StationPlacement:
         *,
         max_edge_km: float = R_GARAGE_TO_KM,
         max_neighbors_a: int = 4,
+        topology_mode: str = "mst",
+        extra_paths_per_a: int = 2,
     ) -> nx.Graph:
         """
         Магистраль: узлы — все станции типа А:
@@ -842,52 +882,77 @@ class StationPlacement:
 
         pts = np.array([[lon, lat] for _, lon, lat in trunk_nodes])
         ids = [nid for nid, _, _ in trunk_nodes]
-        k = min(max(1, int(max_neighbors_a)), 2, len(trunk_nodes) - 1)
-        if k <= 0:
-            return G
-        for i in range(len(trunk_nodes)):
-            nid_i = ids[i]
-            lat_i, lon_i = pts[i, 1], pts[i, 0]
-            cand = []
-            for j in range(len(trunk_nodes)):
-                if j == i:
-                    continue
-                d_km = haversine_km(lat_i, lon_i, pts[j, 1], pts[j, 0])
-                if d_km <= max_edge_km:
-                    cand.append((d_km, j))
-            cand.sort(key=lambda x: x[0])
-            for d_km, j in cand[:k]:
-                nid_j = ids[j]
-                if G.has_edge(nid_i, nid_j):
-                    continue
-                lon_j, lat_j = pts[j, 0], pts[j, 1]
-                # Проверяем: проходит ли прямая между станциями через беспилотную зону
-                if not _edge_intersects_nfz(lon_i, lat_i, lon_j, lat_j):
-                    G.add_edge(nid_i, nid_j, weight=d_km, length=d_km)
-                    continue
-                # Отрезок пересекает беспилотную зону — строим обход по воздушному графу (A*)
-                self.logger.debug(
-                    "Магистраль пересекает беспилотную зону %s–%s, строим обход A*", nid_i, nid_j
-                )
-                if air_graph is not None and air_tree is not None:
-                    detour_coords, detour_len = _astar_detour(lon_i, lat_i, lon_j, lat_j)
-                    if detour_coords is not None and detour_len is not None:
-                        G.add_edge(
-                            nid_i,
-                            nid_j,
-                            weight=detour_len,
-                            length=detour_len,
-                            geometry_coords=detour_coords,
-                        )
-                        self.logger.info(
-                            "Обход беспилотной зоны: %s–%s, точек маршрута %s",
-                            nid_i,
-                            nid_j,
-                            len(detour_coords),
-                        )
-                        continue
-                self.logger.warning("Обход не построен для %s–%s, оставлена прямая", nid_i, nid_j)
+
+        def _add_trunk_edge(nid_i: str, nid_j: str, lon_i: float, lat_i: float, lon_j: float, lat_j: float) -> None:
+            if G.has_edge(nid_i, nid_j):
+                return
+            d_km = haversine_km(lat_i, lon_i, lat_j, lon_j)
+            if not _edge_intersects_nfz(lon_i, lat_i, lon_j, lat_j):
                 G.add_edge(nid_i, nid_j, weight=d_km, length=d_km)
+                return
+            self.logger.debug("Магистраль пересекает беспилотную зону %s–%s, строим обход A*", nid_i, nid_j)
+            if air_graph is not None and air_tree is not None:
+                detour_coords, detour_len = _astar_detour(lon_i, lat_i, lon_j, lat_j)
+                if detour_coords is not None and detour_len is not None:
+                    G.add_edge(
+                        nid_i,
+                        nid_j,
+                        weight=detour_len,
+                        length=detour_len,
+                        geometry_coords=detour_coords,
+                    )
+                    self.logger.info(
+                        "Обход беспилотной зоны: %s–%s, точек маршрута %s",
+                        nid_i,
+                        nid_j,
+                        len(detour_coords),
+                    )
+                    return
+            self.logger.warning("Обход не построен для %s–%s, оставлена прямая", nid_i, nid_j)
+            G.add_edge(nid_i, nid_j, weight=d_km, length=d_km)
+
+        use_mst = str(topology_mode or "").strip().lower() == "mst"
+        if use_mst and len(trunk_nodes) >= 2:
+            full = nx.Graph()
+            for nid, lon, lat in trunk_nodes:
+                full.add_node(nid, lon=lon, lat=lat)
+            for i in range(len(trunk_nodes)):
+                nid_i, lon_i, lat_i = trunk_nodes[i]
+                for j in range(i + 1, len(trunk_nodes)):
+                    nid_j, lon_j, lat_j = trunk_nodes[j]
+                    d_km = haversine_km(lat_i, lon_i, lat_j, lon_j)
+                    full.add_edge(nid_i, nid_j, weight=d_km)
+            mst = nx.minimum_spanning_tree(full, weight="weight")
+            for u, v in mst.edges():
+                du = full.nodes[u]
+                dv = full.nodes[v]
+                _add_trunk_edge(
+                    u,
+                    v,
+                    float(du["lon"]),
+                    float(du["lat"]),
+                    float(dv["lon"]),
+                    float(dv["lat"]),
+                )
+        else:
+            k = min(max(1, int(max_neighbors_a)), 2, len(trunk_nodes) - 1)
+            if k <= 0:
+                return G
+            for i in range(len(trunk_nodes)):
+                nid_i = ids[i]
+                lat_i, lon_i = pts[i, 1], pts[i, 0]
+                cand = []
+                for j in range(len(trunk_nodes)):
+                    if j == i:
+                        continue
+                    d_km = haversine_km(lat_i, lon_i, pts[j, 1], pts[j, 0])
+                    if d_km <= max_edge_km:
+                        cand.append((d_km, j))
+                cand.sort(key=lambda x: x[0])
+                for _, j in cand[:k]:
+                    nid_j = ids[j]
+                    lon_j, lat_j = pts[j, 0], pts[j, 1]
+                    _add_trunk_edge(nid_i, nid_j, lon_i, lat_i, lon_j, lat_j)
 
         trunk_node_ids = list(G.nodes())
         if len(trunk_node_ids) > 1:
@@ -922,6 +987,34 @@ class StationPlacement:
                         G.add_edge(u, v, weight=best_dist, length=best_dist)
                     base_comp |= remaining[best_idx]
                     del remaining[best_idx]
+
+        # Добавляем до N дополнительных путей между станциями A,
+        # чтобы сеть была более устойчивой (резервные маршруты).
+        extra_n = max(0, int(extra_paths_per_a))
+        if extra_n > 0:
+            charge_nodes = [(nid, lon, lat) for nid, lon, lat in trunk_nodes if str(nid).startswith("charge_")]
+            if len(charge_nodes) >= 2:
+                added_cnt: Dict[str, int] = {nid: 0 for nid, _, _ in charge_nodes}
+                cand_edges: List[Tuple[float, str, float, float, str, float, float]] = []
+                for i in range(len(charge_nodes)):
+                    ni, loni, lati = charge_nodes[i]
+                    for j in range(i + 1, len(charge_nodes)):
+                        nj, lonj, latj = charge_nodes[j]
+                        if G.has_edge(ni, nj):
+                            continue
+                        d_km = haversine_km(lati, loni, latj, lonj)
+                        if d_km <= max_edge_km:
+                            cand_edges.append((d_km, ni, loni, lati, nj, lonj, latj))
+                cand_edges.sort(key=lambda x: x[0])
+                for _, ni, loni, lati, nj, lonj, latj in cand_edges:
+                    if added_cnt.get(ni, 0) >= extra_n or added_cnt.get(nj, 0) >= extra_n:
+                        continue
+                    if G.has_edge(ni, nj):
+                        continue
+                    _add_trunk_edge(ni, nj, loni, lati, lonj, latj)
+                    if G.has_edge(ni, nj):
+                        added_cnt[ni] = added_cnt.get(ni, 0) + 1
+                        added_cnt[nj] = added_cnt.get(nj, 0) + 1
         self.logger.info(
             f"Trunk (А–А, макс. {max_neighbors_a} соседей): {G.number_of_nodes()} узлов, {G.number_of_edges()} рёбер"
         )
@@ -1428,6 +1521,7 @@ def run_full_pipeline(
     max_charge_stations: Optional[int] = None,
     num_garages: int = 1,
     num_to: int = 1,
+    a_by_admin_districts: bool = False,
 ) -> Dict[str, Any]:
     """
     Запускает полный пайплайн: данные города → спрос (DBSCAN или сетка) → зарядки → гаражи/ТО → метрики.
@@ -1476,6 +1570,180 @@ def run_full_pipeline(
             "trunk_graph": None,
             "metrics": {},
         }
+
+    if a_by_admin_districts and demand is not None and len(demand) > 0:
+        def _repack_regions_by_nearest_clusters(
+            d: gpd.GeoDataFrame, group_size: int = 5
+        ) -> gpd.GeoDataFrame:
+            """
+            Формирует region_id из групп ближайших кластеров.
+            Затем в каждой группе forced-логика ставит одну A в самый тяжёлый кластер.
+            """
+            out = d.copy()
+            if len(out) == 0:
+                return out
+
+            cluster_col = None
+            if "subcluster_id" in out.columns:
+                cluster_col = "subcluster_id"
+            elif "cluster_id" in out.columns:
+                cluster_col = "cluster_id"
+            if cluster_col is None:
+                out["region_id"] = "nearest_0"
+                return out
+
+            centroid_df = out
+            if "is_cluster_fill" in centroid_df.columns:
+                centroid_df = centroid_df[~centroid_df["is_cluster_fill"].fillna(False).astype(bool)].copy()
+            if len(centroid_df) == 0:
+                centroid_df = out.copy()
+
+            cluster_rows = centroid_df[[cluster_col, "geometry"]].copy()
+            if "weight" in centroid_df.columns:
+                cluster_rows["weight"] = centroid_df["weight"].astype(float)
+            else:
+                cluster_rows["weight"] = 1.0
+            cluster_rows = cluster_rows[cluster_rows[cluster_col].notna()].copy()
+            if len(cluster_rows) == 0:
+                out["region_id"] = "nearest_0"
+                return out
+            cluster_rows = cluster_rows.sort_values(by="weight", ascending=False).drop_duplicates(subset=[cluster_col])
+
+            # Список уникальных кластеров.
+            clus = []
+            for _, row in cluster_rows.iterrows():
+                lon, lat = _coords_from_geom(row.geometry)
+                clus.append(
+                    {
+                        "cid": row[cluster_col],
+                        "lon": float(lon),
+                        "lat": float(lat),
+                        "weight": float(row.get("weight", 1.0)),
+                    }
+                )
+            if not clus:
+                out["region_id"] = "nearest_0"
+                return out
+
+            group_size = max(1, int(group_size))
+            unassigned = set(range(len(clus)))
+            region_for_cid: Dict[Any, str] = {}
+            region_idx = 0
+
+            while unassigned:
+                # seed: самый тяжёлый ещё не назначенный кластер
+                seed = max(unassigned, key=lambda i: clus[i]["weight"])
+                seed_lon = clus[seed]["lon"]
+                seed_lat = clus[seed]["lat"]
+
+                dist_items = []
+                for j in unassigned:
+                    d_km = haversine_km(seed_lat, seed_lon, clus[j]["lat"], clus[j]["lon"])
+                    dist_items.append((d_km, j))
+                dist_items.sort(key=lambda x: x[0])
+                picked = [j for _, j in dist_items[:group_size]]
+                rid = f"nearest_{region_idx}"
+                region_idx += 1
+                for j in picked:
+                    region_for_cid[clus[j]["cid"]] = rid
+                    if j in unassigned:
+                        unassigned.remove(j)
+
+            out["region_id"] = out[cluster_col].map(region_for_cid)
+            na_mask = out["region_id"].isna()
+            if na_mask.any():
+                out.loc[na_mask, "region_id"] = "nearest_0"
+            return out
+
+        def _assign_synthetic_regions(d: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+            """Fallback: если районов 0-1, делим кластеры на синтетические регионы по главной оси."""
+            out = d.copy()
+            if "region_id" not in out.columns:
+                out["region_id"] = None
+            if len(out) <= 1:
+                out["region_id"] = "region_0"
+                return out
+
+            # Берем только реальные центроиды кластеров (без fill-точек), если колонка есть.
+            work_idx = out.index
+            if "is_cluster_fill" in out.columns:
+                mask = ~out["is_cluster_fill"].fillna(False).astype(bool)
+                work_idx = out.index[mask]
+                if len(work_idx) == 0:
+                    work_idx = out.index
+
+            coords = np.array([_coords_from_geom(out.loc[i].geometry) for i in work_idx], dtype=float)
+            if len(coords) < 2:
+                out["region_id"] = "region_0"
+                return out
+
+            centered = coords - coords.mean(axis=0, keepdims=True)
+            try:
+                _, _, vt = np.linalg.svd(centered, full_matrices=False)
+                axis = vt[0]
+            except Exception:
+                axis = np.array([1.0, 0.0], dtype=float)
+            proj = centered @ axis
+
+            n_points = len(work_idx)
+            # Обычно даёт 4-8 "районов", чтобы A не схлопывались в одну станцию.
+            k_regions = int(np.clip(round(np.sqrt(n_points)), 2, 8))
+            edges = np.quantile(proj, np.linspace(0.0, 1.0, k_regions + 1))
+            labels = np.digitize(proj, edges[1:-1], right=False)
+
+            for pos, idx in enumerate(work_idx):
+                out.at[idx, "region_id"] = f"synthetic_{int(labels[pos])}"
+            # На всякий случай проставим тем, кто не попал в work_idx.
+            na_mask = out["region_id"].isna()
+            if na_mask.any():
+                out.loc[na_mask, "region_id"] = "synthetic_0"
+            return out
+
+        try:
+            admin_districts = data_service.get_admin_districts(city_name, city_boundary=city_boundary)
+        except Exception:
+            admin_districts = gpd.GeoDataFrame()
+
+        if admin_districts is not None and len(admin_districts) > 0:
+            try:
+                d = demand.copy()
+                if d.crs is None:
+                    d = d.set_crs("EPSG:4326", allow_override=True)
+                districts = admin_districts.to_crs(d.crs)
+                if "district_name" not in districts.columns:
+                    districts["district_name"] = districts.index.astype(str)
+                districts = districts[["district_name", "geometry"]].copy()
+                districts = districts.rename(columns={"district_name": "region_id"})
+                joined = gpd.sjoin(d, districts, how="left", predicate="within")
+                if "region_id" in joined.columns:
+                    d["region_id"] = joined["region_id"].values
+                    no_region = d["region_id"].isna()
+                    if no_region.any():
+                        d.loc[no_region, "region_id"] = (
+                            "unassigned_" + d.index.astype(str)
+                        )[no_region]
+                else:
+                    d["region_id"] = "region_default"
+                n_regions = int(pd.Series(d["region_id"]).nunique()) if "region_id" in d.columns else 0
+                if n_regions <= 1:
+                    d = _assign_synthetic_regions(d)
+                    n_regions = int(pd.Series(d["region_id"]).nunique())
+                # Пользовательская логика: группы ближайших кластеров (по 5), одна A в самый большой кластер группы.
+                d = _repack_regions_by_nearest_clusters(d, group_size=5)
+                n_regions = int(pd.Series(d["region_id"]).nunique()) if "region_id" in d.columns else n_regions
+                demand = d
+                logger.info(
+                    "Привязка кластеров к административным районам/группам: %s групп",
+                    n_regions,
+                )
+            except Exception:
+                demand = demand.copy()
+                demand["region_id"] = "region_default"
+                demand = _assign_synthetic_regions(demand)
+                demand = _repack_regions_by_nearest_clusters(demand, group_size=5)
+        else:
+            demand = _assign_synthetic_regions(demand.copy())
+            demand = _repack_regions_by_nearest_clusters(demand, group_size=5)
 
     candidates_rooftop = data_service.get_station_candidates(
         buildings, city_boundary, no_fly_zones, road_graph, station_type="rooftop"
@@ -1553,6 +1821,7 @@ def run_full_pipeline(
         min_center_distance_factor_b=0.75,
         force_type_b_per_cluster=True,
         force_type_a_per_region=True,
+        force_type_a_per_cluster=False,
     )
     # --- Корректная привязка зарядок к "своей" геометрии кластера ---
     # Мы делаем hull-first привязку:
@@ -1688,6 +1957,33 @@ def run_full_pipeline(
         # - иначе можно полностью потерять размещение, если hull'ы не покрывают точные координаты кандидатов
         # - UI/линии привязки при None просто не смогут построиться корректно, что безопаснее неверного cluster_id.
 
+    # Проставляем region_id станциям через cluster_id demand-кластеров.
+    if (
+        charge_stations is not None
+        and len(charge_stations) > 0
+        and demand is not None
+        and len(demand) > 0
+        and "region_id" in demand.columns
+    ):
+        try:
+            cluster_key = None
+            if "cluster_id" in demand.columns:
+                cluster_key = "cluster_id"
+            elif "subcluster_id" in demand.columns:
+                cluster_key = "subcluster_id"
+            if cluster_key is not None and "cluster_id" in charge_stations.columns:
+                cluster_to_region: Dict[Any, Any] = {}
+                for _, row in demand.iterrows():
+                    cid = row.get(cluster_key)
+                    rid = row.get("region_id")
+                    if pd.isna(cid) or pd.isna(rid):
+                        continue
+                    cluster_to_region[cid] = rid
+                charge_stations = charge_stations.copy()
+                charge_stations["region_id"] = charge_stations["cluster_id"].map(cluster_to_region)
+        except Exception:
+            pass
+
     # --- Информация о кластерах и “зданиях зарядки” ---
     cluster_count = 0
     charging_buildings_in_clusters = 0
@@ -1706,12 +2002,120 @@ def run_full_pipeline(
             else:
                 charging_buildings_in_clusters = int(demand["n_buildings"].sum())
 
-    # --- Отключаем гаражи/ТО и магистраль (trunk) по запросу пользователя ---
+    # --- Гаражи/ТО отключены, но магистраль строим по зарядкам типа A ---
     garages = gpd.GeoDataFrame()
     to_stations = gpd.GeoDataFrame()
-    trunk = None
+    obstacles_union = None
+    if no_fly_zones is not None:
+        try:
+            if isinstance(no_fly_zones, gpd.GeoDataFrame) and len(no_fly_zones) > 0:
+                nz = no_fly_zones.to_crs("EPSG:4326")
+                obstacles_union = unary_union([g for g in nz.geometry if g is not None and not g.is_empty])
+            elif isinstance(no_fly_zones, list) and len(no_fly_zones) > 0:
+                obstacles_union = unary_union([g for g in no_fly_zones if g is not None and not g.is_empty])
+        except Exception:
+            obstacles_union = None
+
+    trunk = placement.build_trunk_graph(
+        charge_stations,
+        garages,
+        to_stations,
+        obstacles_union,
+        air_graph=None,
+        max_edge_km=R_GARAGE_TO_KM,
+        max_neighbors_a=4,
+        topology_mode="mst",
+        extra_paths_per_a=2,
+    )
+
+    if charge_stations is not None and len(charge_stations) > 0:
+        charge_stations = charge_stations.copy()
+        charge_stations["trunk_degree"] = 0
+        if trunk is not None and trunk.number_of_nodes() > 0:
+            for pos, idx in enumerate(charge_stations.index):
+                nid = f"charge_{idx}"
+                if trunk.has_node(nid):
+                    charge_stations.iloc[pos, charge_stations.columns.get_loc("trunk_degree")] = int(trunk.degree[nid])
     branch_edges: List[Dict[str, Any]] = []
     local_edges: List[Dict[str, Any]] = []
+
+    # Явные связи B -> A в пределах одной группы region_id (группа "5 ближайших").
+    if charge_stations is not None and len(charge_stations) > 0 and "station_type" in charge_stations.columns:
+        try:
+            st = charge_stations
+            a_mask = st["station_type"] == "charge_a"
+            b_mask = st["station_type"] == "charge_b"
+            if a_mask.any() and b_mask.any():
+                a_rows = st[a_mask]
+                b_rows = st[b_mask]
+
+                def _nearest_a_for_b(
+                    b_row,
+                    all_a: gpd.GeoDataFrame,
+                    preferred_region: Any = None,
+                    *,
+                    k_nearest: int = 5,
+                ):
+                    if all_a is None or len(all_a) == 0:
+                        return None
+                    lon_b, lat_b = _coords_from_geom(b_row.geometry)
+                    dist_items = []
+                    for idx_a, row_a in all_a.iterrows():
+                        lon_a, lat_a = _coords_from_geom(row_a.geometry)
+                        d_km = haversine_km(lat_b, lon_b, lat_a, lon_a)
+                        dist_items.append((float(d_km), idx_a))
+                    if not dist_items:
+                        return None
+                    dist_items.sort(key=lambda x: x[0])
+                    nearest = dist_items[: max(1, int(k_nearest))]
+
+                    # Приоритетно берем A из той же region_id, но только среди 5 ближайших A.
+                    if preferred_region is not None and not pd.isna(preferred_region) and "region_id" in all_a.columns:
+                        for d_km, idx_a in nearest:
+                            row_a = all_a.loc[idx_a]
+                            if row_a.get("region_id") == preferred_region:
+                                return row_a, float(d_km)
+
+                    # Иначе — просто ближайшая из 5 ближайших.
+                    d_km, idx_a = nearest[0]
+                    row_a = all_a.loc[idx_a]
+                    return row_a, float(d_km)
+
+                for idx_b, row_b in b_rows.iterrows():
+                    region_b = row_b.get("region_id") if "region_id" in b_rows.columns else None
+                    target = _nearest_a_for_b(
+                        row_b,
+                        a_rows,
+                        preferred_region=region_b,
+                        k_nearest=5,
+                    )
+                    if target is None:
+                        continue
+                    row_a, d_km = target
+                    lon_b, lat_b = _coords_from_geom(row_b.geometry)
+                    lon_a, lat_a = _coords_from_geom(row_a.geometry)
+                    branch_edges.append(
+                        {
+                            "type": "Feature",
+                            "geometry": {
+                                "type": "LineString",
+                                "coordinates": [[lon_b, lat_b], [lon_a, lat_a]],
+                            },
+                            "properties": {
+                                "edge_type": "branch_b_to_a_group",
+                                "source_id": str(idx_b),
+                                "target_id": str(getattr(row_a, "name", "")),
+                                "weight_km": round(float(d_km), 4),
+                                "region_id": (
+                                    str(region_b)
+                                    if region_b is not None and not pd.isna(region_b)
+                                    else None
+                                ),
+                            },
+                        }
+                    )
+        except Exception:
+            branch_edges = []
 
     metrics = placement.compute_metrics(demand, charge_stations, trunk)
     metrics["charge"] = charge_metrics
