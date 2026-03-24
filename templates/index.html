@@ -211,6 +211,12 @@
             <button class="floating-btn btn-secondary" id="loadStationsRulesBtn" style="width:100%; margin-top:8px" onclick="loadStationsRulesPlacement()">
                 Рассчитать зарядки
             </button>
+            <button class="floating-btn btn-secondary" id="toggleTrunkBtn" style="width:100%; margin-top:6px" onclick="toggleTrunkLines()">
+                <span id="toggleTrunkLabel">Скрыть магистраль</span>
+            </button>
+            <button class="floating-btn btn-secondary" id="toggleLocalBtn" style="width:100%; margin-top:6px" onclick="toggleLocalLines()">
+                <span id="toggleLocalLabel">Скрыть локальные пути</span>
+            </button>
             <button class="floating-btn btn-secondary" id="exportSavedStationsBtn" style="width:100%; margin-top:6px" onclick="exportSavedStations()">
                 Выгрузить станции из БД
             </button>
@@ -239,9 +245,13 @@
     <script>
         let map, boundaryLayer, noFlyZonesLayer, buildingsLayer, clustersLayer, clusterHullsLayer, clusterPointsLayer;
         let stationsRulesLayerGroup = null;
+        let trunkLinesLayer = null;
+        let localLinesLayer = null;
         let clusterHullsVisible = true;
         let clusterPointsVisible = false; // точки кластеров (центроиды/точки спроса) по умолчанию скрыты
         let buildingsVisible = true;
+        let trunkLinesVisible = true;
+        let localLinesVisible = true;
         
         // Список популярных городов
         const CITIES = [
@@ -638,6 +648,42 @@
             updateClusterPointsButtonLabel();
         }
 
+        function updateTrunkButtonLabel() {
+            const el = document.getElementById('toggleTrunkLabel');
+            if (!el) return;
+            el.textContent = trunkLinesVisible ? 'Скрыть магистраль' : 'Показать магистраль';
+        }
+
+        function updateLocalButtonLabel() {
+            const el = document.getElementById('toggleLocalLabel');
+            if (!el) return;
+            el.textContent = localLinesVisible ? 'Скрыть локальные пути' : 'Показать локальные пути';
+        }
+
+        function toggleTrunkLines() {
+            trunkLinesVisible = !trunkLinesVisible;
+            if (stationsRulesLayerGroup && trunkLinesLayer) {
+                if (trunkLinesVisible) {
+                    trunkLinesLayer.addTo(stationsRulesLayerGroup);
+                } else {
+                    stationsRulesLayerGroup.removeLayer(trunkLinesLayer);
+                }
+            }
+            updateTrunkButtonLabel();
+        }
+
+        function toggleLocalLines() {
+            localLinesVisible = !localLinesVisible;
+            if (stationsRulesLayerGroup && localLinesLayer) {
+                if (localLinesVisible) {
+                    localLinesLayer.addTo(stationsRulesLayerGroup);
+                } else {
+                    stationsRulesLayerGroup.removeLayer(localLinesLayer);
+                }
+            }
+            updateLocalButtonLabel();
+        }
+
         async function exportSavedStations() {
             const city = getCityQuery();
             if (!city) {
@@ -703,6 +749,8 @@
                     map.removeLayer(stationsRulesLayerGroup);
                     stationsRulesLayerGroup = null;
                 }
+                trunkLinesLayer = null;
+                localLinesLayer = null;
                 stationsRulesLayerGroup = L.layerGroup();
 
                 /** Устойчивый цвет по id кластера (золотой угол в HSL). */
@@ -715,7 +763,7 @@
                     };
                 }
 
-                function addLines(fc, style, popupTitle) {
+                function addLines(fc, style, popupTitle, targetLayer) {
                     if (!fc || !fc.features || !fc.features.length) return;
                     L.geoJSON(fc, {
                         style: style,
@@ -723,7 +771,7 @@
                             const p = feature.properties || {};
                             layer.bindPopup(popupTitle + '<br>' + JSON.stringify(p).slice(0, 200));
                         },
-                    }).addTo(stationsRulesLayerGroup);
+                    }).addTo(targetLayer || stationsRulesLayerGroup);
                 }
                 function addPoints(fc, color, border, r, title, pointStyleResolver) {
                     if (!fc || !fc.features || !fc.features.length) return;
@@ -777,9 +825,13 @@
                 addPoints(data.charging_type_b, '#16a34a', '#14532d', 7, 'Зарядка + ожидание (тип B)');
                 addPoints(data.garages, '#3b82f6', '#1d4ed8', 10, 'Гараж');
                 addPoints(data.to_stations, '#f97316', '#9a3412', 10, 'Станция ТО');
-                addLines(data.trunk, { color: '#16a34a', weight: 3, opacity: 0.95, lineCap: 'round', lineJoin: 'round' }, 'Магистраль');
+                trunkLinesLayer = L.layerGroup();
+                localLinesLayer = L.layerGroup();
+                addLines(data.trunk, { color: '#16a34a', weight: 3, opacity: 0.95, lineCap: 'round', lineJoin: 'round' }, 'Магистраль', trunkLinesLayer);
                 addLines(data.branch_edges, { color: '#2563eb', weight: 2, opacity: 0.9 }, 'Ветвь B→A');
-                addLines(data.local_edges, { color: '#a78bfa', weight: 3, opacity: 0.75, dashArray: '2, 4' }, 'Локально B↔B');
+                addLines(data.local_edges, { color: '#a78bfa', weight: 3, opacity: 0.75, dashArray: '2, 4' }, 'Локально B↔B', localLinesLayer);
+                if (trunkLinesVisible) trunkLinesLayer.addTo(stationsRulesLayerGroup);
+                if (localLinesVisible) localLinesLayer.addTo(stationsRulesLayerGroup);
 
                 // Явные линии "кластер ↔ зарядка" (по cluster_id зарядки и cluster_centroids из API).
                 try {
@@ -881,6 +933,8 @@
                 }
 
                 stationsRulesLayerGroup.addTo(map);
+                updateTrunkButtonLabel();
+                updateLocalButtonLabel();
                 const m = data.metrics || {};
                 if (statsEl) {
                     statsEl.textContent =
