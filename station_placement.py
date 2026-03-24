@@ -673,13 +673,8 @@ class StationPlacement:
                             continue
                         if cid in placed_cluster_ids:
                             continue
-                        # определяем район для этого кластера (берём region_id из centroid_df)
-                        if region_col is None or region_col not in sub_c.columns:
-                            rid = None
-                        else:
-                            rid = sub_c[region_col].values[0] if len(sub_c[region_col].values) > 0 else None
-                        if rid is not None and rid in main_cluster_by_region and main_cluster_by_region[rid] == cid:
-                            continue  # в главный кластер charge_b не ставим
+                        # Главный кластер региона: если A уже поставлен, cid ∈ placed_cluster_ids и мы выше вышли.
+                        # Если A не удалось поставить — даём станцию B, иначе кластер остаётся без зарядки.
                         lon_c, lat_c = _coords_from_geom(sub_c.iloc[0].geometry)
 
                         # Строго: кандидат должен лежать внутри hull своего cid кластера.
@@ -731,6 +726,59 @@ class StationPlacement:
         # Фаза 2: станции типа Б (дополняют покрытие оставшегося спроса).
         if enable_type_b and (max_stations is None or len(selected) < max_stations):
             run_phase("charge_b", type_b_coverage_ratio, ignore_covered_in_score=False)
+
+        # Резерв: если жёсткие ограничения/forced ничего не дали, но МКД-кандидаты и спрос есть —
+        # ставим минимум одну А в лучшей точке (или у ближайшего МКД к центру спроса).
+        if not selected and len(cand_pts) > 0 and n_demand > 0:
+            building_indices = list(range(len(cand_pts)))
+            if "source" in candidates.columns:
+                building_indices = [
+                    i for i in building_indices if candidates.iloc[i].get("source") == "building"
+                ]
+            best_i = -1
+            best_cov = -1.0
+            for i in building_indices:
+                lon_c, lat_c = cand_pts[i, 0], cand_pts[i, 1]
+                cov = 0.0
+                for j in range(n_demand):
+                    if not is_core_demand[j]:
+                        continue
+                    d_km = haversine_km(lat_c, lon_c, dem_pts[j, 1], dem_pts[j, 0])
+                    if d_km <= radius_km:
+                        cov += float(weights[j])
+                if cov > best_cov:
+                    best_cov = cov
+                    best_i = i
+            if best_i < 0:
+                best_d = float("inf")
+                for i in building_indices:
+                    lon_c, lat_c = cand_pts[i, 0], cand_pts[i, 1]
+                    d = haversine_km(lat_c, lon_c, core_lat, core_lon)
+                    if d < best_d:
+                        best_d = d
+                        best_i = i
+            if best_i >= 0:
+                self.logger.warning(
+                    "Зарядки: основной алгоритм не поставил станций — резервная одна станция типа А (индекс кандидата %s)",
+                    best_i,
+                )
+                lon_c, lat_c = cand_pts[best_i, 0], cand_pts[best_i, 1]
+                selected_indices.append(best_i)
+                selected_types.append("charge_a")
+                for j in range(n_demand):
+                    d_km = haversine_km(lat_c, lon_c, dem_pts[j, 1], dem_pts[j, 0])
+                    if d_km <= radius_km:
+                        if not is_core_demand[j]:
+                            continue
+                        if not covered[j]:
+                            covered[j] = True
+                selected.append(
+                    {
+                        "geometry": Point(cand_pts[best_i, 0], cand_pts[best_i, 1]),
+                        "station_type": "charge_a",
+                        "source_index": best_i,
+                    }
+                )
 
         gdf = gpd.GeoDataFrame(selected, crs=candidates.crs) if selected else gpd.GeoDataFrame()
         covered_weight = float(weights[covered].sum())
@@ -1775,6 +1823,11 @@ def run_full_pipeline(
         if parts
         else gpd.GeoDataFrame()
     )
+    if charge_candidates_full is None or len(charge_candidates_full) == 0:
+        logger.warning(
+            "Кандидатов для зарядок на МКД нет (пустой список после фильтрации OSM). "
+            "Проверьте теги building и границу города; слой зарядок будет пустым."
+        )
 
     if demand_method == "dbscan" and charge_candidates_full is not None and len(charge_candidates_full) > 0:
         charge_candidates = placement.build_charge_candidates_from_clusters(

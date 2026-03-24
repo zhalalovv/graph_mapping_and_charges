@@ -43,6 +43,9 @@ def _placement_cache_key(
         "dbscan_eps_m": float(dbscan_eps_m),
         "dbscan_min_samples": int(dbscan_min_samples),
         "a_by_admin_districts": bool(a_by_admin_districts),
+        # Смена версии сбрасывает устаревший Redis-кэш (иначе после правок пайплайна
+        # клиент может бесконечно получать пустой сохранённый ответ).
+        "placement_schema": 5,
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()
