@@ -1775,12 +1775,19 @@ class DataService:
                         break
                     except (ValueError, TypeError):
                         pass
-            is_mkd = self._is_apartment(row) or tag in self._ROOFTOP_BUILDING_TAGS
-            is_residential_high = tag in ("residential", "yes", "house") and levels is not None and levels >= 3
-            is_rooftop = is_mkd or is_residential_high
+            # МКД в OSM чаще всего: building=apartments; также dormitory и крупный residential.
+            is_rooftop = False
+            if tag == "apartments" or tag == "dormitory":
+                is_rooftop = True
+            elif tag == "residential":
+                if levels is not None and int(levels) >= 3:
+                    is_rooftop = True
+                elif area >= 600:
+                    is_rooftop = True
 
             if station_type == "rooftop":
-                if not is_rooftop and not (tag in ("yes", "residential") and area > 800):
+                # Кандидаты зарядки — многоквартирные и сопоставимые по масштабу жилые дома.
+                if not is_rooftop:
                     continue
                 rows.append({"geometry": Point(lon, lat), "source": "building", "osm_index": idx})
             elif station_type == "ground":
