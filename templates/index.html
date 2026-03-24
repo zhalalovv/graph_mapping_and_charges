@@ -216,8 +216,8 @@
             <button class="floating-btn btn-secondary" id="toggleLocalBtn" style="width:100%; margin-top:6px" onclick="toggleLocalLines()" title="Ветви Б/гараж/ТО к зарядке A и локальные B↔B (магистраль A не трогаем)">
                 <span id="toggleLocalLabel">Скрыть локальные пути</span>
             </button>
-            <button class="floating-btn btn-secondary" id="exportSavedStationsBtn" style="width:100%; margin-top:6px" onclick="exportSavedStations()">
-                Выгрузить станции из БД
+            <button class="floating-btn btn-secondary" id="loadSavedStationsBtn" style="width:100%; margin-top:6px" onclick="loadSavedStationsToMap()" title="Показать последнюю сохранённую расстановку из Redis на карте (без пересчёта)">
+                Показать сохранённые станции на карте
             </button>
             <div id="stationsRulesStats" style="font-size:12px; color:#6b7280; margin-top:8px"></div>
         </div>
@@ -683,77 +683,42 @@
             updateLocalButtonLabel();
         }
 
-        async function exportSavedStations() {
+        function buildStationsPlacementUrl(useSaved, onlySaved) {
             const city = getCityQuery();
-            if (!city) {
-                alert('Сначала выберите город');
-                return;
-            }
-            try {
-                const url = new URL('/api/stations/export_saved', window.location.origin);
-                url.searchParams.set('city', city);
-                url.searchParams.set('network_type', 'drive');
-                url.searchParams.set('simplify', 'true');
-                url.searchParams.set('demand_method', 'dbscan');
-                url.searchParams.set('a_by_admin_districts', 'true');
-                const resp = await fetch(url);
-                if (!resp.ok) {
-                    const err = await resp.json().catch(() => ({}));
-                    throw new Error(err.detail || ('Ошибка ' + resp.status));
-                }
-                const data = await resp.json();
-                const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json;charset=utf-8' });
-                const a = document.createElement('a');
-                const safeCity = city.replace(/\s+/g, '_').replace(/[^\w\-]/g, '');
-                a.href = URL.createObjectURL(blob);
-                a.download = `stations_${safeCity || 'city'}.json`;
-                document.body.appendChild(a);
-                a.click();
-                URL.revokeObjectURL(a.href);
-                document.body.removeChild(a);
-            } catch (e) {
-                alert('Не удалось выгрузить станции: ' + e.message);
-            }
+            const url = new URL('/api/stations/placement', window.location.origin);
+            url.searchParams.set('city', city);
+            url.searchParams.set('network_type', 'drive');
+            url.searchParams.set('simplify', 'true');
+            url.searchParams.set('demand_method', 'dbscan');
+            url.searchParams.set('dbscan_eps_m', '180');
+            url.searchParams.set('dbscan_min_samples', '15');
+            url.searchParams.set('a_by_admin_districts', 'true');
+            url.searchParams.set('use_saved', useSaved ? 'true' : 'false');
+            url.searchParams.set('only_saved', onlySaved ? 'true' : 'false');
+            return url;
         }
 
-        async function loadStationsRulesPlacement() {
-            const city = getCityQuery();
-            const network = 'drive';
-            const simplify = true;
+        /** Общая отрисовка слоёв зарядки (ответ API такой же для расчёта и для кэша). */
+        function renderStationsRulesPlacement(data) {
             const statsEl = document.getElementById('stationsRulesStats');
-            if (!city) {
-                alert('Сначала выберите город');
+            if (!data) {
+                if (statsEl) statsEl.textContent = 'Нет данных';
                 return;
             }
-            if (statsEl) statsEl.textContent = 'Расчёт зарядок / гаражей / ТО…';
-            try {
-                const url = new URL('/api/stations/placement', window.location.origin);
-                url.searchParams.set('city', city);
-                url.searchParams.set('network_type', network);
-                url.searchParams.set('simplify', simplify);
-                url.searchParams.set('demand_method', 'dbscan');
-                url.searchParams.set('a_by_admin_districts', 'true');
-                url.searchParams.set('use_saved', 'false');
-                const resp = await fetch(url);
-                if (!resp.ok) {
-                    const err = await resp.json().catch(() => ({}));
-                    throw new Error(err.detail || 'Ошибка ' + resp.status);
-                }
-                const data = await resp.json();
-                if (data.error) {
-                    if (statsEl) statsEl.textContent = data.error;
-                    return;
-                }
-                if (stationsRulesLayerGroup) {
-                    map.removeLayer(stationsRulesLayerGroup);
-                    stationsRulesLayerGroup = null;
-                }
-                trunkLinesLayer = null;
-                localLinesLayer = null;
-                stationsRulesLayerGroup = L.layerGroup();
+            if (data.error) {
+                if (statsEl) statsEl.textContent = data.error;
+                return;
+            }
+            if (stationsRulesLayerGroup) {
+                map.removeLayer(stationsRulesLayerGroup);
+                stationsRulesLayerGroup = null;
+            }
+            trunkLinesLayer = null;
+            localLinesLayer = null;
+            stationsRulesLayerGroup = L.layerGroup();
 
-                /** Устойчивый цвет по id кластера (золотой угол в HSL). */
-                function colorForClusterId(cid) {
+            /** Устойчивый цвет по id кластера (золотой угол в HSL). */
+            function colorForClusterId(cid) {
                     const n = Math.max(0, parseInt(cid, 10) || 0);
                     const h = (n * 137.508) % 360;
                     return {
@@ -779,6 +744,9 @@
                 const STATION_COLOR_GARAGE_STROKE = '#c2410c';
                 const STATION_COLOR_TO = '#2563eb';
                 const STATION_COLOR_TO_STROKE = '#1e40af';
+                /** Ветви к A и локальные B↔B (не магистраль) — голубые, чтобы не сливаться с зелёной магистралью. */
+                const STATION_COLOR_BRANCH = '#0ea5e9';
+                const STATION_COLOR_LOCAL_EDGE = '#38bdf8';
 
                 function addPoints(fc, color, border, r, title, pointStyleResolver, ignoreClusterColor) {
                     if (!fc || !fc.features || !fc.features.length) return;
@@ -821,8 +789,8 @@
                 localLinesLayer = L.layerGroup();
                 addLines(data.trunk, { color: STATION_COLOR_CHARGING, weight: 3, opacity: 0.95, lineCap: 'round', lineJoin: 'round' }, 'Магистраль', trunkLinesLayer);
                 /* Ветви к A и локальные B↔B — один слой: скрываются кнопкой «локальные пути» (магистраль отдельно). */
-                addLines(data.branch_edges, { color: STATION_COLOR_CHARGING, weight: 2, opacity: 0.9, lineCap: 'round' }, 'Ветвь к зарядке A (Б / гараж / ТО)', localLinesLayer);
-                addLines(data.local_edges, { color: '#a78bfa', weight: 3, opacity: 0.75, dashArray: '2, 4' }, 'Локально B↔B', localLinesLayer);
+                addLines(data.branch_edges, { color: STATION_COLOR_BRANCH, weight: 2, opacity: 0.92, lineCap: 'round', lineJoin: 'round' }, 'Ветвь к зарядке A (Б / гараж / ТО)', localLinesLayer);
+                addLines(data.local_edges, { color: STATION_COLOR_LOCAL_EDGE, weight: 3, opacity: 0.9, dashArray: '2, 4', lineCap: 'round', lineJoin: 'round' }, 'Локально B↔B', localLinesLayer);
                 if (trunkLinesVisible) trunkLinesLayer.addTo(stationsRulesLayerGroup);
                 if (localLinesVisible) localLinesLayer.addTo(stationsRulesLayerGroup);
 
@@ -970,7 +938,49 @@
                         + ', зданий в кластерах: ' + (m.charging_buildings_in_clusters != null ? m.charging_buildings_in_clusters : '—')
                         + ' | гаражей: ' + nGar + ', ТО: ' + nTo
                         + (data.from_saved ? ' | загружено из сохранённой расстановки' : ' | сохранено');
+            }
+        }
+
+        async function loadStationsRulesPlacement() {
+            const city = getCityQuery();
+            const statsEl = document.getElementById('stationsRulesStats');
+            if (!city) {
+                alert('Сначала выберите город');
+                return;
+            }
+            if (statsEl) statsEl.textContent = 'Расчёт зарядок / гаражей / ТО…';
+            try {
+                const url = buildStationsPlacementUrl(false, false);
+                const resp = await fetch(url);
+                if (!resp.ok) {
+                    const err = await resp.json().catch(() => ({}));
+                    throw new Error(err.detail || ('Ошибка ' + resp.status));
                 }
+                const data = await resp.json();
+                renderStationsRulesPlacement(data);
+            } catch (e) {
+                console.error(e);
+                if (statsEl) statsEl.textContent = 'Ошибка: ' + e.message;
+            }
+        }
+
+        async function loadSavedStationsToMap() {
+            const city = getCityQuery();
+            const statsEl = document.getElementById('stationsRulesStats');
+            if (!city) {
+                alert('Сначала выберите город');
+                return;
+            }
+            if (statsEl) statsEl.textContent = 'Загрузка сохранённой расстановки…';
+            try {
+                const url = buildStationsPlacementUrl(true, true);
+                const resp = await fetch(url);
+                if (!resp.ok) {
+                    const err = await resp.json().catch(() => ({}));
+                    throw new Error(err.detail || ('Ошибка ' + resp.status));
+                }
+                const data = await resp.json();
+                renderStationsRulesPlacement(data);
             } catch (e) {
                 console.error(e);
                 if (statsEl) statsEl.textContent = 'Ошибка: ' + e.message;

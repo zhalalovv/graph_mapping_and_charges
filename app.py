@@ -363,6 +363,7 @@ def get_stations_placement(
     dbscan_min_samples: int = Query(15, description="min_samples DBSCAN"),
     a_by_admin_districts: bool = Query(True, description="Ставить станции A по административным районам"),
     use_saved: bool = Query(True, description="Использовать сохранённую расстановку, если есть"),
+    only_saved: bool = Query(False, description="Только кэш Redis: при промахе 404, без пересчёта пайплайна"),
     save_result: bool = Query(True, description="Сохранять новую расстановку в Redis"),
 ):
     """
@@ -380,6 +381,22 @@ def get_stations_placement(
             a_by_admin_districts=a_by_admin_districts,
         )
         redis_client = data_service.get_redis_client()
+        if only_saved:
+            if redis_client is None:
+                raise HTTPException(status_code=503, detail="Redis недоступен")
+            try:
+                cached = redis_client.get(cache_key)
+                if cached:
+                    data = json.loads(cached.decode("utf-8"))
+                    data["from_saved"] = True
+                    return JSONResponse(data)
+            except Exception as e:
+                logger.warning("Не удалось прочитать сохранённую расстановку: %s", e)
+            raise HTTPException(
+                status_code=404,
+                detail="Сохранённая расстановка не найдена (нет записи в кэше для этих параметров)",
+            )
+
         if use_saved and redis_client is not None:
             try:
                 cached = redis_client.get(cache_key)

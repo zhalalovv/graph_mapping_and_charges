@@ -2380,6 +2380,15 @@ def run_full_pipeline(
         except Exception:
             branch_edges = []
 
+    try:
+        local_edges = placement.build_local_edges(
+            charge_stations,
+            max_edge_km=R_GARAGE_TO_KM,
+            max_neighbors_b=2,
+        )
+    except Exception:
+        local_edges = []
+
     metrics = placement.compute_metrics(demand, charge_stations, trunk)
     metrics["charge"] = charge_metrics
     metrics["cluster_count"] = cluster_count
