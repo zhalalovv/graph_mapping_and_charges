@@ -7,10 +7,9 @@
 Шаги:
   1) Точки спроса (кластеры/сетка 250×250 м с весом).
   2) Зарядки: weighted maximum coverage / set cover (жадный).
-  3) Магистральный слой: узлы Charge_A + гаражи/ТО, рёбра А–А (макс. 4 на станцию).
-  4) Гаражи: k-median по спросу, только промзоны.
-  5) ТО: betweenness centrality по trunk + промзона.
-  6) Локальная сеть и метрики.
+  3) Гаражи и ТО: по ceil(N_A/3) каждого, промзона; разнос между точками и от зарядок (см. MIN_FACILITY_SEPARATION_KM); ветви к ближайшим A как у B→A.
+  4) Магистраль: только между станциями Charge_A (MST по A); гаражи/ТО — ответвления к ближайшим A (ветки на карте).
+  5) Локальная сеть и метрики.
 """
 
 from __future__ import annotations
@@ -35,6 +34,8 @@ D_MAX_KM = 16.0
 R_CHARGE_KM = 0.4 * D_MAX_KM / 4.0
 # Гаражи и ТО (в одну сторону): R = 0.8 * D_max / 4 = 3.2 км
 R_GARAGE_TO_KM = 0.8 * D_MAX_KM / 4.0
+# Разные типы станций (гараж / ТО / зарядка) и несколько гаражей — не в одной точке (разные корпуса).
+MIN_FACILITY_SEPARATION_KM = 0.4
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -67,6 +68,149 @@ def _points_array(gdf: gpd.GeoDataFrame) -> np.ndarray:
         g = row.geometry
         coords.append(_coords_from_geom(g))
     return np.array(coords)
+
+
+def _lonlat_exclusions_from_gdf(gdf: Optional[gpd.GeoDataFrame]) -> List[Tuple[float, float]]:
+    """Список (lon, lat) для запрета колокации."""
+    if gdf is None or len(gdf) == 0:
+        return []
+    return [_coords_from_geom(row.geometry) for _, row in gdf.iterrows()]
+
+
+def _respect_min_separation(
+    lon: float,
+    lat: float,
+    chosen_idx: List[int],
+    cand_pts: np.ndarray,
+    exclude_lonlat: List[Tuple[float, float]],
+    min_sep_km: float,
+) -> bool:
+    if min_sep_km <= 0:
+        return True
+    for elon, elat in exclude_lonlat:
+        if haversine_km(lat, lon, elat, elon) < min_sep_km:
+            return False
+    for ci in chosen_idx:
+        elon, elat = float(cand_pts[ci, 0]), float(cand_pts[ci, 1])
+        if haversine_km(lat, lon, elat, elon) < min_sep_km:
+            return False
+    return True
+
+
+def _place_n_facilities_by_demand_coverage(
+    demand: Optional[gpd.GeoDataFrame],
+    candidates: Optional[gpd.GeoDataFrame],
+    *,
+    n: int,
+    radius_km: float,
+    station_type_label: str,
+    log: Optional[logging.Logger] = None,
+    min_separation_km: float = 0.0,
+    exclude_lonlat: Optional[List[Tuple[float, float]]] = None,
+) -> gpd.GeoDataFrame:
+    """
+    Ровно до `n` точек из кандидатов: жадно по максимальному приросту покрытого веса спроса в радиусе.
+    Опционально — минимальное расстояние между выбранными точками и до ``exclude_lonlat`` (другие типы станций).
+    Если с разнесением кандидатов не хватает, один раз ослабляем проверку для текущего шага (с предупреждением в лог).
+    """
+    if candidates is None or len(candidates) == 0 or n <= 0:
+        return gpd.GeoDataFrame()
+    n = min(int(n), len(candidates))
+    exclude = list(exclude_lonlat or [])
+    cand_pts = _points_array(candidates)
+
+    if demand is None or len(demand) == 0:
+        chosen_ns: List[int] = []
+        for _ in range(n):
+            pick = -1
+            for c in range(len(cand_pts)):
+                if c in chosen_ns:
+                    continue
+                lon_c, lat_c = float(cand_pts[c, 0]), float(cand_pts[c, 1])
+                if _respect_min_separation(lon_c, lat_c, chosen_ns, cand_pts, exclude, min_separation_km):
+                    pick = c
+                    break
+            if pick < 0:
+                for c in range(len(cand_pts)):
+                    if c not in chosen_ns:
+                        pick = c
+                        if log and min_separation_km > 0:
+                            log.warning(
+                                "%s: не найден кандидат с разносом ≥ %.2f км, берём ближайший доступный",
+                                station_type_label,
+                                min_separation_km,
+                            )
+                        break
+            if pick < 0:
+                break
+            chosen_ns.append(pick)
+        rows_ns = [candidates.iloc[i].copy() for i in chosen_ns]
+        for r in rows_ns:
+            r["station_type"] = station_type_label
+        out_ns = gpd.GeoDataFrame(rows_ns, crs=candidates.crs) if rows_ns else gpd.GeoDataFrame()
+        if log:
+            log.info("%s: размещено %s из целевых %s", station_type_label, len(out_ns), n)
+        return out_ns
+
+    dem_pts = _points_array(demand)
+    weights = demand["weight"].values if "weight" in demand.columns else np.ones(len(demand))
+    chosen: List[int] = []
+    covered = np.zeros(len(dem_pts), dtype=bool)
+    warned_relax = False
+    for _ in range(n):
+        best_cand = -1
+        best_new = -1.0
+        for c in range(len(cand_pts)):
+            if c in chosen:
+                continue
+            lat_c, lon_c = cand_pts[c, 1], cand_pts[c, 0]
+            if not _respect_min_separation(lon_c, lat_c, chosen, cand_pts, exclude, min_separation_km):
+                continue
+            new_w = 0.0
+            for j in range(len(dem_pts)):
+                if covered[j]:
+                    continue
+                if haversine_km(lat_c, lon_c, dem_pts[j, 1], dem_pts[j, 0]) <= radius_km:
+                    new_w += float(weights[j])
+            if new_w > best_new:
+                best_new = new_w
+                best_cand = c
+        if best_cand < 0 and best_new < 0:
+            for c in range(len(cand_pts)):
+                if c in chosen:
+                    continue
+                lat_c, lon_c = cand_pts[c, 1], cand_pts[c, 0]
+                new_w = 0.0
+                for j in range(len(dem_pts)):
+                    if covered[j]:
+                        continue
+                    if haversine_km(lat_c, lon_c, dem_pts[j, 1], dem_pts[j, 0]) <= radius_km:
+                        new_w += float(weights[j])
+                if new_w > best_new:
+                    best_new = new_w
+                    best_cand = c
+            if best_cand >= 0 and log and min_separation_km > 0 and not warned_relax:
+                log.warning(
+                    "%s: для шага размещения нет кандидата с разносом ≥ %.2f км — ослабляем критерий",
+                    station_type_label,
+                    min_separation_km,
+                )
+                warned_relax = True
+        if best_cand < 0:
+            break
+        chosen.append(best_cand)
+        lat_c, lon_c = cand_pts[best_cand, 1], cand_pts[best_cand, 0]
+        for j in range(len(dem_pts)):
+            if haversine_km(lat_c, lon_c, dem_pts[j, 1], dem_pts[j, 0]) <= radius_km:
+                covered[j] = True
+
+    rows = [candidates.iloc[i].copy() for i in chosen]
+    for r in rows:
+        r["station_type"] = station_type_label
+    out = gpd.GeoDataFrame(rows, crs=candidates.crs)
+    if log:
+        log.info("%s: размещено %s из целевых %s", station_type_label, len(out), n)
+    return out
 
 
 def _lat_center_from_boundary(city_boundary) -> float:
@@ -812,12 +956,10 @@ class StationPlacement:
         extra_paths_per_a: int = 2,
     ) -> nx.Graph:
         """
-        Магистраль: узлы — все станции типа А:
-        - зарядки типа А (основное покрытие),
-        - гаражи,
-        - станции ТО.
+        Магистраль (спина сети): только станции типа А (зарядки А).
+        Гаражи и ТО в магистраль не входят — к ближайшим А ведут ветки (см. branch_edges в пайплайне).
 
-        Рёбра магистрали соединяют каждую станцию с ближайшими соседями в пределах max_edge_km (км),
+        Рёбра магистрали соединяют каждую станцию А с ближайшими соседями-А в пределах max_edge_km (км),
         не более 2 рёбер на станцию (даже если max_neighbors_a > 2).
 
         Если прямая связь между станциями пересекает препятствия (бесполётные зоны / высокие здания),
@@ -833,16 +975,6 @@ class StationPlacement:
             lon, lat = _coords_from_geom(row.geometry)
             nid = f"charge_{i}"
             nodes_list.append(((lon, lat), "charge", nid))
-            trunk_nodes.append((nid, lon, lat))
-        for i, row in (garage_points.iterrows() if garage_points is not None and len(garage_points) > 0 else []):
-            lon, lat = _coords_from_geom(row.geometry)
-            nid = f"garage_{i}"
-            nodes_list.append(((lon, lat), "garage", nid))
-            trunk_nodes.append((nid, lon, lat))
-        for i, row in (to_points.iterrows() if to_points is not None and len(to_points) > 0 else []):
-            lon, lat = _coords_from_geom(row.geometry)
-            nid = f"to_{i}"
-            nodes_list.append(((lon, lat), "to", nid))
             trunk_nodes.append((nid, lon, lat))
 
         G = nx.Graph()
@@ -1082,7 +1214,7 @@ class StationPlacement:
                         added_cnt[ni] = added_cnt.get(ni, 0) + 1
                         added_cnt[nj] = added_cnt.get(nj, 0) + 1
         self.logger.info(
-            f"Trunk (А–А, макс. {max_neighbors_a} соседей): {G.number_of_nodes()} узлов, {G.number_of_edges()} рёбер"
+            f"Магистраль (только А, макс. {max_neighbors_a} соседей): {G.number_of_nodes()} узлов, {G.number_of_edges()} рёбер"
         )
         return G
 
@@ -2069,9 +2201,7 @@ def run_full_pipeline(
             else:
                 charging_buildings_in_clusters = int(demand["n_buildings"].sum())
 
-    # --- Гаражи/ТО отключены, но магистраль строим по зарядкам типа A ---
-    garages = gpd.GeoDataFrame()
-    to_stations = gpd.GeoDataFrame()
+    # --- Гаражи и ТО: ceil(N_a/3) каждого типа; связь с ближайшими A как у B→A (ветка на карте) ---
     obstacles_union = None
     if no_fly_zones is not None:
         try:
@@ -2083,10 +2213,55 @@ def run_full_pipeline(
         except Exception:
             obstacles_union = None
 
+    n_a_for_facilities = 0
+    if (
+        charge_stations is not None
+        and len(charge_stations) > 0
+        and "station_type" in charge_stations.columns
+    ):
+        n_a_for_facilities = int((charge_stations["station_type"] == "charge_a").sum())
+    n_garage_to = (n_a_for_facilities + 2) // 3 if n_a_for_facilities > 0 else 0
+
+    garage_candidates_fc = data_service.get_station_candidates(
+        buildings, city_boundary, no_fly_zones, road_graph, station_type="garage"
+    )
+    to_candidates_fc = data_service.get_station_candidates(
+        buildings, city_boundary, no_fly_zones, road_graph, station_type="to"
+    )
+    if n_garage_to > 0:
+        busy_lonlat = _lonlat_exclusions_from_gdf(charge_stations)
+        garages = _place_n_facilities_by_demand_coverage(
+            demand,
+            garage_candidates_fc,
+            n=n_garage_to,
+            radius_km=R_GARAGE_TO_KM,
+            station_type_label="garage",
+            log=logger,
+            min_separation_km=MIN_FACILITY_SEPARATION_KM,
+            exclude_lonlat=busy_lonlat,
+        )
+        busy_lonlat = busy_lonlat + _lonlat_exclusions_from_gdf(garages)
+        # Тот же принцип, что и гараж; плюс разнос от зарядок и от уже выбранных гаражей.
+        to_stations = _place_n_facilities_by_demand_coverage(
+            demand,
+            to_candidates_fc,
+            n=n_garage_to,
+            radius_km=R_GARAGE_TO_KM,
+            station_type_label="to",
+            log=logger,
+            min_separation_km=MIN_FACILITY_SEPARATION_KM,
+            exclude_lonlat=busy_lonlat,
+        )
+    else:
+        garages = gpd.GeoDataFrame()
+        to_stations = gpd.GeoDataFrame()
+
+    # Магистраль на карте — только между зарядками A (как на схеме: «хребет» из зелёных точек).
+    # Гараж и ТО подключаются к A отдельными ветвями (branch_edges), не входят в линию магистрали.
     trunk = placement.build_trunk_graph(
         charge_stations,
-        garages,
-        to_stations,
+        gpd.GeoDataFrame(),
+        gpd.GeoDataFrame(),
         obstacles_union,
         air_graph=None,
         max_edge_km=R_GARAGE_TO_KM,
@@ -2106,18 +2281,17 @@ def run_full_pipeline(
     branch_edges: List[Dict[str, Any]] = []
     local_edges: List[Dict[str, Any]] = []
 
-    # Явные связи B -> A в пределах одной группы region_id (группа "5 ближайших").
+    # Связи «спутник → A»: Б, гараж и ТО — та же логика, что B→A (k ближайших A, приоритет той же region_id).
     if charge_stations is not None and len(charge_stations) > 0 and "station_type" in charge_stations.columns:
         try:
             st = charge_stations
             a_mask = st["station_type"] == "charge_a"
             b_mask = st["station_type"] == "charge_b"
-            if a_mask.any() and b_mask.any():
+            if a_mask.any():
                 a_rows = st[a_mask]
-                b_rows = st[b_mask]
 
-                def _nearest_a_for_b(
-                    b_row,
+                def _nearest_a_for_satellite(
+                    sat_row,
                     all_a: gpd.GeoDataFrame,
                     preferred_region: Any = None,
                     *,
@@ -2125,62 +2299,84 @@ def run_full_pipeline(
                 ):
                     if all_a is None or len(all_a) == 0:
                         return None
-                    lon_b, lat_b = _coords_from_geom(b_row.geometry)
+                    lon_s, lat_s = _coords_from_geom(sat_row.geometry)
                     dist_items = []
                     for idx_a, row_a in all_a.iterrows():
                         lon_a, lat_a = _coords_from_geom(row_a.geometry)
-                        d_km = haversine_km(lat_b, lon_b, lat_a, lon_a)
+                        d_km = haversine_km(lat_s, lon_s, lat_a, lon_a)
                         dist_items.append((float(d_km), idx_a))
                     if not dist_items:
                         return None
                     dist_items.sort(key=lambda x: x[0])
                     nearest = dist_items[: max(1, int(k_nearest))]
 
-                    # Приоритетно берем A из той же region_id, но только среди 5 ближайших A.
                     if preferred_region is not None and not pd.isna(preferred_region) and "region_id" in all_a.columns:
                         for d_km, idx_a in nearest:
                             row_a = all_a.loc[idx_a]
                             if row_a.get("region_id") == preferred_region:
                                 return row_a, float(d_km)
 
-                    # Иначе — просто ближайшая из 5 ближайших.
                     d_km, idx_a = nearest[0]
                     row_a = all_a.loc[idx_a]
                     return row_a, float(d_km)
 
-                for idx_b, row_b in b_rows.iterrows():
-                    region_b = row_b.get("region_id") if "region_id" in b_rows.columns else None
-                    target = _nearest_a_for_b(
-                        row_b,
+                def _append_satellite_to_a_branch(
+                    sat_row,
+                    sat_index: Any,
+                    region_opt: Any,
+                    *,
+                    satellite_role: str,
+                ) -> None:
+                    target = _nearest_a_for_satellite(
+                        sat_row,
                         a_rows,
-                        preferred_region=region_b,
+                        preferred_region=region_opt,
                         k_nearest=5,
                     )
                     if target is None:
-                        continue
+                        return
                     row_a, d_km = target
-                    lon_b, lat_b = _coords_from_geom(row_b.geometry)
+                    lon_s, lat_s = _coords_from_geom(sat_row.geometry)
                     lon_a, lat_a = _coords_from_geom(row_a.geometry)
                     branch_edges.append(
                         {
                             "type": "Feature",
                             "geometry": {
                                 "type": "LineString",
-                                "coordinates": [[lon_b, lat_b], [lon_a, lat_a]],
+                                "coordinates": [[lon_s, lat_s], [lon_a, lat_a]],
                             },
                             "properties": {
                                 "edge_type": "branch_b_to_a_group",
-                                "source_id": str(idx_b),
+                                "satellite_role": satellite_role,
+                                "source_id": str(sat_index),
                                 "target_id": str(getattr(row_a, "name", "")),
                                 "weight_km": round(float(d_km), 4),
                                 "region_id": (
-                                    str(region_b)
-                                    if region_b is not None and not pd.isna(region_b)
+                                    str(region_opt)
+                                    if region_opt is not None and not pd.isna(region_opt)
                                     else None
                                 ),
                             },
                         }
                     )
+
+                if b_mask.any():
+                    b_rows = st[b_mask]
+                    for idx_b, row_b in b_rows.iterrows():
+                        region_b = row_b.get("region_id") if "region_id" in b_rows.columns else None
+                        _append_satellite_to_a_branch(
+                            row_b, idx_b, region_b, satellite_role="charge_b"
+                        )
+
+                if garages is not None and len(garages) > 0:
+                    for idx_g, row_g in garages.iterrows():
+                        region_g = row_g.get("region_id") if "region_id" in garages.columns else None
+                        _append_satellite_to_a_branch(row_g, idx_g, region_g, satellite_role="garage")
+
+                if to_stations is not None and len(to_stations) > 0:
+                    for idx_t, row_t in to_stations.iterrows():
+                        region_t = row_t.get("region_id") if "region_id" in to_stations.columns else None
+                        _append_satellite_to_a_branch(row_t, idx_t, region_t, satellite_role="to")
         except Exception:
             branch_edges = []
 

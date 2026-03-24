@@ -16,6 +16,32 @@ from redis import Redis
 from shapely.geometry import box, MultiPoint, Point, Polygon
 from shapely.ops import unary_union
 
+
+def _representative_points_from_polygonal_union(geom) -> List[Point]:
+    """Точки внутри каждого полигона объединения (для кандидатов без зданий в OSM)."""
+    out: List[Point] = []
+    if geom is None or getattr(geom, "is_empty", True):
+        return out
+    gt = getattr(geom, "geom_type", None)
+    if gt == "Point":
+        out.append(geom)
+        return out
+    if gt == "Polygon":
+        try:
+            out.append(geom.representative_point())
+        except Exception:
+            pass
+        return out
+    if gt == "MultiPolygon":
+        for poly in getattr(geom, "geoms", []):
+            out.extend(_representative_points_from_polygonal_union(poly))
+        return out
+    if gt == "GeometryCollection":
+        for g in getattr(geom, "geoms", []):
+            out.extend(_representative_points_from_polygonal_union(g))
+        return out
+    return out
+
 # Подавляем DeprecationWarning из OSMnx (unary_union и др. — внутренние вызовы библиотеки)
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="osmnx")
 warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"osmnx\.features")
@@ -1699,6 +1725,97 @@ class DataService:
             "shed",
         )
     )
+    # Гараж и ТО: только промзоны / гаражные массивы (landuse) + «свои» типы зданий.
+    _GARAGE_TO_ALLOWED_BUILDING_TAGS = frozenset(
+        (
+            "industrial",
+            "warehouse",
+            "factory",
+            "manufacture",
+            "depot",
+            "hangar",
+            "shed",
+            "garages",
+            "garage",
+        )
+    )
+    _GARAGE_TO_EXCLUDED_BUILDING_TAGS = frozenset(
+        (
+            "retail",
+            "supermarket",
+            "shop",
+            "mall",
+            "kiosk",
+            "office",
+            "hotel",
+            "motel",
+            "church",
+            "cathedral",
+            "mosque",
+            "temple",
+            "school",
+            "university",
+            "college",
+            "kindergarten",
+            "hospital",
+            "clinic",
+            "civic",
+            "stadium",
+            "commercial",
+            "apartments",
+            "residential",
+            "house",
+            "dormitory",
+            "public",
+        )
+    )
+
+    def _union_industrial_and_garage_landuse(
+        self, north: float, south: float, east: float, west: float, city_boundary=None
+    ):
+        """
+        Полигоны OSM: landuse=industrial, garages, brownfield (промзоны / гаражные массивы).
+        Опционально пересекаем с границей города.
+        """
+        try:
+            g = ox.features_from_bbox(
+                bbox=(north, south, east, west),
+                tags={"landuse": ["industrial", "garages", "brownfield"]},
+            )
+            if g is None or len(g) == 0:
+                return None
+            if g.crs is None:
+                g = g.set_crs("EPSG:4326", allow_override=True)
+            else:
+                g = g.to_crs("EPSG:4326")
+            geoms = []
+            for geom in g.geometry:
+                if geom is None or getattr(geom, "is_empty", True):
+                    continue
+                try:
+                    gg = geom if geom.is_valid else geom.buffer(0)
+                    if not getattr(gg, "is_empty", True):
+                        geoms.append(gg)
+                except Exception:
+                    pass
+            if not geoms:
+                return None
+            u = unary_union(geoms)
+            if u is None or getattr(u, "is_empty", True):
+                return None
+            if city_boundary is not None and getattr(city_boundary, "is_valid", True):
+                try:
+                    cb = unary_union(gpd.GeoSeries([city_boundary], crs="EPSG:4326").geometry)
+                    if cb is not None and not getattr(cb, "is_empty", True):
+                        u = u.intersection(cb)
+                except Exception:
+                    pass
+            if u is None or getattr(u, "is_empty", True):
+                return None
+            return u
+        except Exception as ex:
+            self.logger.debug("Зоны industrial/garages (OSM): %s", ex)
+            return None
 
     def get_station_candidates(
         self,
@@ -1712,7 +1829,8 @@ class DataService:
         Точки-кандидаты для размещения станций (центроиды зданий WGS84).
         rooftop — крыши МКД/жилые многоэтажки (source=building);
         ground — наземные площадки / коммерция (source=ground);
-        garage / to — промзоны и склады (для гаража и ТО).
+        garage / to — строго только внутри полигонов OSM landuse=industrial или landuse=garages;
+        без этих зон кандидатов нет. Здания — только склады/пром/гаражные боксы; торговля и офисы исключаются.
         """
         from shapely.geometry import Point
 
@@ -1756,6 +1874,31 @@ class DataService:
         except Exception:
             b["area_m2"] = 0.0
 
+        landuse_union = None
+        if station_type in ("garage", "to"):
+            try:
+                bx = b.total_bounds
+                west, south, east, north = float(bx[0]), float(bx[1]), float(bx[2]), float(bx[3])
+                landuse_union = self._union_industrial_and_garage_landuse(
+                    north, south, east, west, city_boundary=city_boundary
+                )
+                if landuse_union is not None and not getattr(landuse_union, "is_empty", True):
+                    self.logger.info(
+                        "Кандидаты %s: полигоны landuse=industrial и landuse=garages (обязательны для размещения)",
+                        station_type,
+                    )
+                else:
+                    landuse_union = None
+            except Exception as ex:
+                self.logger.warning("Зоны под гараж/ТО (OSM): %s", ex)
+                landuse_union = None
+            # Без промзон/гаражных территорий в OSM — кандидатов нет (не размещаем «вне зон»).
+            if landuse_union is None or getattr(landuse_union, "is_empty", True):
+                self.logger.warning(
+                    "Гараж и ТО: нет полигонов landuse (industrial / garages / brownfield) — кандидаты пусты"
+                )
+                return gpd.GeoDataFrame()
+
         rows = []
         for idx, row in b.iterrows():
             g = row.geometry
@@ -1790,7 +1933,26 @@ class DataService:
                 if tag in self._GROUND_BUILDING_TAGS or tag in ("office",) or area > 400:
                     rows.append({"geometry": Point(lon, lat), "source": "ground", "osm_index": idx})
             elif station_type in ("garage", "to"):
-                if tag not in self._INDUSTRIAL_BUILDING_TAGS and area < 300:
+                if tag in self._GARAGE_TO_EXCLUDED_BUILDING_TAGS:
+                    continue
+                if tag not in self._GARAGE_TO_ALLOWED_BUILDING_TAGS:
+                    continue
+                pt = Point(lon, lat)
+                try:
+                    if not (
+                        landuse_union.contains(pt)
+                        or landuse_union.covers(pt)
+                        or landuse_union.intersects(pt.buffer(1e-9))
+                    ):
+                        continue
+                except Exception:
+                    continue
+                min_area_m2 = 250.0
+                if tag == "garage":
+                    min_area_m2 = 20.0
+                elif tag == "garages":
+                    min_area_m2 = 60.0
+                if area < min_area_m2:
                     continue
                 rows.append(
                     {
@@ -1801,6 +1963,26 @@ class DataService:
                 )
             else:
                 continue
+
+        # В зонах landuse нет подходящих зданий в выгрузке — кандидаты по точке внутри каждого полигона зоны.
+        if station_type in ("garage", "to") and not rows and landuse_union is not None:
+            try:
+                for i, shpt in enumerate(_representative_points_from_polygonal_union(landuse_union)):
+                    rows.append(
+                        {
+                            "geometry": Point(float(shpt.x), float(shpt.y)),
+                            "source": "landuse_interior",
+                            "osm_index": -(i + 1),
+                        }
+                    )
+                if rows:
+                    self.logger.info(
+                        "Кандидаты %s: точки по полигонам landuse (зданий с подходящими тегами не найдено): %s",
+                        station_type,
+                        len(rows),
+                    )
+            except Exception as ex:
+                self.logger.warning("Кандидаты %s (точки по landuse): %s", station_type, ex)
 
         if not rows:
             return gpd.GeoDataFrame()
