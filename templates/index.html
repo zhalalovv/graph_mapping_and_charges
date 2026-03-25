@@ -693,6 +693,7 @@
             url.searchParams.set('dbscan_eps_m', '180');
             url.searchParams.set('dbscan_min_samples', '15');
             url.searchParams.set('a_by_admin_districts', 'true');
+            url.searchParams.set('candidates_per_cluster', '30');
             url.searchParams.set('use_saved', useSaved ? 'true' : 'false');
             url.searchParams.set('only_saved', onlySaved ? 'true' : 'false');
             return url;
@@ -724,6 +725,18 @@
                     return {
                         fill: 'hsl(' + h + ', 70%, 50%)',
                         stroke: 'hsl(' + h + ', 70%, 28%)',
+                    };
+                }
+
+                function colorForRegionId(regionId) {
+                    const s = String(regionId || 'nearest_0');
+                    let acc = 0;
+                    for (let i = 0; i < s.length; i++) acc = ((acc << 5) - acc + s.charCodeAt(i)) | 0;
+                    const n = Math.abs(acc);
+                    const h = (n * 137.508) % 360;
+                    return {
+                        fill: 'hsl(' + h + ', 78%, 52%)',
+                        stroke: 'hsl(' + h + ', 78%, 30%)',
                     };
                 }
 

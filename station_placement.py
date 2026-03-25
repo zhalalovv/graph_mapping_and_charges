@@ -271,7 +271,7 @@ class StationPlacement:
         full_candidates: gpd.GeoDataFrame,
         *,
         max_distance_km: Optional[float] = None,
-        candidates_per_cluster: int = 10,
+        candidates_per_cluster: int = 30,
     ) -> gpd.GeoDataFrame:
         """
         Строит кандидатов зарядки относительно кластеров DBSCAN: для каждого кластера (центроид спроса)
@@ -525,6 +525,10 @@ class StationPlacement:
             if centroid_df is not None and len(centroid_df) > 0:
                 used_candidate_indices: set[int] = set()
                 placed_cluster_ids: set[Any] = set()
+                # Счётчики случаев, когда внутри hull кластера не нашлось кандидатов.
+                # Тогда forced-логика делает fallback и выбирает ближайший кандидат "вообще".
+                fallback_allowed_a_from_empty_hull = 0
+                fallback_allowed_b_from_empty_hull = 0
 
                 # Предрасчет принадлежности кандидатов hull'ам кластеров.
                 # Правило:
@@ -562,7 +566,10 @@ class StationPlacement:
                                 idxs = None
                                 if sindex is not None:
                                     try:
-                                        idxs = list(sindex.query(pt, predicate="covers"))
+                                        # Для spatial index запрос идёт "геометрии индекса относительно точки".
+                                        # predicate="covers" здесь почти всегда даёт пусто; берём intersects,
+                                        # затем точно проверяем geom.covers(pt) ниже.
+                                        idxs = list(sindex.query(pt, predicate="intersects"))
                                     except Exception:
                                         idxs = None
                                 if idxs is None:
@@ -695,6 +702,25 @@ class StationPlacement:
                             best = ci
                     return int(best) if best is not None else None
 
+                def _place_at_cluster_hull_if_possible(station_type: str, cid: Any) -> bool:
+                    """Ставит станцию в заведомо внутреннюю точку hull кластера (если геометрия доступна)."""
+                    try:
+                        geom_h = hull_geom_by_cluster.get(cid)
+                        if geom_h is None or getattr(geom_h, "is_empty", True):
+                            return False
+                        rp = geom_h.representative_point()
+                        if rp is None or getattr(rp, "is_empty", True):
+                            return False
+                        _place_one_station_at_point(
+                            station_type,
+                            float(rp.x),
+                            float(rp.y),
+                            served_cluster_id=cid,
+                        )
+                        return True
+                    except Exception:
+                        return False
+
                 # Вычисляем главный (A) кластер по району: центральный кластер,
                 # т.е. ближайший к взвешенному центру района.
                 main_cluster_by_region: Dict[Any, Any] = {}
@@ -747,7 +773,12 @@ class StationPlacement:
                         # Берем все точки кандидатов внутри hull этого кластера.
                         target_allowed_a = [i for i in candidates_by_cluster.get(cid, []) if i in allowed_a]
                         if not target_allowed_a:
-                            # Если внутри hull нет кандидатов МКД, берём ближайший МКД-кандидат.
+                            # Если внутри hull нет кандидатов МКД — ставим точку в representative_point hull,
+                            # чтобы не "уводить" кластерную станцию в соседний кластер.
+                            if _place_at_cluster_hull_if_possible("charge_a", cid):
+                                continue
+                            # Если hull недоступен, берём ближайший МКД-кандидат.
+                            fallback_allowed_a_from_empty_hull += 1
                             target_allowed_a = allowed_a
                             if not target_allowed_a:
                                 continue
@@ -785,7 +816,12 @@ class StationPlacement:
                         # "нельзя допускать, чтобы станция оказывалась ближе/внутри другого кластера".
                         target_allowed_a = [i for i in candidates_by_cluster.get(main_cid, []) if i in allowed_a]
                         if not target_allowed_a:
-                            # Если внутри hull главного кластера нет МКД-кандидатов, берём ближайший МКД-кандидат.
+                            # Если внутри hull главного кластера нет МКД-кандидатов —
+                            # ставим точку в representative_point этого hull.
+                            if _place_at_cluster_hull_if_possible("charge_a", main_cid):
+                                continue
+                            # Если hull недоступен, берём ближайший МКД-кандидат.
+                            fallback_allowed_a_from_empty_hull += 1
                             target_allowed_a = allowed_a
                             if not target_allowed_a:
                                 continue
@@ -824,7 +860,11 @@ class StationPlacement:
                         # Строго: кандидат должен лежать внутри hull своего cid кластера.
                         target_allowed_b = [i for i in candidates_by_cluster.get(cid, []) if i in allowed_b]
                         if not target_allowed_b:
-                            # Если внутри hull кластера нет МКД-кандидатов, берём ближайший МКД-кандидат.
+                            # Если внутри hull нет МКД-кандидатов — ставим точку в representative_point hull.
+                            if _place_at_cluster_hull_if_possible("charge_b", cid):
+                                continue
+                            # Если hull недоступен, берём ближайший МКД-кандидат.
+                            fallback_allowed_b_from_empty_hull += 1
                             target_allowed_b = allowed_b
                             if not target_allowed_b:
                                 continue
@@ -856,9 +896,12 @@ class StationPlacement:
                         "demand_covered": covered_weight,
                         "demand_total": total_weight,
                         "coverage_ratio": covered_weight / total_weight if total_weight > 0 else 0.0,
+                        "fallback_allowed_a_from_empty_hull": fallback_allowed_a_from_empty_hull,
+                        "fallback_allowed_b_from_empty_hull": fallback_allowed_b_from_empty_hull,
                     }
                     self.logger.info(
-                        f"[forced] Зарядки: тип А {n_a}, тип Б {n_b}, покрытие {metrics['coverage_ratio']:.2%}"
+                        f"[forced] Зарядки: тип А {n_a}, тип Б {n_b}, покрытие {metrics['coverage_ratio']:.2%}, "
+                        f"fallback A(empty hull)={fallback_allowed_a_from_empty_hull}, fallback B(empty hull)={fallback_allowed_b_from_empty_hull}"
                     )
                     return gdf, metrics
 
@@ -1715,6 +1758,7 @@ def run_full_pipeline(
     demand_cell_m: float = 250.0,
     dbscan_eps_m: float = 180.0,
     dbscan_min_samples: int = 15,
+    candidates_per_cluster: int = 10,
     use_all_buildings: bool = False,
     max_charge_stations: Optional[int] = None,
     num_garages: int = 1,
@@ -1963,7 +2007,9 @@ def run_full_pipeline(
 
     if demand_method == "dbscan" and charge_candidates_full is not None and len(charge_candidates_full) > 0:
         charge_candidates = placement.build_charge_candidates_from_clusters(
-            demand, charge_candidates_full
+            demand,
+            charge_candidates_full,
+            candidates_per_cluster=candidates_per_cluster,
         )
     else:
         charge_candidates = charge_candidates_full
@@ -2062,13 +2108,21 @@ def run_full_pipeline(
                 if len(hulls_gdf) > 0:
                     sindex = getattr(hulls_gdf, "sindex", None)
                     for pos, (_, srow) in enumerate(charge_stations.iterrows()):
+                        # Если cluster_id уже задан forced-логикой, сохраняем его как "истину":
+                        # иначе последующая пере-привязка по геометрии может схлопнуть разные кластеры
+                        # в один и потерять станции после dedup.
+                        if assigned[pos] is not None:
+                            continue
+
                         lon_s, lat_s = _coords_from_geom(srow.geometry)
                         pt = Point(lon_s, lat_s)
 
                         idxs = None
                         if sindex is not None:
                             try:
-                                idxs = list(sindex.query(pt, predicate="covers"))
+                                # См. комментарий выше: через spatial index используем intersects,
+                                # а точную проверку принадлежности делаем geom.covers(pt).
+                                idxs = list(sindex.query(pt, predicate="intersects"))
                             except Exception:
                                 idxs = None
                         if idxs is None:
@@ -2092,39 +2146,38 @@ def run_full_pipeline(
                         unique_cids = set(match_cids)
                         if len(unique_cids) == 1:
                             assigned[pos] = next(iter(unique_cids))
-                        elif len(unique_cids) == 0:
-                            # Точка не попала ни в один hull: назначаем ближайший hull по расстоянию,
-                            # но только если он заметно ближе второго.
+                        else:
+                            # Неоднозначно (0 или несколько hull покрывают точку).
+                            # Раньше мы намеренно ставили `None`, чтобы не допустить ошибочной привязки,
+                            # но это приводит к тому, что целые кластеры выглядят "без станций".
+                            # Поэтому в любом неоднозначном случае назначаем ближайший hull по расстоянию.
                             try:
                                 best_cid: Optional[int] = None
                                 best_d: Optional[float] = None
-                                second_d: Optional[float] = None
+
+                                # Если несколько hulls совпали, ограничим выбор только ими.
+                                # Если 0 совпадений — ищем ближайший среди всех hulls.
+                                cids_to_check: Optional[set] = unique_cids if len(unique_cids) > 0 else None
+
                                 for hi in range(len(hulls_gdf)):
+                                    cid_h = int(hulls_gdf.iloc[int(hi)]["cluster_id"])
+                                    if cids_to_check is not None and cid_h not in cids_to_check:
+                                        continue
+
                                     geom = hulls_gdf.geometry.iloc[int(hi)]
                                     if geom is None or not geom.is_valid:
                                         continue
+
                                     d = float(geom.distance(pt))
-                                    cid = int(hulls_gdf.iloc[int(hi)]["cluster_id"])
                                     if best_d is None or d < best_d:
-                                        second_d = best_d
                                         best_d = d
-                                        best_cid = cid
-                                    elif second_d is None or d < second_d:
-                                        second_d = d
-                                if best_cid is not None and best_d is not None and second_d is not None:
-                                    # Условие "заметно ближе": минимум на 5% меньше расстояния до второго.
-                                    if second_d <= 0:
-                                        assigned[pos] = None
-                                    elif best_d < second_d * 0.95:
-                                        assigned[pos] = best_cid
-                                    else:
-                                        assigned[pos] = None
-                                else:
-                                    assigned[pos] = None
+                                        best_cid = cid_h
+
+                                # Если даже это не получилось — оставляем текущую (initial) привязку.
+                                assigned[pos] = best_cid if best_cid is not None else assigned[pos]
                             except Exception:
-                                assigned[pos] = None
-                        else:
-                            assigned[pos] = None
+                                # На худой случай оставляем initial привязку.
+                                assigned[pos] = assigned[pos]
             except Exception:
                 pass
 

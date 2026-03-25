@@ -34,6 +34,7 @@ def _placement_cache_key(
     dbscan_eps_m: float,
     dbscan_min_samples: int,
     a_by_admin_districts: bool,
+    candidates_per_cluster: int,
 ) -> str:
     payload = {
         "city": city.strip(),
@@ -43,9 +44,10 @@ def _placement_cache_key(
         "dbscan_eps_m": float(dbscan_eps_m),
         "dbscan_min_samples": int(dbscan_min_samples),
         "a_by_admin_districts": bool(a_by_admin_districts),
+        "candidates_per_cluster": int(candidates_per_cluster),
         # Смена версии сбрасывает устаревший Redis-кэш (иначе после правок пайплайна
         # клиент может бесконечно получать пустой сохранённый ответ).
-        "placement_schema": 9,
+        "placement_schema": 10,
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()
@@ -362,6 +364,7 @@ def get_stations_placement(
     dbscan_eps_m: float = Query(180.0, description="eps DBSCAN (м)"),
     dbscan_min_samples: int = Query(15, description="min_samples DBSCAN"),
     a_by_admin_districts: bool = Query(True, description="Ставить станции A по административным районам"),
+    candidates_per_cluster: int = Query(25, description="Кандидатов на кластер при выборе точек зарядки"),
     use_saved: bool = Query(True, description="Использовать сохранённую расстановку, если есть"),
     only_saved: bool = Query(False, description="Только кэш Redis: при промахе 404, без пересчёта пайплайна"),
     save_result: bool = Query(True, description="Сохранять новую расстановку в Redis"),
@@ -379,6 +382,7 @@ def get_stations_placement(
             dbscan_eps_m=dbscan_eps_m,
             dbscan_min_samples=dbscan_min_samples,
             a_by_admin_districts=a_by_admin_districts,
+            candidates_per_cluster=candidates_per_cluster,
         )
         redis_client = data_service.get_redis_client()
         if only_saved:
@@ -416,6 +420,7 @@ def get_stations_placement(
             dbscan_eps_m=dbscan_eps_m,
             dbscan_min_samples=dbscan_min_samples,
             a_by_admin_districts=a_by_admin_districts,
+            candidates_per_cluster=candidates_per_cluster,
         )
         if raw.get("error"):
             return JSONResponse({**pipeline_result_to_geojson(raw), "error": raw["error"]})
@@ -441,6 +446,7 @@ def export_saved_stations(
     dbscan_eps_m: float = Query(180.0, description="eps DBSCAN (м)"),
     dbscan_min_samples: int = Query(15, description="min_samples DBSCAN"),
     a_by_admin_districts: bool = Query(True, description="Режим размещения A по районам/группам"),
+    candidates_per_cluster: int = Query(25, description="Кандидатов на кластер при выборе точек зарядки"),
 ):
     """Выгрузка сохраненной расстановки станций из Redis в JSON."""
     redis_client = data_service.get_redis_client()
@@ -454,6 +460,7 @@ def export_saved_stations(
         dbscan_eps_m=dbscan_eps_m,
         dbscan_min_samples=dbscan_min_samples,
         a_by_admin_districts=a_by_admin_districts,
+        candidates_per_cluster=candidates_per_cluster,
     )
     try:
         cached = redis_client.get(cache_key)
