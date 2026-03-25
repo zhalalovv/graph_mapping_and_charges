@@ -401,17 +401,6 @@
                         stroke: 'hsl(' + h + ', 70%, 28%)',
                     };
                 }
-                function colorForRegionId(regionId) {
-                    const s = String(regionId || 'nearest_0');
-                    let acc = 0;
-                    for (let i = 0; i < s.length; i++) acc = ((acc << 5) - acc + s.charCodeAt(i)) | 0;
-                    const n = Math.abs(acc);
-                    const h = (n * 137.508) % 360;
-                    return {
-                        fill: 'hsl(' + h + ', 78%, 52%)',
-                        stroke: 'hsl(' + h + ', 78%, 30%)',
-                    };
-                }
                 clustersLayer = L.layerGroup();
                 if (hullsFc.features && hullsFc.features.length > 0) {
                     clusterHullsLayer = L.geoJSON(hullsFc, {
@@ -728,18 +717,6 @@
                     };
                 }
 
-                function colorForRegionId(regionId) {
-                    const s = String(regionId || 'nearest_0');
-                    let acc = 0;
-                    for (let i = 0; i < s.length; i++) acc = ((acc << 5) - acc + s.charCodeAt(i)) | 0;
-                    const n = Math.abs(acc);
-                    const h = (n * 137.508) % 360;
-                    return {
-                        fill: 'hsl(' + h + ', 78%, 52%)',
-                        stroke: 'hsl(' + h + ', 78%, 30%)',
-                    };
-                }
-
                 function addLines(fc, style, popupTitle, targetLayer) {
                     if (!fc || !fc.features || !fc.features.length) return;
                     L.geoJSON(fc, {
@@ -811,14 +788,6 @@
                 try {
                     if (data.cluster_centroids && data.cluster_centroids.features && data.cluster_centroids.features.length > 0) {
                         const centroidByCid = new Map();
-                        const centroidsByRegion = new Map();
-                        const aClusterIds = new Set();
-                        if (data.charging_type_a && data.charging_type_a.features) {
-                            data.charging_type_a.features.forEach(f => {
-                                const p = f.properties || {};
-                                if (p.cluster_id != null) aClusterIds.add(String(p.cluster_id));
-                            });
-                        }
                         data.cluster_centroids.features.forEach(f => {
                             const p = f.properties || {};
                             const cid = p.cluster_id;
@@ -826,14 +795,6 @@
                             const coords = f.geometry && f.geometry.coordinates;
                             if (!coords || coords.length < 2) return;
                             centroidByCid.set(String(cid), coords);
-                            const rid = p.region_id != null ? String(p.region_id) : 'nearest_0';
-                            const arr = centroidsByRegion.get(rid) || [];
-                            arr.push({
-                                type: 'Feature',
-                                geometry: { type: 'Point', coordinates: coords },
-                                properties: p,
-                            });
-                            centroidsByRegion.set(rid, arr);
                         });
 
                         const links = [];
@@ -870,37 +831,6 @@
                                 }
                             }).addTo(stationsRulesLayerGroup);
                         }
-
-                        // Подсветка групп "по 5 ближайших кластеров":
-                        // одна и та же группа region_id = один цвет.
-                        centroidsByRegion.forEach((features, rid) => {
-                            const color = colorForRegionId(rid);
-                            const fc = { type: 'FeatureCollection', features: features };
-                            L.geoJSON(fc, {
-                                pointToLayer: function(feature, latlng) {
-                                    const p = feature.properties || {};
-                                    const isA = p.cluster_id != null && aClusterIds.has(String(p.cluster_id));
-                                    return L.circleMarker(latlng, {
-                                        radius: isA ? 8 : 6,
-                                        fillColor: color.fill,
-                                        color: color.stroke,
-                                        weight: 2,
-                                        fillOpacity: 0.35,
-                                        opacity: 0.9,
-                                        dashArray: isA ? null : '3, 3',
-                                    });
-                                },
-                                onEachFeature: function(feature, layer) {
-                                    const p = feature.properties || {};
-                                    layer.bindPopup(
-                                        '<strong>Группа кластеров (5 ближайших)</strong>'
-                                        + '<br>Группа: ' + rid
-                                        + '<br>Кластер №' + (p.cluster_id != null ? p.cluster_id : '—')
-                                        + '<br>Вес: ' + (p.weight != null ? p.weight : '—')
-                                    );
-                                }
-                            }).addTo(stationsRulesLayerGroup);
-                        });
                     }
                 } catch (e) {
                     console.warn('Линии "кластер ↔ зарядка" не построены:', e);
