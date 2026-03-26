@@ -15,7 +15,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+import math
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import geopandas as gpd
 import networkx as nx
@@ -229,6 +230,363 @@ def km_to_deg_approx(km: float, lat_center: float) -> float:
     deg_lat = km / 111.0
     deg_lon = km / (111.0 * max(0.2, np.cos(np.radians(lat_center))))
     return max(deg_lat, deg_lon)
+
+
+def reconstruct_path(came_from: Dict[Any, Any], current: Any) -> List[Any]:
+    """Восстановление пути A* из came_from."""
+    path: List[Any] = [current]
+    while current in came_from:
+        current = came_from[current]
+        path.append(current)
+    path.reverse()
+    return path
+
+
+def _iter_no_fly_geoms(no_fly_zones: Any) -> List[Any]:
+    """Нормализует no-fly zones к списку shapely-геометрий."""
+    if no_fly_zones is None:
+        return []
+    try:
+        if isinstance(no_fly_zones, gpd.GeoDataFrame) and len(no_fly_zones) > 0:
+            geoms = [g for g in no_fly_zones.geometry.tolist() if g is not None]
+        elif isinstance(no_fly_zones, list) and len(no_fly_zones) > 0:
+            geoms = [g for g in no_fly_zones if g is not None]
+        else:
+            if getattr(no_fly_zones, "is_empty", True):
+                return []
+            geoms = list(getattr(no_fly_zones, "geoms", [])) or [no_fly_zones]
+        return [g for g in geoms if g is not None and not getattr(g, "is_empty", True)]
+    except Exception:
+        return []
+
+
+def is_point_in_no_fly_zone(point: Tuple[float, float], no_fly_zones: Any, safety_buffer: float = 0.0) -> bool:
+    if no_fly_zones is None:
+        return False
+    lon, lat = float(point[0]), float(point[1])
+    pt = Point(lon, lat)
+    for zone in _iter_no_fly_geoms(no_fly_zones):
+        try:
+            z = zone.buffer(safety_buffer) if safety_buffer else zone
+            # covers=True также на границе полигона (касание запретно).
+            if z.covers(pt):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def is_edge_blocked(edge_line: LineString, no_fly_zones: Any, safety_buffer: float = 0.0) -> bool:
+    """Запрещает ребро, если оно пересекает/касается/проходит внутри no-fly зоны."""
+    if no_fly_zones is None:
+        return False
+    if edge_line is None or getattr(edge_line, "is_empty", True):
+        return False
+    for zone in _iter_no_fly_geoms(no_fly_zones):
+        try:
+            z = zone.buffer(safety_buffer) if safety_buffer else zone
+            # intersects включает касание границы, а также случай "линия внутри полигона".
+            if z.intersects(edge_line):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def mark_blocked_edges(
+    graph: nx.Graph,
+    no_fly_zones: Any,
+    safety_buffer: float = 0.0,
+) -> Tuple[Set[Tuple[Any, Any]], Set[Any]]:
+    """
+    Предобработка: находит заблокированные рёбра и узлы.
+    Блокировка: узел внутри зоны или ребро пересекает/касается/проходит внутри зоны.
+    """
+    blocked_edges: Set[Tuple[Any, Any]] = set()
+    blocked_nodes: Set[Any] = set()
+    if graph is None or graph.number_of_nodes() == 0 or no_fly_zones is None:
+        return blocked_edges, blocked_nodes
+
+    zones = _iter_no_fly_geoms(no_fly_zones)
+    if safety_buffer:
+        buffered: List[Any] = []
+        for z in zones:
+            try:
+                buffered.append(z.buffer(safety_buffer))
+            except Exception:
+                buffered.append(z)
+        zones = buffered
+
+    def _node_lon_lat(nid: Any) -> Optional[Tuple[float, float]]:
+        d = graph.nodes[nid]
+        lon = d.get("lon") if isinstance(d, dict) else None
+        lat = d.get("lat") if isinstance(d, dict) else None
+        if lon is None:
+            lon = d.get("x") if isinstance(d, dict) else None
+        if lat is None:
+            lat = d.get("y") if isinstance(d, dict) else None
+        if lon is None or lat is None:
+            return None
+        return float(lon), float(lat)
+
+    # Узлы.
+    for nid in graph.nodes():
+        try:
+            ll = _node_lon_lat(nid)
+            if ll is None:
+                continue
+            lon, lat = ll
+            if any(z.covers(Point(lon, lat)) for z in zones):
+                blocked_nodes.add(nid)
+        except Exception:
+            continue
+
+    # Рёбра.
+    for u, v in graph.edges():
+        if u in blocked_nodes or v in blocked_nodes:
+            blocked_edges.add((u, v))
+            continue
+        try:
+            ll_u = _node_lon_lat(u)
+            ll_v = _node_lon_lat(v)
+            if ll_u is None or ll_v is None:
+                continue
+            lon_u, lat_u = ll_u
+            lon_v, lat_v = ll_v
+            line = LineString([(lon_u, lat_u), (lon_v, lat_v)])
+            if any(z.intersects(line) for z in zones):
+                blocked_edges.add((u, v))
+        except Exception:
+            continue
+
+    return blocked_edges, blocked_nodes
+
+
+def build_safe_graph(graph: nx.Graph, no_fly_zones: Any, safety_buffer: float = 0.0) -> nx.Graph:
+    """Возвращает копию графа с удалёнными заблокированными узлами и рёбрами."""
+    if graph is None:
+        return graph
+    if no_fly_zones is None:
+        safe_graph = graph.copy()
+        safe_graph.graph["__no_fly_safe"] = False
+        return safe_graph
+
+    safe_graph = graph.copy()
+    blocked_edges, blocked_nodes = mark_blocked_edges(safe_graph, no_fly_zones, safety_buffer=safety_buffer)
+    if blocked_nodes:
+        safe_graph.remove_nodes_from(blocked_nodes)
+    if blocked_edges:
+        safe_graph.remove_edges_from(list(blocked_edges))
+
+    safe_graph.graph["__no_fly_safe"] = True
+    safe_graph.graph["__no_fly_safe_safety_buffer"] = float(safety_buffer or 0.0)
+    return safe_graph
+
+
+def _node_lon_lat_from_graph(graph: nx.Graph, nid: Any) -> Optional[Tuple[float, float]]:
+    d = graph.nodes[nid]
+    lon = d.get("lon") if isinstance(d, dict) else None
+    lat = d.get("lat") if isinstance(d, dict) else None
+    if lon is None:
+        lon = d.get("x") if isinstance(d, dict) else None
+    if lat is None:
+        lat = d.get("y") if isinstance(d, dict) else None
+    if lon is None or lat is None:
+        return None
+    return float(lon), float(lat)
+
+
+def astar_path_safe(
+    graph: nx.Graph,
+    start_node: Any,
+    goal_node: Any,
+    no_fly_zones: Any,
+    safety_buffer: float = 0.0,
+    weight_attr: str = "weight",
+) -> Dict[str, Any]:
+    """
+    A* по безопасному графу: запрещает узлы/рёбра, пересекающие no-fly зоны.
+    Возвращает статус: success|no_path|start_in_no_fly_zone|goal_in_no_fly_zone.
+    """
+    if graph is None:
+        return {"status": "no_path", "path_nodes": [], "path_coords": [], "path_length_km": 0.0}
+
+    start_ll = _node_lon_lat_from_graph(graph, start_node)
+    goal_ll = _node_lon_lat_from_graph(graph, goal_node)
+
+    if start_ll is not None and is_point_in_no_fly_zone(start_ll, no_fly_zones, safety_buffer=safety_buffer):
+        return {"status": "start_in_no_fly_zone", "path_nodes": [], "path_coords": [], "path_length_km": 0.0}
+    if goal_ll is not None and is_point_in_no_fly_zone(goal_ll, no_fly_zones, safety_buffer=safety_buffer):
+        return {"status": "goal_in_no_fly_zone", "path_nodes": [], "path_coords": [], "path_length_km": 0.0}
+
+    is_safe_flag = bool(graph.graph.get("__no_fly_safe", False))
+    safe_buffer_flag = graph.graph.get("__no_fly_safe_safety_buffer", None)
+    if is_safe_flag and safe_buffer_flag is not None and float(safe_buffer_flag) == float(safety_buffer or 0.0):
+        safe_graph = graph
+    else:
+        safe_graph = build_safe_graph(graph, no_fly_zones, safety_buffer=safety_buffer)
+
+    if start_node not in safe_graph or goal_node not in safe_graph:
+        return {"status": "no_path", "path_nodes": [], "path_coords": [], "path_length_km": 0.0}
+
+    def _heuristic(a: Any, b: Any) -> float:
+        la = _node_lon_lat_from_graph(safe_graph, a)
+        lb = _node_lon_lat_from_graph(safe_graph, b)
+        if la is None or lb is None:
+            return 0.0
+        lon_a, lat_a = la
+        lon_b, lat_b = lb
+        return haversine_km(lat_a, lon_a, lat_b, lon_b)
+
+    import heapq
+
+    open_heap: List[Tuple[float, float, Any]] = []
+    came_from: Dict[Any, Any] = {}
+    g_score: Dict[Any, float] = {start_node: 0.0}
+    heapq.heappush(open_heap, (_heuristic(start_node, goal_node), 0.0, start_node))
+
+    while open_heap:
+        _, cur_g, current = heapq.heappop(open_heap)
+        if current == goal_node:
+            path_nodes = reconstruct_path(came_from, current)
+            path_coords: List[Tuple[float, float]] = []
+            for nid in path_nodes:
+                ll = _node_lon_lat_from_graph(safe_graph, nid)
+                if ll is not None:
+                    path_coords.append(ll)
+            return {
+                "status": "success",
+                "path_nodes": path_nodes,
+                "path_coords": path_coords,
+                "path_length_km": float(cur_g),
+            }
+
+        for neighbor in safe_graph.neighbors(current):
+            edge_data = {}
+            try:
+                edge_data = safe_graph[current][neighbor]
+            except Exception:
+                pass
+            w = edge_data.get(weight_attr)
+            if w is None:
+                w = edge_data.get("length")
+            if w is None:
+                w = 1.0
+            try:
+                w = float(w)
+            except Exception:
+                w = 1.0
+
+            tentative_g = cur_g + w
+            if tentative_g < g_score.get(neighbor, float("inf")):
+                came_from[neighbor] = current
+                g_score[neighbor] = tentative_g
+                heapq.heappush(open_heap, (tentative_g + _heuristic(neighbor, goal_node), tentative_g, neighbor))
+
+    return {"status": "no_path", "path_nodes": [], "path_coords": [], "path_length_km": 0.0}
+
+
+def build_uav_air_graph_grid(
+    city_boundary: Any,
+    no_fly_zones: Any,
+    *,
+    grid_spacing_km: float = 0.35,
+    connect_diagonal: bool = True,
+    max_nodes: int = 8000,
+    safety_buffer: float = 0.0,
+) -> nx.Graph:
+    """
+    Сеточный "воздушный" граф для A*: узлы — точки в свободном пространстве,
+    рёбра — прямые сегменты между соседями (8-связность), веса — haversine_km.
+    Узлы/рёбра фильтруются по no-fly зонам геометрией.
+    """
+    G = nx.Graph()
+    if city_boundary is None or getattr(city_boundary, "is_empty", True):
+        return G
+    if grid_spacing_km <= 0:
+        return G
+
+    # city_boundary и no_fly_zones ожидаются в тех же координатах, что и остальная логика (EPSG:4326).
+    minx, miny, maxx, maxy = city_boundary.bounds
+    if minx == maxx or miny == maxy:
+        return G
+
+    lat_center = float((miny + maxy) / 2.0)
+    # Конвертация км -> градусы (приближённо), чтобы задать шаг сетки в lat/lon.
+    deg_lat = grid_spacing_km / 111.0
+    cos_lat = float(np.cos(np.radians(lat_center)))
+    cos_lat = max(0.2, cos_lat)
+    deg_lon = grid_spacing_km / (111.0 * cos_lat)
+
+    if deg_lat <= 0 or deg_lon <= 0:
+        return G
+
+    nx_est = int(math.ceil((maxx - minx) / deg_lon)) + 1
+    ny_est = int(math.ceil((maxy - miny) / deg_lat)) + 1
+    est_nodes = nx_est * ny_est
+    if est_nodes > max_nodes:
+        scale = int(math.ceil(math.sqrt(est_nodes / float(max_nodes))))
+        scale = max(1, scale)
+        deg_lon *= scale
+        deg_lat *= scale
+
+    lon_vals = np.arange(minx, maxx + deg_lon * 0.5, deg_lon, dtype=float)
+    lat_vals = np.arange(miny, maxy + deg_lat * 0.5, deg_lat, dtype=float)
+
+    grid_to_node: Dict[Tuple[int, int], Any] = {}
+    node_lons_lats: Dict[Any, Tuple[float, float]] = {}
+
+    # Создаём узлы.
+    for ix, lon in enumerate(lon_vals):
+        for iy, lat in enumerate(lat_vals):
+            pt = Point(float(lon), float(lat))
+            # Узел должен быть внутри границы города.
+            if not city_boundary.covers(pt):
+                continue
+            # Узел должен быть вне no-fly.
+            if no_fly_zones is not None and is_point_in_no_fly_zone((lon, lat), no_fly_zones, safety_buffer=safety_buffer):
+                continue
+            nid = f"air_{ix}_{iy}"
+            G.add_node(nid, lon=float(lon), lat=float(lat), node_type="air")
+            grid_to_node[(ix, iy)] = nid
+            node_lons_lats[nid] = (float(lon), float(lat))
+
+    if G.number_of_nodes() == 0:
+        return G
+
+    # Создаём рёбра между соседними узлами.
+    # Чтобы не дублировать рёбра в undirected графе — добавляем только "вперёд" (в i/j направлениях).
+    forward_offsets: List[Tuple[int, int]] = [(1, 0), (0, 1)]
+    if connect_diagonal:
+        forward_offsets += [(1, 1), (1, -1)]
+
+    offsets_in_bounds = set(forward_offsets)
+
+    for (ix, iy), nid in list(grid_to_node.items()):
+        lon1, lat1 = node_lons_lats[nid]
+        for dx, dy in offsets_in_bounds:
+            jx = ix + dx
+            jy = iy + dy
+            nid2 = grid_to_node.get((jx, jy))
+            if nid2 is None:
+                continue
+            lon2, lat2 = node_lons_lats[nid2]
+
+            line = LineString([(lon1, lat1), (lon2, lat2)])
+            if no_fly_zones is not None and is_edge_blocked(line, no_fly_zones, safety_buffer=safety_buffer):
+                continue
+
+            w_km = haversine_km(lat1, lon1, lat2, lon2)
+            if w_km <= 0:
+                continue
+            G.add_edge(nid, nid2, weight=float(w_km), length=float(w_km), edge_type="air")
+
+    # Удалим изолированные узлы (они не помогут A*).
+    isolated = [n for n in G.nodes() if G.degree(n) == 0]
+    if isolated:
+        G.remove_nodes_from(isolated)
+
+    return G
 
 
 class StationPlacement:
@@ -997,6 +1355,7 @@ class StationPlacement:
         max_neighbors_a: int = 4,
         topology_mode: str = "mst",
         extra_paths_per_a: int = 2,
+        no_fly_safety_buffer: float = 0.0,
     ) -> nx.Graph:
         """
         Магистраль (спина сети): только станции типа А (зарядки А).
@@ -1031,6 +1390,18 @@ class StationPlacement:
         if obstacles is not None and getattr(obstacles, "is_empty", True) is False and getattr(obstacles, "is_valid", True):
             nfz_union = obstacles
 
+        # Предобработка воздушного графа: исключаем любые рёбра/узлы, проходящие через no-fly зоны.
+        if nfz_union is not None and air_graph is not None and air_graph.number_of_nodes() > 1:
+            try:
+                air_graph = build_safe_graph(
+                    air_graph,
+                    nfz_union,
+                    safety_buffer=no_fly_safety_buffer,
+                )
+            except Exception:
+                # Фоллбэк: не ломаем остальную логику, просто оставляем исходный граф.
+                pass
+
         air_coords = None
         air_ids = None
         air_tree = None
@@ -1060,17 +1431,13 @@ class StationPlacement:
                 except Exception:
                     air_tree = None
 
-        def _edge_intersects_nfz(lon1: float, lat1: float, lon2: float, lat2: float) -> bool:
-            """Проверка: проходит ли отрезок магистрали через беспилотную зону (пересекает или внутри)."""
+        def _edge_blocked(lon1: float, lat1: float, lon2: float, lat2: float) -> bool:
+            """Проверка: проходит ли отрезок магистрали через no-fly зоны."""
             if nfz_union is None:
                 return False
-            from shapely.geometry import LineString as _Line
-
             try:
-                line = _Line([(float(lon1), float(lat1)), (float(lon2), float(lat2))])
-                if not line.is_valid:
-                    return False
-                return nfz_union.intersects(line)
+                line = LineString([(float(lon1), float(lat1)), (float(lon2), float(lat2))])
+                return is_edge_blocked(line, nfz_union, safety_buffer=no_fly_safety_buffer)
             except Exception:
                 return False
 
@@ -1087,37 +1454,21 @@ class StationPlacement:
                 start_id = air_ids[int(idx_start)]
                 end_id = air_ids[int(idx_end)]
 
-                def _heuristic(a, b):
-                    da = air_graph.nodes[a]
-                    db = air_graph.nodes[b]
-                    lon_a = da.get("lon") or da.get("x")
-                    lat_a = da.get("lat") or da.get("y")
-                    lon_b = db.get("lon") or db.get("x")
-                    lat_b = db.get("lat") or db.get("y")
-                    if lon_a is None or lat_a is None or lon_b is None or lat_b is None:
-                        return 0.0
-                    return haversine_km(lat_a, lon_a, lat_b, lon_b)
-
-                path = nx.astar_path(air_graph, start_id, end_id, heuristic=_heuristic, weight="weight")
-                if not path or len(path) < 2:
+                res = astar_path_safe(
+                    air_graph,
+                    start_id,
+                    end_id,
+                    nfz_union,
+                    safety_buffer=no_fly_safety_buffer,
+                    weight_attr="weight",
+                )
+                if res.get("status") != "success":
                     return None, None
-                coords = []
-                total_len = 0.0
-                prev = None
-                for nid in path:
-                    d = air_graph.nodes[nid]
-                    lon = d.get("lon") or d.get("x")
-                    lat = d.get("lat") or d.get("y")
-                    if lon is None or lat is None:
-                        continue
-                    lon_f, lat_f = float(lon), float(lat)
-                    coords.append((lon_f, lat_f))
-                    if prev is not None:
-                        total_len += haversine_km(prev[1], prev[0], lat_f, lon_f)
-                    prev = (lon_f, lat_f)
-                if len(coords) < 2:
+                coords = res.get("path_coords") or []
+                length_km = res.get("path_length_km")
+                if not coords or length_km is None:
                     return None, None
-                return coords, total_len
+                return coords, float(length_km)
             except Exception:
                 return None, None
 
@@ -1128,7 +1479,14 @@ class StationPlacement:
             if G.has_edge(nid_i, nid_j):
                 return
             d_km = haversine_km(lat_i, lon_i, lat_j, lon_j)
-            if not _edge_intersects_nfz(lon_i, lat_i, lon_j, lat_j):
+            if nfz_union is not None:
+                # Если хотя бы один конец попадает в no-fly зону — ребро запрещено.
+                if is_point_in_no_fly_zone((lon_i, lat_i), nfz_union, safety_buffer=no_fly_safety_buffer) or is_point_in_no_fly_zone(
+                    (lon_j, lat_j), nfz_union, safety_buffer=no_fly_safety_buffer
+                ):
+                    return
+
+            if not _edge_blocked(lon_i, lat_i, lon_j, lat_j):
                 G.add_edge(nid_i, nid_j, weight=d_km, length=d_km)
                 return
             self.logger.debug("Магистраль пересекает беспилотную зону %s–%s, строим обход A*", nid_i, nid_j)
@@ -1149,8 +1507,8 @@ class StationPlacement:
                         len(detour_coords),
                     )
                     return
-            self.logger.warning("Обход не построен для %s–%s, оставлена прямая", nid_i, nid_j)
-            G.add_edge(nid_i, nid_j, weight=d_km, length=d_km)
+            # Если обход не построен — ребро магистрали недоступно (не добавляем небезопасную прямую).
+            self.logger.warning("Обход не построен для %s–%s, ребро пропущено", nid_i, nid_j)
 
         use_mst = str(topology_mode or "").strip().lower() == "mst"
         if use_mst and len(trunk_nodes) >= 2:
@@ -1225,7 +1583,9 @@ class StationPlacement:
                         break
                     u, v = best_pair
                     if not G.has_edge(u, v):
-                        G.add_edge(u, v, weight=best_dist, length=best_dist)
+                        lon_u, lat_u = coords[u]
+                        lon_v, lat_v = coords[v]
+                        _add_trunk_edge(u, v, lon_u, lat_u, lon_v, lat_v)
                     base_comp |= remaining[best_idx]
                     del remaining[best_idx]
 
@@ -2311,12 +2671,31 @@ def run_full_pipeline(
 
     # Магистраль на карте — только между зарядками A (как на схеме: «хребет» из зелёных точек).
     # Гараж и ТО подключаются к A отдельными ветвями (branch_edges), не входят в линию магистрали.
+    # Воздушный граф БПЛА строим отдельно как сетку свободного пространства,
+    # чтобы detour обходил no-fly зоны "по воздуху", а не по дорогам.
+    uav_air_graph = None
+    try:
+        nfz_for_air = obstacles_union if obstacles_union is not None else no_fly_zones
+        uav_air_graph = build_uav_air_graph_grid(
+            city_boundary,
+            nfz_for_air,
+            grid_spacing_km=0.35,
+            connect_diagonal=True,
+            max_nodes=8000,
+            safety_buffer=0.0,
+        )
+        if uav_air_graph is None or uav_air_graph.number_of_nodes() < 2:
+            uav_air_graph = None
+    except Exception as e:
+        logger.warning("Не удалось построить воздушный граф для обходов: %s", e)
+        uav_air_graph = None
+
     trunk = placement.build_trunk_graph(
         charge_stations,
         gpd.GeoDataFrame(),
         gpd.GeoDataFrame(),
         obstacles_union,
-        air_graph=None,
+        air_graph=uav_air_graph,
         max_edge_km=R_GARAGE_TO_KM,
         max_neighbors_a=4,
         topology_mode="mst",
