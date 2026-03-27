@@ -23,8 +23,10 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 from scipy.spatial import cKDTree
-from shapely.geometry import LineString, Point
-from shapely.ops import unary_union
+from shapely.geometry import LineString, Point, Polygon, MultiPolygon
+from shapely.ops import unary_union, transform as shapely_transform
+
+from pyproj import CRS, Transformer
 
 # Радиус Земли в км
 EARTH_R_KM = 6371.0
@@ -37,6 +39,11 @@ R_CHARGE_KM = 0.4 * D_MAX_KM / 4.0
 R_GARAGE_TO_KM = 0.8 * D_MAX_KM / 4.0
 # Разные типы станций (гараж / ТО / зарядка) и несколько гаражей — не в одной точке (разные корпуса).
 MIN_FACILITY_SEPARATION_KM = 0.4
+
+# Дополнительный метрический отступ от границы no-fly при построении "дуги" облёта.
+# Важно: no-fly зоны в данных уже буферизуются (порядка десятков метров),
+# поэтому здесь держим небольшой offset, чтобы не раздувать detour.
+NO_FLY_DETOUR_OFFSET_M = 10.0
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -268,8 +275,9 @@ def is_point_in_no_fly_zone(point: Tuple[float, float], no_fly_zones: Any, safet
     for zone in _iter_no_fly_geoms(no_fly_zones):
         try:
             z = zone.buffer(safety_buffer) if safety_buffer else zone
-            # covers=True также на границе полигона (касание запретно).
-            if z.covers(pt):
+            # Считаем запретным только "внутри", касание границы допускаем,
+            # чтобы маршрут мог идти по контуру ближе (detour будет короче).
+            if z.contains(pt):
                 return True
         except Exception:
             continue
@@ -282,12 +290,31 @@ def is_edge_blocked(edge_line: LineString, no_fly_zones: Any, safety_buffer: flo
         return False
     if edge_line is None or getattr(edge_line, "is_empty", True):
         return False
+    eps = 1e-9
     for zone in _iter_no_fly_geoms(no_fly_zones):
         try:
             z = zone.buffer(safety_buffer) if safety_buffer else zone
-            # intersects включает касание границы, а также случай "линия внутри полигона".
-            if z.intersects(edge_line):
+            inter = z.intersection(edge_line)
+            if inter.is_empty:
+                continue
+            # Если пересечение только точки (касание границы), считаем ребро допустимым.
+            if inter.geom_type in ("Point", "MultiPoint"):
+                continue
+            if inter.geom_type == "GeometryCollection":
+                try:
+                    parts = list(getattr(inter, "geoms", []))
+                    if parts and all((p.geom_type in ("Point", "MultiPoint") or getattr(p, "length", 0.0) <= eps) for p in parts):
+                        continue
+                except Exception:
+                    pass
+            # Если пересечение имеет длину (линия в/через полигон) — ребро блокируем.
+            if getattr(inter, "length", 0.0) > eps:
                 return True
+            # Если вдруг это многоугольная/площадная часть — блокируем.
+            if getattr(inter, "area", 0.0) > eps:
+                return True
+            # Остальные типы (LineString/GeometryCollection с линиями и т.п.) — консервативно блокируем.
+            return True
         except Exception:
             continue
     return False
@@ -308,7 +335,7 @@ def mark_blocked_edges(
         return blocked_edges, blocked_nodes
 
     zones = _iter_no_fly_geoms(no_fly_zones)
-    if safety_buffer:
+    if safety_buffer and safety_buffer != 0.0:
         buffered: List[Any] = []
         for z in zones:
             try:
@@ -329,32 +356,33 @@ def mark_blocked_edges(
             return None
         return float(lon), float(lat)
 
-    # Узлы.
+    # Узлы: блокируем только если точка реально внутри (касание границы допускаем).
     for nid in graph.nodes():
+        ll = _node_lon_lat(nid)
+        if ll is None:
+            continue
+        lon, lat = ll
+        pt = Point(lon, lat)
         try:
-            ll = _node_lon_lat(nid)
-            if ll is None:
-                continue
-            lon, lat = ll
-            if any(z.covers(Point(lon, lat)) for z in zones):
+            if any(z.contains(pt) for z in zones):
                 blocked_nodes.add(nid)
         except Exception:
             continue
 
-    # Рёбра.
+    # Рёбра: блокируем если пересечение не сводится к касанию точкой/точками.
     for u, v in graph.edges():
         if u in blocked_nodes or v in blocked_nodes:
             blocked_edges.add((u, v))
             continue
+        ll_u = _node_lon_lat(u)
+        ll_v = _node_lon_lat(v)
+        if ll_u is None or ll_v is None:
+            continue
+        lon_u, lat_u = ll_u
+        lon_v, lat_v = ll_v
+        line = LineString([(lon_u, lat_u), (lon_v, lat_v)])
         try:
-            ll_u = _node_lon_lat(u)
-            ll_v = _node_lon_lat(v)
-            if ll_u is None or ll_v is None:
-                continue
-            lon_u, lat_u = ll_u
-            lon_v, lat_v = ll_v
-            line = LineString([(lon_u, lat_u), (lon_v, lat_v)])
-            if any(z.intersects(line) for z in zones):
+            if is_edge_blocked(line, zones, safety_buffer=0.0):
                 blocked_edges.add((u, v))
         except Exception:
             continue
@@ -537,6 +565,7 @@ def build_uav_air_graph_grid(
     node_lons_lats: Dict[Any, Tuple[float, float]] = {}
 
     # Создаём узлы.
+    G.graph["__grid_spacing_km"] = float(grid_spacing_km)
     for ix, lon in enumerate(lon_vals):
         for iy, lat in enumerate(lat_vals):
             pt = Point(float(lon), float(lat))
@@ -588,6 +617,337 @@ def build_uav_air_graph_grid(
 
     return G
 
+
+def _utm_epsg_from_lonlat(lon: float, lat: float) -> int:
+    """Локальный UTM EPSG по долготе/широте."""
+    zone = int(math.floor((lon + 180.0) / 6.0)) + 1
+    zone = max(1, min(60, zone))
+    if lat >= 0:
+        return 32600 + zone
+    return 32700 + zone
+
+
+def _ring_signed_area_xy(coords_xy: List[Tuple[float, float]]) -> float:
+    """Знак площади по внешнему кольцу: >0 обычно CCW."""
+    area2 = 0.0
+    n = len(coords_xy)
+    for i in range(n):
+        x1, y1 = coords_xy[i]
+        x2, y2 = coords_xy[(i + 1) % n]
+        area2 += x1 * y2 - x2 * y1
+    return area2 / 2.0
+
+
+def _nearest_visible_boundary_point_metric(
+    start_xy: Tuple[float, float],
+    safe_poly_metric: Polygon,
+    *,
+    step_samples: int = 72,
+    eps: float = 1e-9,
+) -> Point:
+    """
+    Ближайшая точка на exterior safe_poly_metric, такая что отрезок start->point
+    не проходит через внутренность safe_poly_metric (считаем по midpoint.contains).
+    """
+    ring = safe_poly_metric.exterior
+    if ring is None or ring.is_empty:
+        raise ValueError("safe_poly_metric has no exterior ring")
+
+    sx, sy = start_xy
+    start_pt = Point(sx, sy)
+
+    def _segment_safe(seg: LineString) -> bool:
+        """Допускаем касание границы, запрещаем вход в внутренность."""
+        try:
+            inter = safe_poly_metric.intersection(seg)
+        except Exception:
+            return False
+        if inter.is_empty:
+            return True
+        if getattr(inter, "length", 0.0) > eps:
+            return False
+        if getattr(inter, "area", 0.0) > eps:
+            return False
+        if inter.geom_type in ("Point", "MultiPoint"):
+            return True
+        if inter.geom_type == "GeometryCollection":
+            try:
+                parts = list(getattr(inter, "geoms", []))
+                if not parts:
+                    return True
+                # Безопасно только если все части — точки/нуль-длины.
+                for p in parts:
+                    if p.geom_type in ("Point", "MultiPoint"):
+                        continue
+                    if getattr(p, "length", 0.0) > eps or getattr(p, "area", 0.0) > eps:
+                        return False
+                return True
+            except Exception:
+                return False
+        return False
+
+    # Быстрый кандидат: проектирование на кольцо
+    d0 = ring.project(start_pt)
+    p0 = ring.interpolate(d0)
+    if _segment_safe(LineString([start_pt, p0])):
+        return p0
+
+    ring_len = ring.length
+    if ring_len <= eps:
+        return p0
+
+    best_p = p0
+    best_dist2 = float("inf")
+    for i in range(step_samples + 1):
+        d = (ring_len * i) / step_samples
+        p = ring.interpolate(d)
+        if not _segment_safe(LineString([start_pt, p])):
+            continue
+        dist2 = (p.x - sx) ** 2 + (p.y - sy) ** 2
+        if dist2 < best_dist2:
+            best_dist2 = dist2
+            best_p = p
+    return best_p
+
+
+def _build_boundary_arcs_metric(
+    safe_poly_metric: Polygon,
+    entry_xy: Tuple[float, float],
+    exit_xy: Tuple[float, float],
+    *,
+    step_m: float = 25.0,
+) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
+    """
+    Возвращает две дуги по exterior кольцу safe_poly_metric между entry и exit:
+    - (clockwise_arc, counterclockwise_arc)
+    каждая включает entry и exit (в metric-координатах).
+    """
+    ring = safe_poly_metric.exterior
+    if ring is None or ring.is_empty:
+        raise ValueError("safe_poly_metric has no exterior")
+
+    entry_pt = Point(entry_xy[0], entry_xy[1])
+    exit_pt = Point(exit_xy[0], exit_xy[1])
+
+    ring_coords = list(ring.coords)
+    if ring_coords and ring_coords[0] == ring_coords[-1]:
+        ring_coords = ring_coords[:-1]
+    ring_is_ccw = _ring_signed_area_xy(ring_coords) > 0.0
+
+    L = ring.length
+    if L <= 1e-9:
+        arc = [(entry_xy[0], entry_xy[1]), (exit_xy[0], exit_xy[1])]
+        return arc, arc
+
+    d_entry = ring.project(entry_pt)
+    d_exit = ring.project(exit_pt)
+
+    # Длина дуги при движении "вперёд" по параметру кольца.
+    forward_len = (d_exit - d_entry) % L
+    backward_len = (d_entry - d_exit) % L
+
+    n_fwd = max(2, int(math.ceil(forward_len / max(1e-6, step_m))))
+    n_bwd = max(2, int(math.ceil(backward_len / max(1e-6, step_m))))
+
+    # forward: d = d_entry + t, t in [0, forward_len]
+    fwd_arc: List[Tuple[float, float]] = []
+    for i in range(n_fwd):
+        t = forward_len * (i / (n_fwd - 1))
+        d = (d_entry + t) % L
+        p = ring.interpolate(d)
+        fwd_arc.append((float(p.x), float(p.y)))
+
+    # backward: d = d_entry - t, t in [0, backward_len]
+    bwd_arc: List[Tuple[float, float]] = []
+    for i in range(n_bwd):
+        t = backward_len * (i / (n_bwd - 1))
+        d = (d_entry - t) % L
+        p = ring.interpolate(d)
+        bwd_arc.append((float(p.x), float(p.y)))
+
+    # Соотнесём "forward" с CCW или CW в зависимости от ориентации внешнего кольца.
+    # Если ring_is_ccw=True, то forward соответствует CCW.
+    if ring_is_ccw:
+        counterclockwise_arc = fwd_arc
+        clockwise_arc = bwd_arc
+    else:
+        clockwise_arc = fwd_arc
+        counterclockwise_arc = bwd_arc
+    return clockwise_arc, counterclockwise_arc
+
+
+def _calculate_metric_path_length_m(path_xy: List[Tuple[float, float]]) -> float:
+    if not path_xy or len(path_xy) < 2:
+        return 0.0
+    total = 0.0
+    for i in range(len(path_xy) - 1):
+        x1, y1 = path_xy[i]
+        x2, y2 = path_xy[i + 1]
+        total += math.hypot(x2 - x1, y2 - y1)
+    return float(total)
+
+
+def boundary_detour_route_for_edge(
+    lon1: float,
+    lat1: float,
+    lon2: float,
+    lat2: float,
+    no_fly_union: Any,
+    *,
+    safety_margin_m: float = 0.0,
+    boundary_step_m: float = 25.0,
+) -> Tuple[Optional[List[Tuple[float, float]]], Optional[float]]:
+    """
+    Строит обход вокруг (buffered) no-fly polygon по внешнему контуру.
+    Возвращает (detour_coords_lonlat, detour_length_km) или (None, None) если не смогли.
+    """
+    if no_fly_union is None or getattr(no_fly_union, "is_empty", True):
+        return None, None
+
+    src_lon = float(lon1 + lon2) / 2.0
+    src_lat = float(lat1 + lat2) / 2.0
+    utm_epsg = _utm_epsg_from_lonlat(src_lon, src_lat)
+    src_crs = CRS.from_epsg(4326)
+    dst_crs = CRS.from_epsg(utm_epsg)
+    fwd = Transformer.from_crs(src_crs, dst_crs, always_xy=True)
+    inv = Transformer.from_crs(dst_crs, src_crs, always_xy=True)
+
+    start_xy = fwd.transform(lon1, lat1)
+    goal_xy = fwd.transform(lon2, lat2)
+    direct_line_xy = LineString([start_xy, goal_xy])
+
+    zones_metric = unary_union([z for z in no_fly_union.geoms]) if hasattr(no_fly_union, "geoms") else no_fly_union
+    zones_metric = zones_metric
+    zones_metric = shapely_transform(fwd.transform, zones_metric)
+
+    # Выбираем компонент, который пересекает прямую в metric.
+    selected_safe_poly: Optional[Polygon] = None
+    best_score = -1.0
+
+    comps: List[Any]
+    if isinstance(zones_metric, MultiPolygon):
+        comps = list(zones_metric.geoms)
+    elif isinstance(zones_metric, Polygon):
+        comps = [zones_metric]
+    else:
+        return None, None
+
+    for comp in comps:
+        try:
+            safe_comp = comp.buffer(safety_margin_m) if safety_margin_m and safety_margin_m != 0.0 else comp
+            if safe_comp is None or getattr(safe_comp, "is_empty", True):
+                continue
+            if not direct_line_xy.intersects(safe_comp):
+                continue
+            inter = direct_line_xy.intersection(safe_comp)
+            score = float(getattr(inter, "length", 0.0) or 0.0)
+            # если пересечение точечное, используем дистанцию как score
+            if score <= 1e-12:
+                score = -float(direct_line_xy.distance(safe_comp))
+            if score > best_score and isinstance(safe_comp, Polygon):
+                best_score = score
+                selected_safe_poly = safe_comp
+        except Exception:
+            continue
+
+    if selected_safe_poly is None:
+        # fallback: возьмём ближайшую компоненту
+        for comp in comps:
+            try:
+                safe_comp = comp.buffer(safety_margin_m) if safety_margin_m and safety_margin_m != 0.0 else comp
+                if safe_comp is None or getattr(safe_comp, "is_empty", True):
+                    continue
+                score = -float(direct_line_xy.distance(safe_comp))
+                if score > best_score and isinstance(safe_comp, Polygon):
+                    best_score = score
+                    selected_safe_poly = safe_comp
+            except Exception:
+                continue
+
+    if selected_safe_poly is None or not isinstance(selected_safe_poly, Polygon):
+        return None, None
+
+    # entry/exit на внешнем контуре
+    # Чтобы маршрут был максимально коротким (как "правильный" естественный обход),
+    # точки entry/exit берём из пересечения прямого сегмента с границей safe-полигона,
+    # а не "по ближайшему" к start/goal.
+    def _extract_points(g) -> List[Point]:
+        if g is None or g.is_empty:
+            return []
+        gt = getattr(g, "geom_type", None)
+        if gt == "Point":
+            return [g]
+        if gt == "MultiPoint":
+            return list(g.geoms)
+        if gt == "GeometryCollection":
+            out: List[Point] = []
+            for part in getattr(g, "geoms", []):
+                out.extend(_extract_points(part))
+            return out
+        if gt in ("LineString", "LinearRing"):
+            # Линия "вдоль границы": возьмём концы перекрытия как точки входа/выхода
+            coords = list(g.coords)
+            if len(coords) >= 2:
+                return [Point(coords[0]), Point(coords[-1])]
+        return []
+
+    boundary_inter = direct_line_xy.intersection(selected_safe_poly.boundary)
+    inter_points = _extract_points(boundary_inter)
+
+    inter_points_sorted = sorted(inter_points, key=lambda p: direct_line_xy.project(p))
+
+    entry_pt_metric: Optional[Point] = None
+    exit_pt_metric: Optional[Point] = None
+
+    # Выбираем пару соседних пересечений, между которыми линия реально проходит через interior safe-полигона.
+    for i in range(len(inter_points_sorted) - 1):
+        p1 = inter_points_sorted[i]
+        p2 = inter_points_sorted[i + 1]
+        # Считаем mid параметр-относительно, между p1 и p2 по координате вдоль прямого сегмента.
+        proj1 = direct_line_xy.project(p1)
+        proj2 = direct_line_xy.project(p2)
+        mid_proj = (proj1 + proj2) / 2.0
+        mid_pt = direct_line_xy.interpolate(mid_proj)
+        try:
+            if selected_safe_poly.contains(mid_pt):
+                entry_pt_metric = p1
+                exit_pt_metric = p2
+                break
+        except Exception:
+            continue
+
+    # Fallback: если пересечений оказалось недостаточно/не нашли interior-сегмент,
+    # используем прежнюю nearest_visible_boundary_point логику.
+    if entry_pt_metric is None or exit_pt_metric is None:
+        entry_pt_metric = _nearest_visible_boundary_point_metric(start_xy, selected_safe_poly)
+        exit_pt_metric = _nearest_visible_boundary_point_metric(goal_xy, selected_safe_poly)
+
+    entry_xy = (float(entry_pt_metric.x), float(entry_pt_metric.y))
+    exit_xy = (float(exit_pt_metric.x), float(exit_pt_metric.y))
+
+    clockwise_arc, counterclockwise_arc = _build_boundary_arcs_metric(
+        selected_safe_poly,
+        entry_xy,
+        exit_xy,
+        step_m=boundary_step_m,
+    )
+
+    route_cw_metric = [start_xy, clockwise_arc[0]] + clockwise_arc[1:-1] + [clockwise_arc[-1], goal_xy]
+    route_ccw_metric = [start_xy, counterclockwise_arc[0]] + counterclockwise_arc[1:-1] + [counterclockwise_arc[-1], goal_xy]
+
+    len_cw_m = _calculate_metric_path_length_m(route_cw_metric)
+    len_ccw_m = _calculate_metric_path_length_m(route_ccw_metric)
+
+    chosen = route_cw_metric if len_cw_m <= len_ccw_m else route_ccw_metric
+    chosen_len_km = (len_cw_m if len_cw_m <= len_ccw_m else len_ccw_m) / 1000.0
+
+    # обратная проекция в lon/lat
+    out_lonlat: List[Tuple[float, float]] = []
+    for x, y in chosen:
+        lon, lat = inv.transform(x, y)
+        out_lonlat.append((float(lon), float(lat)))
+
+    return out_lonlat, float(chosen_len_km)
 
 class StationPlacement:
     def __init__(self, data_service, logger=None):
@@ -1390,6 +1750,24 @@ class StationPlacement:
         if obstacles is not None and getattr(obstacles, "is_empty", True) is False and getattr(obstacles, "is_valid", True):
             nfz_union = obstacles
 
+        # Важно: для корректных проверок пересечений/касаний линии с no-fly зонами
+        # используем метрическую СК (UTM). Иначе в EPSG:4326 (градусы) ошибки допусков
+        # могут приводить к тому, что визуально маршрут заходит в зону.
+        nfz_union_metric = None
+        to_metric: Optional[Transformer] = None
+        if nfz_union is not None and len(trunk_nodes) >= 2:
+            try:
+                mid_lon = float(np.mean([lon for _, lon, _ in trunk_nodes]))
+                mid_lat = float(np.mean([lat for _, _, lat in trunk_nodes]))
+                utm_epsg = _utm_epsg_from_lonlat(mid_lon, mid_lat)
+                src_crs = CRS.from_epsg(4326)
+                dst_crs = CRS.from_epsg(utm_epsg)
+                to_metric = Transformer.from_crs(src_crs, dst_crs, always_xy=True)
+                nfz_union_metric = shapely_transform(to_metric.transform, nfz_union)
+            except Exception:
+                nfz_union_metric = None
+                to_metric = None
+
         # Предобработка воздушного графа: исключаем любые рёбра/узлы, проходящие через no-fly зоны.
         if nfz_union is not None and air_graph is not None and air_graph.number_of_nodes() > 1:
             try:
@@ -1431,15 +1809,147 @@ class StationPlacement:
                 except Exception:
                     air_tree = None
 
+        detour_call_idx = 0
+
         def _edge_blocked(lon1: float, lat1: float, lon2: float, lat2: float) -> bool:
             """Проверка: проходит ли отрезок магистрали через no-fly зоны."""
             if nfz_union is None:
                 return False
             try:
+                if nfz_union_metric is not None and to_metric is not None:
+                    x1, y1 = to_metric.transform(float(lon1), float(lat1))
+                    x2, y2 = to_metric.transform(float(lon2), float(lat2))
+                    line = LineString([(float(x1), float(y1)), (float(x2), float(y2))])
+                    return is_edge_blocked(line, nfz_union_metric, safety_buffer=0.0)
+                # Fallback (должно редко использоваться).
                 line = LineString([(float(lon1), float(lat1)), (float(lon2), float(lat2))])
                 return is_edge_blocked(line, nfz_union, safety_buffer=no_fly_safety_buffer)
             except Exception:
                 return False
+
+        def _route_is_safe(route_coords: Optional[List[Tuple[float, float]]]) -> bool:
+            """
+            Проверка детура целиком: ни одна точка/сегмент маршрута не должна
+            попадать в no-fly зону (с тем же safety buffer).
+            """
+            if route_coords is None or len(route_coords) < 2:
+                return False
+            if nfz_union is None:
+                return True
+            try:
+                for lon, lat in route_coords:
+                    if nfz_union_metric is not None and to_metric is not None:
+                        x, y = to_metric.transform(float(lon), float(lat))
+                        if is_point_in_no_fly_zone((float(x), float(y)), nfz_union_metric, safety_buffer=0.0):
+                            return False
+                    else:
+                        if is_point_in_no_fly_zone(
+                            (float(lon), float(lat)), nfz_union, safety_buffer=no_fly_safety_buffer
+                        ):
+                            return False
+                for i in range(len(route_coords) - 1):
+                    lon_a, lat_a = route_coords[i]
+                    lon_b, lat_b = route_coords[i + 1]
+                    if _edge_blocked(float(lon_a), float(lat_a), float(lon_b), float(lat_b)):
+                        return False
+                return True
+            except Exception:
+                return False
+
+        def _compress_route_with_visibility(
+            route_coords: Optional[List[Tuple[float, float]]],
+        ) -> Optional[List[Tuple[float, float]]]:
+            """
+            Упрощает ломаную (обычно после A*) в более "чистый" маршрут:
+            жадно соединяем максимально дальние точки, если прямой сегмент безопасен.
+            """
+            if route_coords is None:
+                return None
+            if len(route_coords) <= 2:
+                return route_coords
+            if nfz_union is None:
+                return [route_coords[0], route_coords[-1]]
+
+            try:
+                pts = [(float(lon), float(lat)) for lon, lat in route_coords]
+                out: List[Tuple[float, float]] = [pts[0]]
+                i = 0
+                n = len(pts)
+                while i < n - 1:
+                    best_j = i + 1
+                    # Идём от дальнего к ближнему, чтобы брать максимально длинный "чистый" прыжок.
+                    for j in range(n - 1, i, -1):
+                        if not _edge_blocked(pts[i][0], pts[i][1], pts[j][0], pts[j][1]):
+                            best_j = j
+                            break
+                    out.append(pts[best_j])
+                    i = best_j
+                return out
+            except Exception:
+                return route_coords
+
+        def _iterative_boundary_detour(
+            lon1: float,
+            lat1: float,
+            lon2: float,
+            lat2: float,
+            *,
+            max_iters: int = 12,
+        ) -> Tuple[Optional[List[Tuple[float, float]]], Optional[float]]:
+            """
+            Многократный гео-обход: если после первого обхода остаются пересечения
+            с другими no-fly зонами, локально переразводим только проблемные сегменты.
+            Это даёт "чистую" полилинию в стиле выделенной пользователем траектории.
+            """
+            route: List[Tuple[float, float]] = [(float(lon1), float(lat1)), (float(lon2), float(lat2))]
+            if nfz_union is None:
+                d0 = haversine_km(float(lat1), float(lon1), float(lat2), float(lon2))
+                return route, float(d0)
+
+            def _first_blocked_idx(coords: List[Tuple[float, float]]) -> Optional[int]:
+                for ii in range(len(coords) - 1):
+                    a = coords[ii]
+                    b = coords[ii + 1]
+                    if _edge_blocked(a[0], a[1], b[0], b[1]):
+                        return ii
+                return None
+
+            for _ in range(max(1, int(max_iters))):
+                bad_idx = _first_blocked_idx(route)
+                if bad_idx is None:
+                    route = _compress_route_with_visibility(route) or route
+                    if _route_is_safe(route):
+                        total_km = 0.0
+                        for kk in range(len(route) - 1):
+                            lon_a, lat_a = route[kk]
+                            lon_b, lat_b = route[kk + 1]
+                            total_km += haversine_km(lat_a, lon_a, lat_b, lon_b)
+                        return route, float(total_km)
+                    return None, None
+
+                a_lon, a_lat = route[bad_idx]
+                b_lon, b_lat = route[bad_idx + 1]
+                local_coords, _ = boundary_detour_route_for_edge(
+                    a_lon,
+                    a_lat,
+                    b_lon,
+                    b_lat,
+                    nfz_union,
+                    safety_margin_m=NO_FLY_DETOUR_OFFSET_M,
+                    boundary_step_m=25.0,
+                )
+                if local_coords is None or len(local_coords) < 2:
+                    return None, None
+
+                # Заменяем только проблемный сегмент, избегая дублирования соседних точек.
+                stitched = list(local_coords)
+                route = route[:bad_idx] + stitched + route[bad_idx + 2 :]
+
+                # Против "зацикливания": если маршрут разрастается слишком сильно — прекращаем.
+                if len(route) > 200:
+                    return None, None
+
+            return None, None
 
         def _astar_detour(lon1: float, lat1: float, lon2: float, lat2: float):
             """
@@ -1449,13 +1959,59 @@ class StationPlacement:
             if air_graph is None or air_tree is None or air_coords is None or not air_ids:
                 return None, None
             try:
-                d_start, idx_start = air_tree.query([lon1, lat1], k=1)
-                d_end, idx_end = air_tree.query([lon2, lat2], k=1)
-                start_id = air_ids[int(idx_start)]
-                end_id = air_ids[int(idx_end)]
+                # Важно: добавляем временные узлы ровно в координатах зарядок,
+                # чтобы полилиния детура начиналась/заканчивалась на самой станции A.
+                # Иначе получаем "почти рядом", как у тебя в UI.
+                nonlocal detour_call_idx  # type: ignore[name-defined]
+                detour_call_idx += 1
+                tmp_start = f"air_tmp_start_{detour_call_idx}"
+                tmp_goal = f"air_tmp_goal_{detour_call_idx}"
+
+                H = air_graph.copy()
+                H.add_node(tmp_start, lon=float(lon1), lat=float(lat1), node_type="air_tmp")
+                H.add_node(tmp_goal, lon=float(lon2), lat=float(lat2), node_type="air_tmp")
+
+                # Подключаем временные узлы к ближайшим узлам air_graph по безопасным рёбрам.
+                # Чем ближе подцепимся, тем короче будет стартовая/финишная "дотяжка" и весь detour.
+                grid_spacing_km = float(air_graph.graph.get("__grid_spacing_km", 0.35))
+                k_attach = int(min(max(6, 20), len(air_ids)))
+                max_attach_km = max(1.0, grid_spacing_km * 3.0)
+
+                def _attach(tmp_nid: str, x0: float, y0: float) -> None:
+                    if air_tree is None or air_coords is None:
+                        return
+                    q = [float(x0), float(y0)]
+                    res = air_tree.query(q, k=k_attach)
+                    if k_attach == 1:
+                        idxs = [int(res[1])]
+                    else:
+                        idxs = [int(ii) for ii in res[1]]
+                    for idx in idxs:
+                        nid2 = air_ids[int(idx)]
+                        d = air_graph.nodes[nid2]
+                        lon2 = d.get("lon") or d.get("x")
+                        lat2 = d.get("lat") or d.get("y")
+                        if lon2 is None or lat2 is None:
+                            continue
+                        line = LineString([(float(x0), float(y0)), (float(lon2), float(lat2))])
+                        if nfz_union is not None and _edge_blocked(float(x0), float(y0), float(lon2), float(lat2)):
+                            continue
+                        w_km = haversine_km(float(y0), float(x0), float(lat2), float(lon2))
+                        if w_km <= 0:
+                            continue
+                        if w_km > max_attach_km:
+                            continue
+                        if not H.has_edge(tmp_nid, nid2):
+                            H.add_edge(tmp_nid, nid2, weight=float(w_km), length=float(w_km), edge_type="air")
+
+                _attach(tmp_start, lon1, lat1)
+                _attach(tmp_goal, lon2, lat2)
+
+                start_id = tmp_start
+                end_id = tmp_goal
 
                 res = astar_path_safe(
-                    air_graph,
+                    H,
                     start_id,
                     end_id,
                     nfz_union,
@@ -1490,9 +2046,53 @@ class StationPlacement:
                 G.add_edge(nid_i, nid_j, weight=d_km, length=d_km)
                 return
             self.logger.debug("Магистраль пересекает беспилотную зону %s–%s, строим обход A*", nid_i, nid_j)
+            # 1) Геометрический обход по внешнему контуру (как "дуга вокруг полигона"),
+            # обычно даёт более короткий и красивый маршрут, чем A* по сетке.
+            detour_coords, detour_len = _iterative_boundary_detour(
+                lon_i,
+                lat_i,
+                lon_j,
+                lat_j,
+            )
+            detour_coords = _compress_route_with_visibility(detour_coords)
+            if detour_coords is not None and detour_len is not None and _route_is_safe(detour_coords):
+                detour_len = 0.0
+                for idx in range(len(detour_coords) - 1):
+                    lon_a, lat_a = detour_coords[idx]
+                    lon_b, lat_b = detour_coords[idx + 1]
+                    detour_len += haversine_km(lat_a, lon_a, lat_b, lon_b)
+                G.add_edge(
+                    nid_i,
+                    nid_j,
+                    weight=detour_len,
+                    length=detour_len,
+                    geometry_coords=detour_coords,
+                )
+                self.logger.info(
+                    "Гео-обход беспилотной зоны: %s–%s, длина %.3f км, точек %s",
+                    nid_i,
+                    nid_j,
+                    detour_len,
+                    len(detour_coords),
+                )
+                return
+            if detour_coords is not None and detour_len is not None:
+                self.logger.debug(
+                    "Гео-обход %s–%s пересекает другую no-fly зону, пробуем A* фоллбэк",
+                    nid_i,
+                    nid_j,
+                )
+
+            # 2) Фоллбэк: A* по воздушному графу (если он есть)
             if air_graph is not None and air_tree is not None:
                 detour_coords, detour_len = _astar_detour(lon_i, lat_i, lon_j, lat_j)
-                if detour_coords is not None and detour_len is not None:
+                detour_coords = _compress_route_with_visibility(detour_coords)
+                if detour_coords is not None and detour_len is not None and _route_is_safe(detour_coords):
+                    detour_len = 0.0
+                    for idx in range(len(detour_coords) - 1):
+                        lon_a, lat_a = detour_coords[idx]
+                        lon_b, lat_b = detour_coords[idx + 1]
+                        detour_len += haversine_km(lat_a, lon_a, lat_b, lon_b)
                     G.add_edge(
                         nid_i,
                         nid_j,
@@ -1501,12 +2101,18 @@ class StationPlacement:
                         geometry_coords=detour_coords,
                     )
                     self.logger.info(
-                        "Обход беспилотной зоны: %s–%s, точек маршрута %s",
+                        "Обход беспилотной зоны (A*): %s–%s, точек маршрута %s",
                         nid_i,
                         nid_j,
                         len(detour_coords),
                     )
                     return
+                if detour_coords is not None and detour_len is not None:
+                    self.logger.warning(
+                        "A* детур %s–%s оказался небезопасным и был отброшен",
+                        nid_i,
+                        nid_j,
+                    )
             # Если обход не построен — ребро магистрали недоступно (не добавляем небезопасную прямую).
             self.logger.warning("Обход не построен для %s–%s, ребро пропущено", nid_i, nid_j)
 
