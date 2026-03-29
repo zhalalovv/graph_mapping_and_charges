@@ -552,11 +552,12 @@ def build_uav_air_graph_grid(
     nx_est = int(math.ceil((maxx - minx) / deg_lon)) + 1
     ny_est = int(math.ceil((maxy - miny) / deg_lat)) + 1
     est_nodes = nx_est * ny_est
+    grid_scale = 1
     if est_nodes > max_nodes:
-        scale = int(math.ceil(math.sqrt(est_nodes / float(max_nodes))))
-        scale = max(1, scale)
-        deg_lon *= scale
-        deg_lat *= scale
+        grid_scale = int(math.ceil(math.sqrt(est_nodes / float(max_nodes))))
+        grid_scale = max(1, grid_scale)
+        deg_lon *= grid_scale
+        deg_lat *= grid_scale
 
     lon_vals = np.arange(minx, maxx + deg_lon * 0.5, deg_lon, dtype=float)
     lat_vals = np.arange(miny, maxy + deg_lat * 0.5, deg_lat, dtype=float)
@@ -564,8 +565,8 @@ def build_uav_air_graph_grid(
     grid_to_node: Dict[Tuple[int, int], Any] = {}
     node_lons_lats: Dict[Any, Tuple[float, float]] = {}
 
-    # Создаём узлы.
-    G.graph["__grid_spacing_km"] = float(grid_spacing_km)
+    # Создаём узлы. Фактический шаг ячейки (после укрупнения под max_nodes) — для привязки A* к сетке.
+    G.graph["__grid_spacing_km"] = float(grid_spacing_km * grid_scale)
     for ix, lon in enumerate(lon_vals):
         for iy, lat in enumerate(lat_vals):
             pt = Point(float(lon), float(lat))
@@ -1856,6 +1857,16 @@ class StationPlacement:
             except Exception:
                 return False
 
+        def _route_length_km(route_coords: Optional[List[Tuple[float, float]]]) -> Optional[float]:
+            if route_coords is None or len(route_coords) < 2:
+                return None
+            total = 0.0
+            for i in range(len(route_coords) - 1):
+                lon_a, lat_a = route_coords[i]
+                lon_b, lat_b = route_coords[i + 1]
+                total += haversine_km(float(lat_a), float(lon_a), float(lat_b), float(lon_b))
+            return float(total)
+
         def _compress_route_with_visibility(
             route_coords: Optional[List[Tuple[float, float]]],
         ) -> Optional[List[Tuple[float, float]]]:
@@ -1973,7 +1984,7 @@ class StationPlacement:
 
                 # Подключаем временные узлы к ближайшим узлам air_graph по безопасным рёбрам.
                 # Чем ближе подцепимся, тем короче будет стартовая/финишная "дотяжка" и весь detour.
-                grid_spacing_km = float(air_graph.graph.get("__grid_spacing_km", 0.35))
+                grid_spacing_km = float(air_graph.graph.get("__grid_spacing_km", 0.22))
                 k_attach = int(min(max(6, 20), len(air_ids)))
                 max_attach_km = max(1.0, grid_spacing_km * 3.0)
 
@@ -2045,22 +2056,41 @@ class StationPlacement:
             if not _edge_blocked(lon_i, lat_i, lon_j, lat_j):
                 G.add_edge(nid_i, nid_j, weight=d_km, length=d_km)
                 return
-            self.logger.debug("Магистраль пересекает беспилотную зону %s–%s, строим обход A*", nid_i, nid_j)
-            # 1) Геометрический обход по внешнему контуру (как "дуга вокруг полигона"),
-            # обычно даёт более короткий и красивый маршрут, чем A* по сетке.
-            detour_coords, detour_len = _iterative_boundary_detour(
-                lon_i,
-                lat_i,
-                lon_j,
-                lat_j,
-            )
-            detour_coords = _compress_route_with_visibility(detour_coords)
-            if detour_coords is not None and detour_len is not None and _route_is_safe(detour_coords):
-                detour_len = 0.0
-                for idx in range(len(detour_coords) - 1):
-                    lon_a, lat_a = detour_coords[idx]
-                    lon_b, lat_b = detour_coords[idx + 1]
-                    detour_len += haversine_km(lat_a, lon_a, lat_b, lon_b)
+            self.logger.debug("Магистраль пересекает беспилотную зону %s–%s, подбираем кратчайший безопасный обход", nid_i, nid_j)
+            # Два кандидата: обход по внешнему контуру полигона и A* по воздушной сетке.
+            # Раньше брался только первый успешный контурный путь — он часто длиннее сеточного (особенно в плотной застройке).
+            candidates: List[Tuple[float, List[Tuple[float, float]], str]] = []
+
+            bd_coords, _bd_len = _iterative_boundary_detour(lon_i, lat_i, lon_j, lat_j)
+            bd_coords = _compress_route_with_visibility(bd_coords)
+            if bd_coords is not None and _route_is_safe(bd_coords):
+                bd_km = _route_length_km(bd_coords)
+                if bd_km is not None:
+                    candidates.append((bd_km, bd_coords, "boundary"))
+            elif bd_coords is not None:
+                self.logger.debug(
+                    "Гео-обход %s–%s после сжатия небезопасен или невалиден, пробуем A*",
+                    nid_i,
+                    nid_j,
+                )
+
+            if air_graph is not None and air_tree is not None:
+                ast_coords, _al = _astar_detour(lon_i, lat_i, lon_j, lat_j)
+                ast_coords = _compress_route_with_visibility(ast_coords)
+                if ast_coords is not None and _route_is_safe(ast_coords):
+                    ast_km = _route_length_km(ast_coords)
+                    if ast_km is not None:
+                        candidates.append((ast_km, ast_coords, "air_astar"))
+                elif ast_coords is not None:
+                    self.logger.warning(
+                        "A* детур %s–%s оказался небезопасным после сжатия и был отброшен",
+                        nid_i,
+                        nid_j,
+                    )
+
+            if candidates:
+                candidates.sort(key=lambda x: x[0])
+                detour_len, detour_coords, how = candidates[0]
                 G.add_edge(
                     nid_i,
                     nid_j,
@@ -2069,50 +2099,15 @@ class StationPlacement:
                     geometry_coords=detour_coords,
                 )
                 self.logger.info(
-                    "Гео-обход беспилотной зоны: %s–%s, длина %.3f км, точек %s",
+                    "Обход no-fly (%s): %s–%s, длина %.3f км, точек %s",
+                    how,
                     nid_i,
                     nid_j,
                     detour_len,
                     len(detour_coords),
                 )
                 return
-            if detour_coords is not None and detour_len is not None:
-                self.logger.debug(
-                    "Гео-обход %s–%s пересекает другую no-fly зону, пробуем A* фоллбэк",
-                    nid_i,
-                    nid_j,
-                )
 
-            # 2) Фоллбэк: A* по воздушному графу (если он есть)
-            if air_graph is not None and air_tree is not None:
-                detour_coords, detour_len = _astar_detour(lon_i, lat_i, lon_j, lat_j)
-                detour_coords = _compress_route_with_visibility(detour_coords)
-                if detour_coords is not None and detour_len is not None and _route_is_safe(detour_coords):
-                    detour_len = 0.0
-                    for idx in range(len(detour_coords) - 1):
-                        lon_a, lat_a = detour_coords[idx]
-                        lon_b, lat_b = detour_coords[idx + 1]
-                        detour_len += haversine_km(lat_a, lon_a, lat_b, lon_b)
-                    G.add_edge(
-                        nid_i,
-                        nid_j,
-                        weight=detour_len,
-                        length=detour_len,
-                        geometry_coords=detour_coords,
-                    )
-                    self.logger.info(
-                        "Обход беспилотной зоны (A*): %s–%s, точек маршрута %s",
-                        nid_i,
-                        nid_j,
-                        len(detour_coords),
-                    )
-                    return
-                if detour_coords is not None and detour_len is not None:
-                    self.logger.warning(
-                        "A* детур %s–%s оказался небезопасным и был отброшен",
-                        nid_i,
-                        nid_j,
-                    )
             # Если обход не построен — ребро магистрали недоступно (не добавляем небезопасную прямую).
             self.logger.warning("Обход не построен для %s–%s, ребро пропущено", nid_i, nid_j)
 
@@ -3285,9 +3280,9 @@ def run_full_pipeline(
         uav_air_graph = build_uav_air_graph_grid(
             city_boundary,
             nfz_for_air,
-            grid_spacing_km=0.35,
+            grid_spacing_km=0.22,
             connect_diagonal=True,
-            max_nodes=8000,
+            max_nodes=14000,
             safety_buffer=0.0,
         )
         if uav_air_graph is None or uav_air_graph.number_of_nodes() < 2:

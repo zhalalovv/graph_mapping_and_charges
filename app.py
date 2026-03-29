@@ -47,7 +47,7 @@ def _placement_cache_key(
         "candidates_per_cluster": int(candidates_per_cluster),
         # Смена версии сбрасывает устаревший Redis-кэш (иначе после правок пайплайна
         # клиент может бесконечно получать пустой сохранённый ответ).
-        "placement_schema": 10,
+        "placement_schema": 11,
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()
