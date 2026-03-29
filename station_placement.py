@@ -950,6 +950,409 @@ def boundary_detour_route_for_edge(
 
     return out_lonlat, float(chosen_len_km)
 
+
+def route_lonlat_segment_with_nfz_detours(
+    lon1: float,
+    lat1: float,
+    lon2: float,
+    lat2: float,
+    nfz_union: Any,
+    *,
+    air_graph: Optional[nx.Graph] = None,
+    air_coords: Optional[np.ndarray] = None,
+    air_ids: Optional[List[Any]] = None,
+    air_tree: Optional[Any] = None,
+    no_fly_safety_buffer: float = 0.0,
+    nfz_metric: Optional[Tuple[Any, Optional[Transformer]]] = None,
+    utm_anchor_lonlat: Optional[Tuple[float, float]] = None,
+    logger: Optional[logging.Logger] = None,
+    detour_counter: Optional[List[int]] = None,
+    log_edge_label: Optional[str] = None,
+) -> Optional[Tuple[List[Tuple[float, float]], float, str]]:
+    """
+    Построение сегмента между двумя точками: прямая, либо кратчайший безопасный обход
+    (контур no-fly и/или A* по воздушному графу), как на магистрали.
+
+    Возвращает (полилиния lon/lat, длина км, режим: straight|boundary|air_astar) или None,
+    если концы в no-fly или безопасный маршрут не найден.
+    """
+    d_km = haversine_km(float(lat1), float(lon1), float(lat2), float(lon2))
+    straight: List[Tuple[float, float]] = [(float(lon1), float(lat1)), (float(lon2), float(lat2))]
+
+    if nfz_union is None or getattr(nfz_union, "is_empty", True):
+        return (straight, float(d_km), "straight")
+
+    if is_point_in_no_fly_zone((lon1, lat1), nfz_union, safety_buffer=no_fly_safety_buffer) or is_point_in_no_fly_zone(
+        (lon2, lat2), nfz_union, safety_buffer=no_fly_safety_buffer
+    ):
+        return None
+
+    nfz_union_metric: Optional[Any] = None
+    to_metric: Optional[Transformer] = None
+    if nfz_metric is not None:
+        nfz_union_metric, to_metric = nfz_metric
+    else:
+        try:
+            alon = float(utm_anchor_lonlat[0]) if utm_anchor_lonlat is not None else float(lon1 + lon2) / 2.0
+            alat = float(utm_anchor_lonlat[1]) if utm_anchor_lonlat is not None else float(lat1 + lat2) / 2.0
+            utm_epsg = _utm_epsg_from_lonlat(alon, alat)
+            src_crs = CRS.from_epsg(4326)
+            dst_crs = CRS.from_epsg(utm_epsg)
+            to_metric = Transformer.from_crs(src_crs, dst_crs, always_xy=True)
+            nfz_union_metric = shapely_transform(to_metric.transform, nfz_union)
+        except Exception:
+            nfz_union_metric = None
+            to_metric = None
+
+    ctr = detour_counter if detour_counter is not None else [0]
+    log = logger or logging.getLogger(__name__)
+    lbl = log_edge_label or "%s–%s" % (lon1, lon2)
+
+    def _edge_blocked(lon_a: float, lat_a: float, lon_b: float, lat_b: float) -> bool:
+        if nfz_union is None:
+            return False
+        try:
+            if nfz_union_metric is not None and to_metric is not None:
+                x1, y1 = to_metric.transform(float(lon_a), float(lat_a))
+                x2, y2 = to_metric.transform(float(lon_b), float(lat_b))
+                line = LineString([(float(x1), float(y1)), (float(x2), float(y2))])
+                return is_edge_blocked(line, nfz_union_metric, safety_buffer=0.0)
+            line = LineString([(float(lon_a), float(lat_a)), (float(lon_b), float(lat_b))])
+            return is_edge_blocked(line, nfz_union, safety_buffer=no_fly_safety_buffer)
+        except Exception:
+            return False
+
+    def _route_is_safe(route_coords: Optional[List[Tuple[float, float]]]) -> bool:
+        if route_coords is None or len(route_coords) < 2:
+            return False
+        if nfz_union is None:
+            return True
+        try:
+            for lon, lat in route_coords:
+                if nfz_union_metric is not None and to_metric is not None:
+                    x, y = to_metric.transform(float(lon), float(lat))
+                    if is_point_in_no_fly_zone((float(x), float(y)), nfz_union_metric, safety_buffer=0.0):
+                        return False
+                else:
+                    if is_point_in_no_fly_zone((float(lon), float(lat)), nfz_union, safety_buffer=no_fly_safety_buffer):
+                        return False
+            for i in range(len(route_coords) - 1):
+                la, lo_a = route_coords[i]
+                lb, lo_b = route_coords[i + 1]
+                if _edge_blocked(float(la), float(lo_a), float(lb), float(lo_b)):
+                    return False
+            return True
+        except Exception:
+            return False
+
+    def _route_length_km(route_coords: Optional[List[Tuple[float, float]]]) -> Optional[float]:
+        if route_coords is None or len(route_coords) < 2:
+            return None
+        total = 0.0
+        for i in range(len(route_coords) - 1):
+            la, lo_a = route_coords[i]
+            lb, lo_b = route_coords[i + 1]
+            total += haversine_km(float(lo_a), float(la), float(lo_b), float(lb))
+        return float(total)
+
+    def _compress_route_greedy_visibility(
+        route_coords: Optional[List[Tuple[float, float]]],
+    ) -> Optional[List[Tuple[float, float]]]:
+        if route_coords is None:
+            return None
+        if len(route_coords) <= 2:
+            return route_coords
+        if nfz_union is None:
+            return [route_coords[0], route_coords[-1]]
+        try:
+            pts = [(float(lon), float(lat)) for lon, lat in route_coords]
+            out: List[Tuple[float, float]] = [pts[0]]
+            i = 0
+            n = len(pts)
+            while i < n - 1:
+                best_j = i + 1
+                for j in range(n - 1, i, -1):
+                    if not _edge_blocked(pts[i][0], pts[i][1], pts[j][0], pts[j][1]):
+                        best_j = j
+                        break
+                out.append(pts[best_j])
+                i = best_j
+            return out
+        except Exception:
+            return route_coords
+
+    def _compress_route_min_length_dp(
+        route_coords: Optional[List[Tuple[float, float]]],
+    ) -> Optional[List[Tuple[float, float]]]:
+        """
+        Кратчайшая полилиния по подмножеству вершин исходной ломаной: ребро i→j допустимо,
+        если прямой сегмент не пересекает no-fly. Жадный «максимальный прыжок» здесь не подходит —
+        он не минимизирует суммарную длину.
+        """
+        if route_coords is None:
+            return None
+        if len(route_coords) <= 2:
+            return route_coords
+        if nfz_union is None:
+            return [route_coords[0], route_coords[-1]]
+        try:
+            pts = [(float(lon), float(lat)) for lon, lat in route_coords]
+            n = len(pts)
+            if n <= 2:
+                return route_coords
+            INF = float("inf")
+            dp = [INF] * n
+            nxt = [-1] * n
+            dp[n - 1] = 0.0
+            for i in range(n - 2, -1, -1):
+                best = INF
+                best_j = -1
+                for j in range(i + 1, n):
+                    if _edge_blocked(pts[i][0], pts[i][1], pts[j][0], pts[j][1]):
+                        continue
+                    w = haversine_km(pts[i][1], pts[i][0], pts[j][1], pts[j][0])
+                    if dp[j] >= INF:
+                        continue
+                    cand = w + dp[j]
+                    if cand < best:
+                        best = cand
+                        best_j = j
+                dp[i] = best
+                nxt[i] = best_j
+            if dp[0] >= INF:
+                return _compress_route_greedy_visibility(route_coords)
+            out: List[Tuple[float, float]] = [pts[0]]
+            cur = 0
+            while cur < n - 1:
+                nj = nxt[cur]
+                if nj < 0:
+                    return _compress_route_greedy_visibility(route_coords)
+                out.append(pts[nj])
+                cur = nj
+            return out
+        except Exception:
+            return _compress_route_greedy_visibility(route_coords)
+
+    def _iterative_boundary_detour(
+        alon1: float,
+        alat1: float,
+        alon2: float,
+        alat2: float,
+        *,
+        max_iters: int = 12,
+    ) -> Tuple[Optional[List[Tuple[float, float]]], Optional[float]]:
+        route: List[Tuple[float, float]] = [(float(alon1), float(alat1)), (float(alon2), float(alat2))]
+        if nfz_union is None:
+            d0 = haversine_km(float(alat1), float(alon1), float(alat2), float(alon2))
+            return route, float(d0)
+
+        def _first_blocked_idx(coords: List[Tuple[float, float]]) -> Optional[int]:
+            for ii in range(len(coords) - 1):
+                a = coords[ii]
+                b = coords[ii + 1]
+                if _edge_blocked(a[0], a[1], b[0], b[1]):
+                    return ii
+            return None
+
+        for _ in range(max(1, int(max_iters))):
+            bad_idx = _first_blocked_idx(route)
+            if bad_idx is None:
+                route = _compress_route_min_length_dp(route) or route
+                if _route_is_safe(route):
+                    total_km = 0.0
+                    for kk in range(len(route) - 1):
+                        la, lo_a = route[kk]
+                        lb, lo_b = route[kk + 1]
+                        total_km += haversine_km(lo_a, la, lo_b, lb)
+                    return route, float(total_km)
+                return None, None
+
+            a_lon, a_lat = route[bad_idx]
+            b_lon, b_lat = route[bad_idx + 1]
+            local_coords, _ = boundary_detour_route_for_edge(
+                a_lon,
+                a_lat,
+                b_lon,
+                b_lat,
+                nfz_union,
+                safety_margin_m=NO_FLY_DETOUR_OFFSET_M,
+                boundary_step_m=25.0,
+            )
+            if local_coords is None or len(local_coords) < 2:
+                return None, None
+            stitched = list(local_coords)
+            route = route[:bad_idx] + stitched + route[bad_idx + 2 :]
+            if len(route) > 200:
+                return None, None
+
+        return None, None
+
+    def _astar_detour(alon1: float, alat1: float, alon2: float, alat2: float):
+        if air_graph is None or air_tree is None or air_coords is None or not air_ids:
+            return None, None
+        try:
+            ctr[0] += 1
+            tmp_start = "air_tmp_start_%s" % ctr[0]
+            tmp_goal = "air_tmp_goal_%s" % ctr[0]
+            H = air_graph.copy()
+            H.add_node(tmp_start, lon=float(alon1), lat=float(alat1), node_type="air_tmp")
+            H.add_node(tmp_goal, lon=float(alon2), lat=float(alat2), node_type="air_tmp")
+            grid_spacing_km = float(air_graph.graph.get("__grid_spacing_km", 0.22))
+            k_attach = int(min(max(12, 40), len(air_ids)))
+            max_attach_km = max(1.0, grid_spacing_km * 6.0)
+
+            def _attach(tmp_nid: str, x0: float, y0: float) -> None:
+                if air_tree is None or air_coords is None:
+                    return
+                q = [float(x0), float(y0)]
+                res = air_tree.query(q, k=k_attach)
+                if k_attach == 1:
+                    idxs = [int(res[1])]
+                else:
+                    idxs = [int(ii) for ii in res[1]]
+                for idx in idxs:
+                    nid2 = air_ids[int(idx)]
+                    d = air_graph.nodes[nid2]
+                    elon = d.get("lon") or d.get("x")
+                    elat = d.get("lat") or d.get("y")
+                    if elon is None or elat is None:
+                        continue
+                    if nfz_union is not None and _edge_blocked(float(x0), float(y0), float(elon), float(elat)):
+                        continue
+                    w_km = haversine_km(float(y0), float(x0), float(elat), float(elon))
+                    if w_km <= 0:
+                        continue
+                    if w_km > max_attach_km:
+                        continue
+                    if not H.has_edge(tmp_nid, nid2):
+                        H.add_edge(tmp_nid, nid2, weight=float(w_km), length=float(w_km), edge_type="air")
+
+            _attach(tmp_start, alon1, alat1)
+            _attach(tmp_goal, alon2, alat2)
+            res = astar_path_safe(
+                H,
+                tmp_start,
+                tmp_goal,
+                nfz_union,
+                safety_buffer=no_fly_safety_buffer,
+                weight_attr="weight",
+            )
+            if res.get("status") != "success":
+                return None, None
+            coords = res.get("path_coords") or []
+            length_km = res.get("path_length_km")
+            if not coords or length_km is None:
+                return None, None
+            return coords, float(length_km)
+        except Exception:
+            return None, None
+
+    if not _edge_blocked(lon1, lat1, lon2, lat2):
+        return (straight, float(d_km), "straight")
+
+    log.debug("Сегмент пересекает беспилотную зону %s, подбираем безопасный обход", lbl)
+    candidates: List[Tuple[float, List[Tuple[float, float]], str]] = []
+
+    bd_coords, _bd_len = _iterative_boundary_detour(lon1, lat1, lon2, lat2)
+    bd_coords = _compress_route_min_length_dp(bd_coords)
+    if bd_coords is not None and _route_is_safe(bd_coords):
+        bd_km = _route_length_km(bd_coords)
+        if bd_km is not None:
+            candidates.append((bd_km, bd_coords, "boundary"))
+    elif bd_coords is not None:
+        log.debug("Гео-обход %s после сжатия небезопасен, пробуем A*", lbl)
+
+    if air_graph is not None and air_tree is not None:
+        ast_coords, _al = _astar_detour(lon1, lat1, lon2, lat2)
+        ast_coords = _compress_route_min_length_dp(ast_coords)
+        if ast_coords is not None and _route_is_safe(ast_coords):
+            ast_km = _route_length_km(ast_coords)
+            if ast_km is not None:
+                candidates.append((ast_km, ast_coords, "air_astar"))
+        elif ast_coords is not None:
+            log.warning("A* детур %s небезопасен после сжатия и отброшен", lbl)
+
+    if not candidates:
+        log.warning("Обход не построен для %s", lbl)
+        return None
+
+    candidates.sort(key=lambda x: x[0])
+    detour_len, detour_coords, how = candidates[0]
+    log.info("Обход no-fly (%s): %s, длина %.3f км, точек %s", how, lbl, detour_len, len(detour_coords))
+    return (detour_coords, float(detour_len), how)
+
+
+def prepare_air_detour_auxiliary(
+    obstacles: Any,
+    air_graph: Optional[nx.Graph],
+    utm_anchor_lonlat: Tuple[float, float],
+    *,
+    no_fly_safety_buffer: float = 0.0,
+) -> Tuple[Any, Optional[Tuple[Any, Optional[Transformer]]], Optional[nx.Graph], Optional[np.ndarray], Optional[List[Any]], Optional[Any]]:
+    """
+    Общая подготовка для route_lonlat_segment_with_nfz_detours: no-fly в UTM, безопасный air_graph, KD-tree.
+    Возвращает (nfz_union, nfz_metric_pair, air_work, air_coords, air_ids, air_tree).
+    """
+    nfz_union = None
+    if obstacles is not None and getattr(obstacles, "is_empty", True) is False and getattr(obstacles, "is_valid", True):
+        nfz_union = obstacles
+
+    nfz_union_metric = None
+    to_metric: Optional[Transformer] = None
+    if nfz_union is not None:
+        try:
+            mid_lon = float(utm_anchor_lonlat[0])
+            mid_lat = float(utm_anchor_lonlat[1])
+            utm_epsg = _utm_epsg_from_lonlat(mid_lon, mid_lat)
+            src_crs = CRS.from_epsg(4326)
+            dst_crs = CRS.from_epsg(utm_epsg)
+            to_metric = Transformer.from_crs(src_crs, dst_crs, always_xy=True)
+            nfz_union_metric = shapely_transform(to_metric.transform, nfz_union)
+        except Exception:
+            nfz_union_metric = None
+            to_metric = None
+
+    air_work = air_graph
+    if nfz_union is not None and air_work is not None and air_work.number_of_nodes() > 1:
+        try:
+            air_work = build_safe_graph(air_work, nfz_union, safety_buffer=no_fly_safety_buffer)
+        except Exception:
+            pass
+
+    air_coords = None
+    air_ids = None
+    air_tree = None
+    if air_work is not None and air_work.number_of_nodes() > 1:
+        air_ids = list(air_work.nodes())
+        pts_air = []
+        for nid in air_ids:
+            data = air_work.nodes[nid]
+            lon = data.get("lon") or data.get("x")
+            lat = data.get("lat") or data.get("y")
+            if lon is None or lat is None:
+                pts_air.append((np.nan, np.nan))
+            else:
+                pts_air.append((float(lon), float(lat)))
+        air_coords = np.array(pts_air, dtype=float)
+        valid_mask = ~np.isnan(air_coords[:, 0]) & ~np.isnan(air_coords[:, 1])
+        if not np.any(valid_mask):
+            air_coords = None
+            air_ids = None
+        else:
+            air_coords = air_coords[valid_mask]
+            air_ids = [air_ids[i] for i, ok in enumerate(valid_mask) if ok]
+            try:
+                air_tree = cKDTree(air_coords)
+            except Exception:
+                air_tree = None
+
+    nfz_metric_pair: Optional[Tuple[Any, Optional[Transformer]]] = None
+    if nfz_union_metric is not None and to_metric is not None:
+        nfz_metric_pair = (nfz_union_metric, to_metric)
+
+    return nfz_union, nfz_metric_pair, air_work, air_coords, air_ids, air_tree
+
+
 class StationPlacement:
     def __init__(self, data_service, logger=None):
         self.data_service = data_service
@@ -1810,234 +2213,10 @@ class StationPlacement:
                 except Exception:
                     air_tree = None
 
-        detour_call_idx = 0
-
-        def _edge_blocked(lon1: float, lat1: float, lon2: float, lat2: float) -> bool:
-            """Проверка: проходит ли отрезок магистрали через no-fly зоны."""
-            if nfz_union is None:
-                return False
-            try:
-                if nfz_union_metric is not None and to_metric is not None:
-                    x1, y1 = to_metric.transform(float(lon1), float(lat1))
-                    x2, y2 = to_metric.transform(float(lon2), float(lat2))
-                    line = LineString([(float(x1), float(y1)), (float(x2), float(y2))])
-                    return is_edge_blocked(line, nfz_union_metric, safety_buffer=0.0)
-                # Fallback (должно редко использоваться).
-                line = LineString([(float(lon1), float(lat1)), (float(lon2), float(lat2))])
-                return is_edge_blocked(line, nfz_union, safety_buffer=no_fly_safety_buffer)
-            except Exception:
-                return False
-
-        def _route_is_safe(route_coords: Optional[List[Tuple[float, float]]]) -> bool:
-            """
-            Проверка детура целиком: ни одна точка/сегмент маршрута не должна
-            попадать в no-fly зону (с тем же safety buffer).
-            """
-            if route_coords is None or len(route_coords) < 2:
-                return False
-            if nfz_union is None:
-                return True
-            try:
-                for lon, lat in route_coords:
-                    if nfz_union_metric is not None and to_metric is not None:
-                        x, y = to_metric.transform(float(lon), float(lat))
-                        if is_point_in_no_fly_zone((float(x), float(y)), nfz_union_metric, safety_buffer=0.0):
-                            return False
-                    else:
-                        if is_point_in_no_fly_zone(
-                            (float(lon), float(lat)), nfz_union, safety_buffer=no_fly_safety_buffer
-                        ):
-                            return False
-                for i in range(len(route_coords) - 1):
-                    lon_a, lat_a = route_coords[i]
-                    lon_b, lat_b = route_coords[i + 1]
-                    if _edge_blocked(float(lon_a), float(lat_a), float(lon_b), float(lat_b)):
-                        return False
-                return True
-            except Exception:
-                return False
-
-        def _route_length_km(route_coords: Optional[List[Tuple[float, float]]]) -> Optional[float]:
-            if route_coords is None or len(route_coords) < 2:
-                return None
-            total = 0.0
-            for i in range(len(route_coords) - 1):
-                lon_a, lat_a = route_coords[i]
-                lon_b, lat_b = route_coords[i + 1]
-                total += haversine_km(float(lat_a), float(lon_a), float(lat_b), float(lon_b))
-            return float(total)
-
-        def _compress_route_with_visibility(
-            route_coords: Optional[List[Tuple[float, float]]],
-        ) -> Optional[List[Tuple[float, float]]]:
-            """
-            Упрощает ломаную (обычно после A*) в более "чистый" маршрут:
-            жадно соединяем максимально дальние точки, если прямой сегмент безопасен.
-            """
-            if route_coords is None:
-                return None
-            if len(route_coords) <= 2:
-                return route_coords
-            if nfz_union is None:
-                return [route_coords[0], route_coords[-1]]
-
-            try:
-                pts = [(float(lon), float(lat)) for lon, lat in route_coords]
-                out: List[Tuple[float, float]] = [pts[0]]
-                i = 0
-                n = len(pts)
-                while i < n - 1:
-                    best_j = i + 1
-                    # Идём от дальнего к ближнему, чтобы брать максимально длинный "чистый" прыжок.
-                    for j in range(n - 1, i, -1):
-                        if not _edge_blocked(pts[i][0], pts[i][1], pts[j][0], pts[j][1]):
-                            best_j = j
-                            break
-                    out.append(pts[best_j])
-                    i = best_j
-                return out
-            except Exception:
-                return route_coords
-
-        def _iterative_boundary_detour(
-            lon1: float,
-            lat1: float,
-            lon2: float,
-            lat2: float,
-            *,
-            max_iters: int = 12,
-        ) -> Tuple[Optional[List[Tuple[float, float]]], Optional[float]]:
-            """
-            Многократный гео-обход: если после первого обхода остаются пересечения
-            с другими no-fly зонами, локально переразводим только проблемные сегменты.
-            Это даёт "чистую" полилинию в стиле выделенной пользователем траектории.
-            """
-            route: List[Tuple[float, float]] = [(float(lon1), float(lat1)), (float(lon2), float(lat2))]
-            if nfz_union is None:
-                d0 = haversine_km(float(lat1), float(lon1), float(lat2), float(lon2))
-                return route, float(d0)
-
-            def _first_blocked_idx(coords: List[Tuple[float, float]]) -> Optional[int]:
-                for ii in range(len(coords) - 1):
-                    a = coords[ii]
-                    b = coords[ii + 1]
-                    if _edge_blocked(a[0], a[1], b[0], b[1]):
-                        return ii
-                return None
-
-            for _ in range(max(1, int(max_iters))):
-                bad_idx = _first_blocked_idx(route)
-                if bad_idx is None:
-                    route = _compress_route_with_visibility(route) or route
-                    if _route_is_safe(route):
-                        total_km = 0.0
-                        for kk in range(len(route) - 1):
-                            lon_a, lat_a = route[kk]
-                            lon_b, lat_b = route[kk + 1]
-                            total_km += haversine_km(lat_a, lon_a, lat_b, lon_b)
-                        return route, float(total_km)
-                    return None, None
-
-                a_lon, a_lat = route[bad_idx]
-                b_lon, b_lat = route[bad_idx + 1]
-                local_coords, _ = boundary_detour_route_for_edge(
-                    a_lon,
-                    a_lat,
-                    b_lon,
-                    b_lat,
-                    nfz_union,
-                    safety_margin_m=NO_FLY_DETOUR_OFFSET_M,
-                    boundary_step_m=25.0,
-                )
-                if local_coords is None or len(local_coords) < 2:
-                    return None, None
-
-                # Заменяем только проблемный сегмент, избегая дублирования соседних точек.
-                stitched = list(local_coords)
-                route = route[:bad_idx] + stitched + route[bad_idx + 2 :]
-
-                # Против "зацикливания": если маршрут разрастается слишком сильно — прекращаем.
-                if len(route) > 200:
-                    return None, None
-
-            return None, None
-
-        def _astar_detour(lon1: float, lat1: float, lon2: float, lat2: float):
-            """
-            Обход по воздушному графу между двумя точками.
-            Возвращает (coords: List[(lon, lat)], length_km) или (None, None) при неудаче.
-            """
-            if air_graph is None or air_tree is None or air_coords is None or not air_ids:
-                return None, None
-            try:
-                # Важно: добавляем временные узлы ровно в координатах зарядок,
-                # чтобы полилиния детура начиналась/заканчивалась на самой станции A.
-                # Иначе получаем "почти рядом", как у тебя в UI.
-                nonlocal detour_call_idx  # type: ignore[name-defined]
-                detour_call_idx += 1
-                tmp_start = f"air_tmp_start_{detour_call_idx}"
-                tmp_goal = f"air_tmp_goal_{detour_call_idx}"
-
-                H = air_graph.copy()
-                H.add_node(tmp_start, lon=float(lon1), lat=float(lat1), node_type="air_tmp")
-                H.add_node(tmp_goal, lon=float(lon2), lat=float(lat2), node_type="air_tmp")
-
-                # Подключаем временные узлы к ближайшим узлам air_graph по безопасным рёбрам.
-                # Чем ближе подцепимся, тем короче будет стартовая/финишная "дотяжка" и весь detour.
-                grid_spacing_km = float(air_graph.graph.get("__grid_spacing_km", 0.22))
-                k_attach = int(min(max(6, 20), len(air_ids)))
-                max_attach_km = max(1.0, grid_spacing_km * 3.0)
-
-                def _attach(tmp_nid: str, x0: float, y0: float) -> None:
-                    if air_tree is None or air_coords is None:
-                        return
-                    q = [float(x0), float(y0)]
-                    res = air_tree.query(q, k=k_attach)
-                    if k_attach == 1:
-                        idxs = [int(res[1])]
-                    else:
-                        idxs = [int(ii) for ii in res[1]]
-                    for idx in idxs:
-                        nid2 = air_ids[int(idx)]
-                        d = air_graph.nodes[nid2]
-                        lon2 = d.get("lon") or d.get("x")
-                        lat2 = d.get("lat") or d.get("y")
-                        if lon2 is None or lat2 is None:
-                            continue
-                        line = LineString([(float(x0), float(y0)), (float(lon2), float(lat2))])
-                        if nfz_union is not None and _edge_blocked(float(x0), float(y0), float(lon2), float(lat2)):
-                            continue
-                        w_km = haversine_km(float(y0), float(x0), float(lat2), float(lon2))
-                        if w_km <= 0:
-                            continue
-                        if w_km > max_attach_km:
-                            continue
-                        if not H.has_edge(tmp_nid, nid2):
-                            H.add_edge(tmp_nid, nid2, weight=float(w_km), length=float(w_km), edge_type="air")
-
-                _attach(tmp_start, lon1, lat1)
-                _attach(tmp_goal, lon2, lat2)
-
-                start_id = tmp_start
-                end_id = tmp_goal
-
-                res = astar_path_safe(
-                    H,
-                    start_id,
-                    end_id,
-                    nfz_union,
-                    safety_buffer=no_fly_safety_buffer,
-                    weight_attr="weight",
-                )
-                if res.get("status") != "success":
-                    return None, None
-                coords = res.get("path_coords") or []
-                length_km = res.get("path_length_km")
-                if not coords or length_km is None:
-                    return None, None
-                return coords, float(length_km)
-            except Exception:
-                return None, None
+        detour_counter = [0]
+        nfz_metric_pair: Optional[Tuple[Any, Optional[Transformer]]] = None
+        if nfz_union_metric is not None and to_metric is not None:
+            nfz_metric_pair = (nfz_union_metric, to_metric)
 
         pts = np.array([[lon, lat] for _, lon, lat in trunk_nodes])
         ids = [nid for nid, _, _ in trunk_nodes]
@@ -2045,71 +2224,29 @@ class StationPlacement:
         def _add_trunk_edge(nid_i: str, nid_j: str, lon_i: float, lat_i: float, lon_j: float, lat_j: float) -> None:
             if G.has_edge(nid_i, nid_j):
                 return
-            d_km = haversine_km(lat_i, lon_i, lat_j, lon_j)
-            if nfz_union is not None:
-                # Если хотя бы один конец попадает в no-fly зону — ребро запрещено.
-                if is_point_in_no_fly_zone((lon_i, lat_i), nfz_union, safety_buffer=no_fly_safety_buffer) or is_point_in_no_fly_zone(
-                    (lon_j, lat_j), nfz_union, safety_buffer=no_fly_safety_buffer
-                ):
-                    return
-
-            if not _edge_blocked(lon_i, lat_i, lon_j, lat_j):
-                G.add_edge(nid_i, nid_j, weight=d_km, length=d_km)
+            routed = route_lonlat_segment_with_nfz_detours(
+                lon_i,
+                lat_i,
+                lon_j,
+                lat_j,
+                nfz_union,
+                air_graph=air_graph,
+                air_coords=air_coords,
+                air_ids=air_ids,
+                air_tree=air_tree,
+                no_fly_safety_buffer=no_fly_safety_buffer,
+                nfz_metric=nfz_metric_pair,
+                logger=self.logger,
+                detour_counter=detour_counter,
+                log_edge_label="%s–%s" % (nid_i, nid_j),
+            )
+            if routed is None:
                 return
-            self.logger.debug("Магистраль пересекает беспилотную зону %s–%s, подбираем кратчайший безопасный обход", nid_i, nid_j)
-            # Два кандидата: обход по внешнему контуру полигона и A* по воздушной сетке.
-            # Раньше брался только первый успешный контурный путь — он часто длиннее сеточного (особенно в плотной застройке).
-            candidates: List[Tuple[float, List[Tuple[float, float]], str]] = []
-
-            bd_coords, _bd_len = _iterative_boundary_detour(lon_i, lat_i, lon_j, lat_j)
-            bd_coords = _compress_route_with_visibility(bd_coords)
-            if bd_coords is not None and _route_is_safe(bd_coords):
-                bd_km = _route_length_km(bd_coords)
-                if bd_km is not None:
-                    candidates.append((bd_km, bd_coords, "boundary"))
-            elif bd_coords is not None:
-                self.logger.debug(
-                    "Гео-обход %s–%s после сжатия небезопасен или невалиден, пробуем A*",
-                    nid_i,
-                    nid_j,
-                )
-
-            if air_graph is not None and air_tree is not None:
-                ast_coords, _al = _astar_detour(lon_i, lat_i, lon_j, lat_j)
-                ast_coords = _compress_route_with_visibility(ast_coords)
-                if ast_coords is not None and _route_is_safe(ast_coords):
-                    ast_km = _route_length_km(ast_coords)
-                    if ast_km is not None:
-                        candidates.append((ast_km, ast_coords, "air_astar"))
-                elif ast_coords is not None:
-                    self.logger.warning(
-                        "A* детур %s–%s оказался небезопасным после сжатия и был отброшен",
-                        nid_i,
-                        nid_j,
-                    )
-
-            if candidates:
-                candidates.sort(key=lambda x: x[0])
-                detour_len, detour_coords, how = candidates[0]
-                G.add_edge(
-                    nid_i,
-                    nid_j,
-                    weight=detour_len,
-                    length=detour_len,
-                    geometry_coords=detour_coords,
-                )
-                self.logger.info(
-                    "Обход no-fly (%s): %s–%s, длина %.3f км, точек %s",
-                    how,
-                    nid_i,
-                    nid_j,
-                    detour_len,
-                    len(detour_coords),
-                )
-                return
-
-            # Если обход не построен — ребро магистрали недоступно (не добавляем небезопасную прямую).
-            self.logger.warning("Обход не построен для %s–%s, ребро пропущено", nid_i, nid_j)
+            coords, w_km, how = routed
+            if how == "straight":
+                G.add_edge(nid_i, nid_j, weight=w_km, length=w_km)
+            else:
+                G.add_edge(nid_i, nid_j, weight=w_km, length=w_km, geometry_coords=coords)
 
         use_mst = str(topology_mode or "").strip().lower() == "mst"
         if use_mst and len(trunk_nodes) >= 2:
@@ -2295,12 +2432,16 @@ class StationPlacement:
     def build_local_edges(
         self,
         charge_stations: gpd.GeoDataFrame,
+        obstacles=None,
+        air_graph: Optional[nx.Graph] = None,
         *,
         max_edge_km: float = R_GARAGE_TO_KM,
         max_neighbors_b: int = 2,
+        no_fly_safety_buffer: float = 0.0,
     ) -> List[Dict[str, Any]]:
         """
         Локальные связи между станциями типа Б. Каждая Б соединяется с макс. max_neighbors_b ближайшими Б в пределах max_edge_km.
+        При наличии no-fly зон и воздушного графа строит тот же обход, что и магистраль (контур + A*).
         Returns: список GeoJSON-like Feature (LineString, edge_type="local", weight_km).
         """
         if charge_stations is None or len(charge_stations) == 0:
@@ -2314,6 +2455,15 @@ class StationPlacement:
         if len(b_indices) < 2:
             return []
         b_pts = np.array([_coords_from_geom(charge_stations.loc[i].geometry) for i in b_indices])
+        anchor = (float(np.mean(b_pts[:, 0])), float(np.mean(b_pts[:, 1])))
+        nfz_union, nfz_metric_pair, air_work, air_coords, air_ids, air_tree = prepare_air_detour_auxiliary(
+            obstacles,
+            air_graph,
+            anchor,
+            no_fly_safety_buffer=no_fly_safety_buffer,
+        )
+
+        detour_counter = [0]
         features = []
         k = min(max_neighbors_b, len(b_indices) - 1)
         seen_edges = set()
@@ -2326,24 +2476,44 @@ class StationPlacement:
                 if d_km <= max_edge_km:
                     cand.append((d_km, j))
             cand.sort(key=lambda x: x[0])
-            for d_km, j in cand[:k]:
+            for _d_unused, j in cand[:k]:
                 ui, vi = b_indices[i], b_indices[j]
                 edge_key = (min(ui, vi), max(ui, vi))
                 if edge_key in seen_edges:
                     continue
                 seen_edges.add(edge_key)
+                lon_i, lat_i = float(b_pts[i, 0]), float(b_pts[i, 1])
+                lon_j, lat_j = float(b_pts[j, 0]), float(b_pts[j, 1])
+                routed = route_lonlat_segment_with_nfz_detours(
+                    lon_i,
+                    lat_i,
+                    lon_j,
+                    lat_j,
+                    nfz_union,
+                    air_graph=air_work,
+                    air_coords=air_coords,
+                    air_ids=air_ids,
+                    air_tree=air_tree,
+                    no_fly_safety_buffer=no_fly_safety_buffer,
+                    nfz_metric=nfz_metric_pair,
+                    utm_anchor_lonlat=anchor,
+                    logger=self.logger,
+                    detour_counter=detour_counter,
+                    log_edge_label="local_B %s–%s" % (ui, vi),
+                )
+                if routed is None:
+                    continue
+                coords, w_km, _how = routed
+                line_coords = [[float(c[0]), float(c[1])] for c in coords]
                 features.append(
                     {
                         "type": "Feature",
-                        "geometry": {
-                            "type": "LineString",
-                            "coordinates": [[b_pts[i, 0], b_pts[i, 1]], [b_pts[j, 0], b_pts[j, 1]]],
-                        },
+                        "geometry": {"type": "LineString", "coordinates": line_coords},
                         "properties": {
                             "edge_type": "local",
                             "source_id": str(ui),
                             "target_id": str(vi),
-                            "weight_km": round(d_km, 4),
+                            "weight_km": round(float(w_km), 4),
                         },
                     }
                 )
@@ -3314,6 +3484,24 @@ def run_full_pipeline(
     branch_edges: List[Dict[str, Any]] = []
     local_edges: List[Dict[str, Any]] = []
 
+    br_nfz: Any = None
+    br_metric: Optional[Tuple[Any, Optional[Transformer]]] = None
+    br_air: Optional[nx.Graph] = None
+    br_coords: Optional[np.ndarray] = None
+    br_ids: Optional[List[Any]] = None
+    br_tree: Optional[Any] = None
+    branch_detour_counter: List[int] = [0]
+    anchor_lon, anchor_lat = 0.0, 0.0
+    if charge_stations is not None and len(charge_stations) > 0:
+        _anchor_pts = np.array([_coords_from_geom(r.geometry) for _, r in charge_stations.iterrows()])
+        anchor_lon, anchor_lat = float(np.mean(_anchor_pts[:, 0])), float(np.mean(_anchor_pts[:, 1]))
+        br_nfz, br_metric, br_air, br_coords, br_ids, br_tree = prepare_air_detour_auxiliary(
+            obstacles_union,
+            uav_air_graph,
+            (anchor_lon, anchor_lat),
+            no_fly_safety_buffer=0.0,
+        )
+
     # Связи «спутник → A»: Б, гараж и ТО — та же логика, что B→A (k ближайших A, приоритет той же region_id).
     if charge_stations is not None and len(charge_stations) > 0 and "station_type" in charge_stations.columns:
         try:
@@ -3368,22 +3556,40 @@ def run_full_pipeline(
                     )
                     if target is None:
                         return
-                    row_a, d_km = target
+                    row_a, _ = target
                     lon_s, lat_s = _coords_from_geom(sat_row.geometry)
                     lon_a, lat_a = _coords_from_geom(row_a.geometry)
+                    routed = route_lonlat_segment_with_nfz_detours(
+                        lon_s,
+                        lat_s,
+                        lon_a,
+                        lat_a,
+                        br_nfz,
+                        air_graph=br_air,
+                        air_coords=br_coords,
+                        air_ids=br_ids,
+                        air_tree=br_tree,
+                        no_fly_safety_buffer=0.0,
+                        nfz_metric=br_metric,
+                        utm_anchor_lonlat=(anchor_lon, anchor_lat),
+                        logger=logger,
+                        detour_counter=branch_detour_counter,
+                        log_edge_label="branch %s→A %s" % (satellite_role, sat_index),
+                    )
+                    if routed is None:
+                        return
+                    coords, w_km, _how = routed
+                    line_coords = [[float(c[0]), float(c[1])] for c in coords]
                     branch_edges.append(
                         {
                             "type": "Feature",
-                            "geometry": {
-                                "type": "LineString",
-                                "coordinates": [[lon_s, lat_s], [lon_a, lat_a]],
-                            },
+                            "geometry": {"type": "LineString", "coordinates": line_coords},
                             "properties": {
                                 "edge_type": "branch_b_to_a_group",
                                 "satellite_role": satellite_role,
                                 "source_id": str(sat_index),
                                 "target_id": str(getattr(row_a, "name", "")),
-                                "weight_km": round(float(d_km), 4),
+                                "weight_km": round(float(w_km), 4),
                                 "region_id": (
                                     str(region_opt)
                                     if region_opt is not None and not pd.isna(region_opt)
@@ -3416,6 +3622,8 @@ def run_full_pipeline(
     try:
         local_edges = placement.build_local_edges(
             charge_stations,
+            obstacles_union,
+            uav_air_graph,
             max_edge_km=R_GARAGE_TO_KM,
             max_neighbors_b=2,
         )
