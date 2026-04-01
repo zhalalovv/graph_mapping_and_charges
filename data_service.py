@@ -1163,8 +1163,21 @@ class DataService:
                             out.extend(_partition_by_target_weight(sub_idx))
                     return out
 
+                # Не склеиваем далёкие группы только из-за малого веса:
+                # объединяем лишь «локально соседние» подгруппы.
+                MAX_MERGE_DISTANCE_M = max(1000.0, float(eps_m) * 3.0)
+                # Лёгкие кластеры (< порога) можно дотягивать до соседа на большем расстоянии,
+                # чтобы не оставлять много мелких зон с весом << MAX_WEIGHT_PER_HULL.
+                SMALL_CLUSTER_WEIGHT_THRESHOLD = 2500.0
+                EXTENDED_MERGE_DISTANCE_M = max(MAX_MERGE_DISTANCE_M * 2.5, 1600.0)
+
                 def _merge_neighboring_weight_groups(groups):
-                    """Сливаем ближайшие по центроиду группы, если суммарный вес ≤ MAX_WEIGHT_PER_HULL."""
+                    """
+                    Сливаем ближайшие группы: при суммарном весе ≤ MAX_WEIGHT_PER_HULL.
+                    Базовый радиус — MAX_MERGE_DISTANCE_M; если вес хотя бы одной группы
+                    < SMALL_CLUSTER_WEIGHT_THRESHOLD, допускается EXTENDED_MERGE_DISTANCE_M.
+                    На каждом шаге — минимальное расстояние между центроидами; при равенстве — большая сумма весов.
+                    """
                     if len(groups) <= 1:
                         return groups
                     groups = [np.asarray(g, dtype=int) for g in groups if len(g) > 0]
@@ -1178,32 +1191,63 @@ class DataService:
                         it += 1
                         weights = np.array([float(base_weights[gi].sum()) for gi in groups], dtype=float)
                         cents = np.stack([pts_utm[gi].mean(axis=0) for gi in groups], axis=0)
+                        n_g = len(groups)
                         best_i, best_j = None, None
                         best_d = None
-                        if cKDTree is not None and len(groups) > 80:
-                            tree = cKDTree(cents)
-                            kn = min(12, len(groups))
-                            dists, nbrs = tree.query(cents, k=kn)
-                            for i in range(len(groups)):
-                                for jj in range(kn):
-                                    j = int(nbrs[i, jj])
-                                    if j == i or j < i:
-                                        continue
-                                    if weights[i] + weights[j] > MAX_WEIGHT_PER_HULL + 1e-9:
-                                        continue
-                                    d = float(dists[i, jj]) ** 2 if dists.ndim == 2 else float("inf")
-                                    if best_d is None or d < best_d:
-                                        best_d = d
-                                        best_i, best_j = i, j
+                        best_sw = None
+
+                        def _allowed_merge_dist_sq(w_i: float, w_j: float) -> float:
+                            if min(w_i, w_j) < SMALL_CLUSTER_WEIGHT_THRESHOLD:
+                                return EXTENDED_MERGE_DISTANCE_M ** 2
+                            return MAX_MERGE_DISTANCE_M ** 2
+
+                        def _consider_pair(i: int, j: int, d_sq: float, sw: float) -> None:
+                            nonlocal best_i, best_j, best_d, best_sw
+                            if sw > MAX_WEIGHT_PER_HULL + 1e-9:
+                                return
+                            allow_sq = _allowed_merge_dist_sq(
+                                float(weights[i]), float(weights[j])
+                            )
+                            if d_sq > allow_sq + 1e-18:
+                                return
+                            if (
+                                best_d is None
+                                or d_sq < best_d - 1e-12
+                                or (
+                                    abs(d_sq - best_d) <= 1e-12
+                                    and best_sw is not None
+                                    and sw > best_sw + 1e-6
+                                )
+                            ):
+                                best_d = d_sq
+                                best_sw = sw
+                                best_i, best_j = i, j
+
+                        pair_idx = None
+                        if cKDTree is not None and n_g > 1:
+                            try:
+                                pair_idx = cKDTree(cents).query_pairs(
+                                    r=EXTENDED_MERGE_DISTANCE_M, output_type="ndarray"
+                                )
+                            except Exception:
+                                pair_idx = None
+                        if pair_idx is not None and len(pair_idx) > 0:
+                            for i, j in pair_idx:
+                                ii, jj = int(i), int(j)
+                                sw = float(weights[ii] + weights[jj])
+                                d_sq = float(np.sum((cents[ii] - cents[jj]) ** 2))
+                                _consider_pair(ii, jj, d_sq, sw)
                         else:
-                            for i in range(len(groups)):
-                                for j in range(i + 1, len(groups)):
-                                    if weights[i] + weights[j] > MAX_WEIGHT_PER_HULL + 1e-9:
-                                        continue
-                                    d = float(np.sum((cents[i] - cents[j]) ** 2))
-                                    if best_d is None or d < best_d:
-                                        best_d = d
-                                        best_i, best_j = i, j
+                            for i in range(n_g):
+                                for j in range(i + 1, n_g):
+                                    sw = float(weights[i] + weights[j])
+                                    d_sq = float(np.sum((cents[i] - cents[j]) ** 2))
+                                    allow_sq = _allowed_merge_dist_sq(
+                                        float(weights[i]), float(weights[j])
+                                    )
+                                    if d_sq <= allow_sq + 1e-18:
+                                        _consider_pair(i, j, d_sq, sw)
+
                         if best_i is None:
                             break
                         merged = np.concatenate([groups[best_i], groups[best_j]])
@@ -1310,16 +1354,8 @@ class DataService:
                     region_labels = np.zeros(len(pts_utm), dtype=int)
                     region_ids = [0]
 
-                # Шум первого уровня привязываем к ближайшему району; если районов нет — отдельно как шум.
-                if np.any(region_labels == -1) and region_ids:
-                    region_centers = {}
-                    for rid in region_ids:
-                        m = region_labels == rid
-                        region_centers[rid] = np.array(pts_utm[m].mean(axis=0))
-                    for i_noise in np.where(region_labels == -1)[0]:
-                        pt = pts_utm[i_noise]
-                        best_rid = min(region_ids, key=lambda rid: float(np.sum((pt - region_centers[rid]) ** 2)))
-                        region_labels[i_noise] = best_rid
+                # Шум первого уровня (label=-1) не привязываем к ближайшему району:
+                # такие точки остаются шумом и не попадают в кластеры.
 
                 subcluster_seq = 0
                 for rid in sorted(set(region_labels) - {-1}):
