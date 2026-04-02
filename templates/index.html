@@ -210,6 +210,9 @@
             <button class="floating-btn btn-secondary" id="loadStationsRulesBtn" style="width:100%; margin-top:8px" onclick="loadStationsRulesPlacement()">
                 Рассчитать зарядки
             </button>
+            <button class="floating-btn btn-secondary" id="toggleVoronoiPathsBtn" style="width:100%; margin-top:6px; display:none" onclick="toggleVoronoiPaths()" title="Включить/выключить отображение рёбер Вороного внутри кластера">
+                <span id="toggleVoronoiPathsLabel">Скрыть Вороного внутри кластера</span>
+            </button>
             <button class="floating-btn btn-secondary" id="toggleTrunkBtn" style="width:100%; margin-top:6px" onclick="toggleTrunkLines()">
                 <span id="toggleTrunkLabel">Скрыть магистраль</span>
             </button>
@@ -246,11 +249,13 @@
         let stationsRulesLayerGroup = null;
         let trunkLinesLayer = null;
         let localLinesLayer = null;
+        let voronoiPathsLayer = null;
         let clusterHullsVisible = true;
         let clusterPointsVisible = false; // точки кластеров (центроиды/точки спроса) по умолчанию скрыты
         let buildingsVisible = true;
         let trunkLinesVisible = true;
         let localLinesVisible = true;
+        let voronoiPathsVisible = true;
         
         // Список популярных городов
         const CITIES = [
@@ -526,6 +531,8 @@
                     map.removeLayer(stationsRulesLayerGroup);
                     stationsRulesLayerGroup = null;
                 }
+                const toggleVoronoiBtn = document.getElementById('toggleVoronoiPathsBtn');
+                if (toggleVoronoiBtn) toggleVoronoiBtn.style.display = 'none';
                 const srsEl = document.getElementById('stationsRulesStats');
                 if (srsEl) srsEl.textContent = '';
                 const toggleClusterBtn = document.getElementById('toggleClusterHullsBtn');
@@ -648,6 +655,23 @@
             el.textContent = localLinesVisible ? 'Скрыть локальные пути' : 'Показать локальные пути';
         }
 
+        function updateVoronoiPathsButtonLabel() {
+            const el = document.getElementById('toggleVoronoiPathsLabel');
+            if (!el) return;
+            el.textContent = voronoiPathsVisible ? 'Скрыть Вороного внутри кластера' : 'Показать Вороного внутри кластера';
+        }
+
+        function toggleVoronoiPaths() {
+            if (!stationsRulesLayerGroup || !voronoiPathsLayer) return;
+            voronoiPathsVisible = !voronoiPathsVisible;
+            if (voronoiPathsVisible) {
+                voronoiPathsLayer.addTo(stationsRulesLayerGroup);
+            } else {
+                stationsRulesLayerGroup.removeLayer(voronoiPathsLayer);
+            }
+            updateVoronoiPathsButtonLabel();
+        }
+
         function toggleTrunkLines() {
             trunkLinesVisible = !trunkLinesVisible;
             if (stationsRulesLayerGroup && trunkLinesLayer) {
@@ -705,7 +729,9 @@
             }
             trunkLinesLayer = null;
             localLinesLayer = null;
+            voronoiPathsLayer = null;
             stationsRulesLayerGroup = L.layerGroup();
+            voronoiPathsLayer = L.layerGroup();
 
             /** Устойчивый цвет по id кластера (золотой угол в HSL). */
             function colorForClusterId(cid) {
@@ -782,8 +808,9 @@
                     data.voronoi_edges,
                     { color: '#7c3aed', weight: 2, opacity: 0.55, dashArray: '4, 6', lineCap: 'round', lineJoin: 'round' },
                     'Вороной (локальные пути)',
-                    stationsRulesLayerGroup
+                    voronoiPathsLayer
                 );
+                if (voronoiPathsVisible) voronoiPathsLayer.addTo(stationsRulesLayerGroup);
                 /* Этап 3: затем магистраль. */
                 addLines(data.trunk, { color: STATION_COLOR_CHARGING, weight: 3, opacity: 0.95, lineCap: 'round', lineJoin: 'round' }, 'Магистраль', trunkLinesLayer);
                 /* Этап 4: затем Б-А и Б-Б (один переключаемый слой). */
@@ -879,6 +906,9 @@
                 stationsRulesLayerGroup.addTo(map);
                 updateTrunkButtonLabel();
                 updateLocalButtonLabel();
+                const toggleVoronoiBtn2 = document.getElementById('toggleVoronoiPathsBtn');
+                if (toggleVoronoiBtn2) toggleVoronoiBtn2.style.display = 'block';
+                updateVoronoiPathsButtonLabel();
                 const m = data.metrics || {};
                 if (statsEl) {
                     const nGar = (data.garages && data.garages.features) ? data.garages.features.length : 0;
