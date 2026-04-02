@@ -2895,6 +2895,7 @@ def run_full_pipeline(
     num_garages: int = 1,
     num_to: int = 1,
     a_by_admin_districts: bool = False,
+    voronoi_buildings_per_centroid: int = 60,
 ) -> Dict[str, Any]:
     """
     Запускает полный пайплайн: данные города → спрос (DBSCAN или сетка) → зарядки → гаражи/ТО → метрики.
@@ -3635,6 +3636,28 @@ def run_full_pipeline(
     metrics["cluster_count"] = cluster_count
     metrics["charging_buildings_in_clusters"] = charging_buildings_in_clusters
 
+    voronoi_edges: Dict[str, Any] = {"type": "FeatureCollection", "features": []}
+    try:
+        from voronoi_paths import build_voronoi_edges_from_pipeline_raw, charging_station_gdfs_to_features
+
+        st_feats = charging_station_gdfs_to_features(
+            charge_stations,
+            garages,
+            to_stations,
+        )
+        voronoi_edges = build_voronoi_edges_from_pipeline_raw(
+            data_service,
+            {
+                "demand": demand,
+                "buildings": buildings,
+                "demand_hulls": cluster_hulls_gdf,
+            },
+            charging_station_features=st_feats,
+            buildings_per_centroid=int(voronoi_buildings_per_centroid),
+        )
+    except Exception as e:
+        logger.warning("Вороной по пайплайну (сайты станций в кластерах): %s", e)
+
     return {
         "buildings": buildings,
         "demand": demand,
@@ -3644,11 +3667,14 @@ def run_full_pipeline(
         "trunk_graph": trunk,
         "branch_edges": branch_edges,
         "local_edges": local_edges,
+        "voronoi_edges": voronoi_edges,
         "metrics": metrics,
         "city_boundary": city_boundary,
         "no_fly_zones": no_fly_zones,
+        "demand_hulls": cluster_hulls_gdf,
         "params": {
-            # Радиусы отсутствуют: покрытие и привязка делаются по `cluster_id`.
+            "voronoi_buildings_per_centroid": int(voronoi_buildings_per_centroid),
+            "voronoi_includes_station_sites": True,
         },
     }
 
@@ -3770,6 +3796,12 @@ def pipeline_result_to_geojson(raw: Dict[str, Any]) -> Dict[str, Any]:
                         keep_cols.append(extra)
                 cluster_centroids = demand_for_link[[*keep_cols, "geometry"]]
 
+    vor_raw = raw.get("voronoi_edges")
+    if not isinstance(vor_raw, dict) or vor_raw.get("type") != "FeatureCollection":
+        vor_fc = _empty_fc()
+    else:
+        vor_fc = vor_raw
+
     out: Dict[str, Any] = {
         "charging_type_a": _gdf_to_fc(charging_a),
         "charging_type_b": _gdf_to_fc(charging_b),
@@ -3778,6 +3810,7 @@ def pipeline_result_to_geojson(raw: Dict[str, Any]) -> Dict[str, Any]:
         "trunk": {"type": "FeatureCollection", "features": trunk_feats},
         "branch_edges": _list_features_to_fc(raw.get("branch_edges")),
         "local_edges": _list_features_to_fc(raw.get("local_edges")),
+        "voronoi_edges": vor_fc,
         "metrics": raw.get("metrics") or {},
         "params": raw.get("params") or {},
         "cluster_centroids": _gdf_to_fc(cluster_centroids),

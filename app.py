@@ -12,6 +12,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from data_service import DataService
 from station_placement import pipeline_result_to_geojson, run_full_pipeline
+from voronoi_paths import build_voronoi_local_paths_fc
+
 
 app = FastAPI(title="Clustering", version="0.2.0")
 
@@ -25,708 +27,6 @@ app.add_middleware(
 
 data_service = DataService()
 logger = logging.getLogger(__name__)
-
-
-def _dedupe_close_parallel_voronoi_edges(
-    fc: dict,
-    *,
-    max_midpoint_distance_m: float = 90.0,
-    max_angle_diff_deg: float = 18.0,
-) -> dict:
-    """Убирает почти дублирующиеся близкие и параллельные рёбра Вороного."""
-    if not fc or not isinstance(fc, dict):
-        return {"type": "FeatureCollection", "features": []}
-    feats = list(fc.get("features", []) or [])
-    if len(feats) < 2:
-        return {"type": "FeatureCollection", "features": feats}
-
-    angle_thr = np.radians(float(max_angle_diff_deg))
-
-    def _xy_m(lon: float, lat: float, ref_lat: float) -> tuple[float, float]:
-        m_per_deg_lat = 111_320.0
-        m_per_deg_lon = 111_320.0 * np.cos(np.radians(ref_lat))
-        return lon * m_per_deg_lon, lat * m_per_deg_lat
-
-    def _enrich(feature: dict):
-        geom = (feature or {}).get("geometry") or {}
-        if geom.get("type") != "LineString":
-            return None
-        coords = geom.get("coordinates") or []
-        if len(coords) < 2:
-            return None
-        p1 = coords[0]
-        p2 = coords[-1]
-        if len(p1) < 2 or len(p2) < 2:
-            return None
-        lon1, lat1 = float(p1[0]), float(p1[1])
-        lon2, lat2 = float(p2[0]), float(p2[1])
-        ref_lat = 0.5 * (lat1 + lat2)
-        x1, y1 = _xy_m(lon1, lat1, ref_lat)
-        x2, y2 = _xy_m(lon2, lat2, ref_lat)
-        dx, dy = x2 - x1, y2 - y1
-        length = float(np.hypot(dx, dy))
-        if length <= 0.1:
-            return None
-        ang = float(np.arctan2(dy, dx))
-        if ang < 0:
-            ang += np.pi
-        mx, my = 0.5 * (x1 + x2), 0.5 * (y1 + y2)
-        return {
-            "feature": feature,
-            "cluster": str(((feature.get("properties") or {}).get("cluster_id"))),
-            "p1": (x1, y1),
-            "p2": (x2, y2),
-            "mx": mx,
-            "my": my,
-            "angle": ang,
-            "length": length,
-            "ux": dx / length,
-            "uy": dy / length,
-        }
-
-    enriched = [e for e in (_enrich(f) for f in feats) if e is not None]
-    if len(enriched) < 2:
-        return {"type": "FeatureCollection", "features": feats}
-
-    by_cluster: dict[str, list[dict]] = {}
-    for e in enriched:
-        by_cluster.setdefault(e["cluster"], []).append(e)
-
-    kept_features: list[dict] = []
-    for _, items in by_cluster.items():
-        items.sort(key=lambda it: it["length"], reverse=True)
-        kept: list[dict] = []
-        for cur in items:
-            is_dup = False
-            for k in kept:
-                d_ang = abs(cur["angle"] - k["angle"])
-                d_ang = min(d_ang, np.pi - d_ang)
-                if d_ang > angle_thr:
-                    continue
-                d_mid = float(np.hypot(cur["mx"] - k["mx"], cur["my"] - k["my"]))
-                if d_mid > max_midpoint_distance_m:
-                    continue
-                # Проверка "почти одной и той же полосы": малая поперечная дистанция
-                # и заметное продольное перекрытие.
-                nx, ny = -k["uy"], k["ux"]  # нормаль к опорной линии
-                perp_cur = abs((cur["mx"] - k["mx"]) * nx + (cur["my"] - k["my"]) * ny)
-                if perp_cur > (max_midpoint_distance_m * 0.7):
-                    continue
-
-                tx, ty = k["ux"], k["uy"]  # тангенс опорной линии
-                cur_min_t = min(cur["p1"][0] * tx + cur["p1"][1] * ty, cur["p2"][0] * tx + cur["p2"][1] * ty)
-                cur_max_t = max(cur["p1"][0] * tx + cur["p1"][1] * ty, cur["p2"][0] * tx + cur["p2"][1] * ty)
-                k_min_t = min(k["p1"][0] * tx + k["p1"][1] * ty, k["p2"][0] * tx + k["p2"][1] * ty)
-                k_max_t = max(k["p1"][0] * tx + k["p1"][1] * ty, k["p2"][0] * tx + k["p2"][1] * ty)
-                overlap = max(0.0, min(cur_max_t, k_max_t) - max(cur_min_t, k_min_t))
-                min_len = max(1.0, min(cur["length"], k["length"]))
-                if overlap >= (0.35 * min_len):
-                    is_dup = True
-                    break
-            if not is_dup:
-                kept.append(cur)
-        kept_features.extend([k["feature"] for k in kept])
-
-    return {"type": "FeatureCollection", "features": kept_features}
-
-
-def _build_voronoi_local_paths_fc(
-    city: str,
-    network_type: str,
-    simplify: bool,
-    dbscan_eps_m: float,
-    dbscan_min_samples: int,
-    use_all_buildings: bool,
-    buildings_per_centroid: int = 60,
-    charging_station_features: list | None = None,
-) -> dict:
-    try:
-        from scipy.spatial import Voronoi
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Scipy Voronoi недоступен: {e}")
-
-    data = data_service.get_city_data(city, network_type=network_type, simplify=simplify)
-    buildings = data.get("buildings")
-    road_graph = data.get("road_graph")
-    city_boundary = data.get("city_boundary")
-    no_fly_zones = data.get("no_fly_zones")
-
-    if buildings is None or len(buildings) == 0:
-        return {
-            "type": "FeatureCollection",
-            "features": [],
-            "clusters_total": 0,
-            "clusters_with_paths": 0,
-            "edges_total": 0,
-        }
-
-    buildings_wgs = buildings.to_crs("EPSG:4326").copy()
-    if not use_all_buildings:
-        buildings_wgs = data_service._filter_buildings_for_demand(buildings_wgs)
-    if buildings_wgs is None or len(buildings_wgs) == 0:
-        return {
-            "type": "FeatureCollection",
-            "features": [],
-            "clusters_total": 0,
-            "clusters_with_paths": 0,
-            "edges_total": 0,
-        }
-
-    hulls_gdf = data.get("demand_hulls")
-    if hulls_gdf is None or len(hulls_gdf) == 0:
-        result = data_service.get_demand_points_weighted(
-            buildings_wgs,
-            road_graph,
-            city_boundary,
-            method="dbscan",
-            dbscan_eps_m=dbscan_eps_m,
-            dbscan_min_samples=dbscan_min_samples,
-            return_hulls=True,
-            use_all_buildings=use_all_buildings,
-            no_fly_zones=no_fly_zones,
-        )
-        _, hulls_gdf = result if isinstance(result, tuple) else (None, None)
-
-    if hulls_gdf is None or len(hulls_gdf) == 0:
-        return {
-            "type": "FeatureCollection",
-            "features": [],
-            "clusters_total": 0,
-            "clusters_with_paths": 0,
-            "edges_total": 0,
-        }
-
-    hulls = hulls_gdf.to_crs("EPSG:4326").copy()
-    if "cluster_id" not in hulls.columns:
-        if "subcluster_id" in hulls.columns:
-            hulls["cluster_id"] = hulls["subcluster_id"]
-        elif "region_id" in hulls.columns:
-            hulls["cluster_id"] = hulls["region_id"]
-        else:
-            return {
-                "type": "FeatureCollection",
-                "features": [],
-                "clusters_total": 0,
-                "clusters_with_paths": 0,
-                "edges_total": 0,
-            }
-    hulls = hulls[hulls["cluster_id"].notna()].copy()
-    if len(hulls) == 0:
-        return {
-            "type": "FeatureCollection",
-            "features": [],
-            "clusters_total": 0,
-            "clusters_with_paths": 0,
-            "edges_total": 0,
-        }
-
-    # Привязываем здания к cluster_id через принадлежность центроида полигонам hull.
-    b_proj = buildings_wgs.to_crs(epsg=3857)
-    b_centroids_wgs = gpd.GeoSeries(b_proj.geometry.centroid, crs=b_proj.crs).to_crs("EPSG:4326")
-    b_points = gpd.GeoDataFrame({"geometry": b_centroids_wgs}, index=buildings_wgs.index, crs="EPSG:4326")
-    try:
-        assigned = gpd.sjoin(
-            b_points,
-            hulls[["cluster_id", "geometry"]],
-            how="inner",
-            predicate="within",
-        )
-    except Exception:
-        # fallback для старых версий geopandas
-        assigned = gpd.sjoin(
-            b_points,
-            hulls[["cluster_id", "geometry"]],
-            how="inner",
-            op="within",
-        )
-
-    if assigned is None or len(assigned) < 2:
-        return {
-            "type": "FeatureCollection",
-            "features": [],
-            "clusters_total": 0,
-            "clusters_with_paths": 0,
-            "edges_total": 0,
-        }
-    assigned = assigned.copy()
-    if "index_left" in assigned.columns:
-        assigned["_left_id"] = assigned["index_left"]
-    else:
-        assigned["_left_id"] = assigned.index
-    assigned = assigned.drop_duplicates(subset=["_left_id"]).set_index("_left_id")
-    assigned = assigned[assigned["cluster_id"].notna()].copy()
-    if len(assigned) < 2:
-        return {
-            "type": "FeatureCollection",
-            "features": [],
-            "clusters_total": 0,
-            "clusters_with_paths": 0,
-            "edges_total": 0,
-        }
-
-    charging_by_cluster: dict[str, list[list[float]]] = {}
-    if charging_station_features:
-        for f in charging_station_features:
-            if not isinstance(f, dict):
-                continue
-            geom = f.get("geometry") or {}
-            if geom.get("type") != "Point":
-                continue
-            coords = geom.get("coordinates") or []
-            if len(coords) < 2:
-                continue
-            props = f.get("properties") or {}
-            cid = props.get("cluster_id")
-            if cid is None:
-                continue
-            key = str(cid)
-            charging_by_cluster.setdefault(key, []).append([float(coords[0]), float(coords[1])])
-
-    target_group_size = max(1, int(buildings_per_centroid or 20))
-    features = []
-    clusters_total = 0
-    clusters_with_paths = 0
-
-    for group_id, sub in assigned.groupby("cluster_id"):
-        if sub is None or len(sub) < 2:
-            continue
-        clusters_total += 1
-
-        pts = []
-        for _, row in sub.iterrows():
-            geom = row.get("geometry")
-            if geom is None or geom.is_empty:
-                continue
-            try:
-                pts.append([float(geom.x), float(geom.y)])
-            except Exception:
-                continue
-        if len(pts) < 2:
-            continue
-
-        pts_arr = np.array(pts, dtype=float)
-        if len(pts_arr) > target_group_size:
-            n_groups = int(np.ceil(len(pts_arr) / float(target_group_size)))
-            n_groups = max(2, min(n_groups, len(pts_arr)))
-            try:
-                from sklearn.cluster import MiniBatchKMeans
-
-                km = MiniBatchKMeans(
-                    n_clusters=n_groups,
-                    random_state=42,
-                    batch_size=min(4096, max(1024, len(pts_arr) // 3)),
-                    n_init=3,
-                    max_iter=200,
-                )
-                labels = km.fit_predict(pts_arr)
-                centers = []
-                for k in range(n_groups):
-                    members = pts_arr[labels == k]
-                    if len(members) == 0:
-                        continue
-                    centers.append(members.mean(axis=0))
-                if len(centers) >= 2:
-                    pts_arr = np.asarray(centers, dtype=float)
-            except Exception:
-                # Fallback без sklearn: грубая агрегация по сортировке координат.
-                order = np.lexsort((pts_arr[:, 1], pts_arr[:, 0]))
-                ordered = pts_arr[order]
-                centers = []
-                for i in range(0, len(ordered), target_group_size):
-                    chunk = ordered[i : i + target_group_size]
-                    if len(chunk) == 0:
-                        continue
-                    centers.append(chunk.mean(axis=0))
-                if len(centers) >= 2:
-                    pts_arr = np.asarray(centers, dtype=float)
-
-        # Добавляем зарядные станции как отдельные центроиды (не агрегируем их по 60 зданий).
-        st_points = charging_by_cluster.get(str(group_id), [])
-        if st_points:
-            st_arr = np.asarray(st_points, dtype=float)
-            if len(st_arr) > 0:
-                pts_arr = np.vstack([pts_arr, st_arr]) if len(pts_arr) > 0 else st_arr
-                # Убираем дубликаты координат после объединения.
-                pts_arr = np.unique(pts_arr, axis=0)
-
-        if len(pts_arr) == 2:
-            p0, p1 = pts_arr[0], pts_arr[1]
-            features.append(
-                {
-                    "type": "Feature",
-                    "geometry": {
-                        "type": "LineString",
-                        "coordinates": [[float(p0[0]), float(p0[1])], [float(p1[0]), float(p1[1])]],
-                    },
-                    "properties": {
-                        "cluster_id": int(group_id) if isinstance(group_id, (int, np.integer)) else str(group_id),
-                        "edge_type": "voronoi_local",
-                        "source_i": 0,
-                        "target_i": 1,
-                    },
-                }
-            )
-            clusters_with_paths += 1
-            continue
-
-        try:
-            vor = Voronoi(pts_arr)
-            map_idx = {i: i for i in range(len(pts_arr))}
-        except Exception:
-            uniq, uniq_idx = np.unique(pts_arr, axis=0, return_index=True)
-            if len(uniq) < 3:
-                continue
-            try:
-                vor = Voronoi(uniq)
-                map_idx = {new_i: int(orig_i) for new_i, orig_i in enumerate(uniq_idx.tolist())}
-            except Exception:
-                continue
-
-        group_edges_before = len(features)
-        seen_pairs = set()
-        for ridge in vor.ridge_points:
-            i_raw, j_raw = int(ridge[0]), int(ridge[1])
-            if i_raw not in map_idx or j_raw not in map_idx:
-                continue
-            i = map_idx[i_raw]
-            j = map_idx[j_raw]
-            if i == j:
-                continue
-            a, b = (i, j) if i < j else (j, i)
-            if (a, b) in seen_pairs:
-                continue
-            seen_pairs.add((a, b))
-            pi = pts_arr[a]
-            pj = pts_arr[b]
-            features.append(
-                {
-                    "type": "Feature",
-                    "geometry": {
-                        "type": "LineString",
-                        "coordinates": [[float(pi[0]), float(pi[1])], [float(pj[0]), float(pj[1])]],
-                    },
-                    "properties": {
-                        "cluster_id": int(group_id) if isinstance(group_id, (int, np.integer)) else str(group_id),
-                        "edge_type": "voronoi_local",
-                        "source_i": int(a),
-                        "target_i": int(b),
-                    },
-                }
-            )
-        if len(features) > group_edges_before:
-            clusters_with_paths += 1
-
-    deduped = _dedupe_close_parallel_voronoi_edges({
-        "type": "FeatureCollection",
-        "features": features,
-    })
-    deduped["clusters_total"] = int(clusters_total)
-    deduped["clusters_with_paths"] = int(clusters_with_paths)
-    deduped["edges_total"] = len(deduped.get("features", []) or [])
-    return deduped
-
-
-def _build_voronoi_edges_from_station_geojson(geo: dict) -> dict:
-    """Строит локальные рёбра Вороного по точкам станций из ответа pipeline_result_to_geojson."""
-    try:
-        from scipy.spatial import Voronoi
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Scipy Voronoi недоступен: {e}")
-
-    station_layers = [
-        geo.get("charging_type_a") or {"type": "FeatureCollection", "features": []},
-        geo.get("charging_type_b") or {"type": "FeatureCollection", "features": []},
-        geo.get("garages") or {"type": "FeatureCollection", "features": []},
-        geo.get("to_stations") or {"type": "FeatureCollection", "features": []},
-    ]
-
-    by_cluster: dict[str, list[list[float]]] = {}
-    by_region: dict[str, list[list[float]]] = {}
-    all_pts: list[list[float]] = []
-    for layer in station_layers:
-        for f in layer.get("features", []) or []:
-            geom = f.get("geometry") or {}
-            if geom.get("type") != "Point":
-                continue
-            coords = geom.get("coordinates") or []
-            if len(coords) < 2:
-                continue
-            props = f.get("properties") or {}
-            cid = props.get("cluster_id")
-            pt = [float(coords[0]), float(coords[1])]
-            all_pts.append(pt)
-            if cid is not None:
-                key = str(cid)
-                by_cluster.setdefault(key, []).append(pt)
-            rid = props.get("region_id")
-            if rid is not None:
-                rkey = str(rid)
-                by_region.setdefault(rkey, []).append(pt)
-
-    # Если по cluster_id почти нет пар для Вороного (часто 1 станция на кластер),
-    # переключаемся на region_id, а затем на all stations.
-    groups = by_cluster
-    if sum(1 for pts in groups.values() if len(pts) >= 2) == 0:
-        groups = by_region if sum(1 for pts in by_region.values() if len(pts) >= 2) > 0 else {}
-    if sum(1 for pts in groups.values() if len(pts) >= 2) == 0 and len(all_pts) >= 2:
-        groups = {"all_stations": all_pts}
-
-    out_features = []
-    for cluster_key, pts in groups.items():
-        if len(pts) < 2:
-            continue
-        pts_arr = np.asarray(pts, dtype=float)
-        if len(pts_arr) == 2:
-            p0, p1 = pts_arr[0], pts_arr[1]
-            out_features.append(
-                {
-                    "type": "Feature",
-                    "geometry": {
-                        "type": "LineString",
-                        "coordinates": [[float(p0[0]), float(p0[1])], [float(p1[0]), float(p1[1])]],
-                    },
-                    "properties": {
-                        "cluster_id": cluster_key,
-                        "edge_type": "voronoi_station_local",
-                        "group_mode": "cluster_or_fallback",
-                        "source_i": 0,
-                        "target_i": 1,
-                    },
-                }
-            )
-            continue
-        try:
-            vor = Voronoi(pts_arr)
-            map_idx = {i: i for i in range(len(pts_arr))}
-        except Exception:
-            uniq, uniq_idx = np.unique(pts_arr, axis=0, return_index=True)
-            if len(uniq) < 3:
-                continue
-            try:
-                vor = Voronoi(uniq)
-                map_idx = {new_i: int(orig_i) for new_i, orig_i in enumerate(uniq_idx.tolist())}
-            except Exception:
-                continue
-
-        seen = set()
-        for ridge in vor.ridge_points:
-            i_raw, j_raw = int(ridge[0]), int(ridge[1])
-            if i_raw not in map_idx or j_raw not in map_idx:
-                continue
-            i, j = map_idx[i_raw], map_idx[j_raw]
-            if i == j:
-                continue
-            a, b = (i, j) if i < j else (j, i)
-            if (a, b) in seen:
-                continue
-            seen.add((a, b))
-            pa, pb = pts_arr[a], pts_arr[b]
-            out_features.append(
-                {
-                    "type": "Feature",
-                    "geometry": {
-                        "type": "LineString",
-                        "coordinates": [[float(pa[0]), float(pa[1])], [float(pb[0]), float(pb[1])]],
-                    },
-                    "properties": {
-                        "cluster_id": cluster_key,
-                        "edge_type": "voronoi_station_local",
-                        "group_mode": "cluster_or_fallback",
-                        "source_i": int(a),
-                        "target_i": int(b),
-                    },
-                }
-            )
-
-    return {"type": "FeatureCollection", "features": out_features}
-
-
-def _build_voronoi_edges_from_pipeline_raw(
-    raw: dict,
-    charging_station_features: list | None = None,
-    buildings_per_centroid: int = 60,
-) -> dict:
-    """
-    Быстрый Вороной без повторного data_service.get_city_data:
-    используем demand из уже выполненного run_full_pipeline.
-    """
-    try:
-        from scipy.spatial import Voronoi
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Scipy Voronoi недоступен: {e}")
-
-    demand = raw.get("demand")
-    if demand is None or len(demand) == 0:
-        return {"type": "FeatureCollection", "features": []}
-    d = demand.copy()
-    if "is_cluster_fill" in d.columns:
-        d = d[~d["is_cluster_fill"].fillna(False).astype(bool)].copy()
-    if len(d) == 0:
-        return {"type": "FeatureCollection", "features": []}
-
-    if "cluster_id" not in d.columns:
-        if "subcluster_id" in d.columns:
-            d["cluster_id"] = d["subcluster_id"]
-        else:
-            return {"type": "FeatureCollection", "features": []}
-    d = d[d["cluster_id"].notna()].copy()
-    if len(d) == 0:
-        return {"type": "FeatureCollection", "features": []}
-
-    # Базовые точки по кластерам из demand (часто по 1 точке на кластер).
-    grouped_points: dict[str, list[list[float]]] = {}
-    for cluster_id, sub in d.groupby("cluster_id"):
-        pts = []
-        for _, row in sub.iterrows():
-            g = row.get("geometry")
-            if g is None or g.is_empty:
-                continue
-            try:
-                pts.append([float(g.x), float(g.y)])
-            except Exception:
-                continue
-        if pts:
-            grouped_points[str(cluster_id)] = pts
-
-    # Если в demand по кластерам в основном по 1 точке, строим точки из зданий:
-    # каждое здание привязываем к ближайшему demand-центроиду его кластера.
-    if not any(len(pts) >= 2 for pts in grouped_points.values()):
-        buildings = raw.get("buildings")
-        if buildings is not None and len(buildings) > 0 and len(grouped_points) > 0:
-            try:
-                try:
-                    from scipy.spatial import cKDTree
-                except Exception:
-                    cKDTree = None
-
-                b = buildings.to_crs("EPSG:4326").copy()
-                try:
-                    b = data_service._filter_buildings_for_demand(b)
-                except Exception:
-                    pass
-                if b is not None and len(b) > 0:
-                    b_proj = b.to_crs(epsg=3857)
-                    b_centroids_wgs = gpd.GeoSeries(b_proj.geometry.centroid, crs=b_proj.crs).to_crs("EPSG:4326")
-                    b_pts = np.array([[float(g.x), float(g.y)] for g in b_centroids_wgs if g is not None and not g.is_empty], dtype=float)
-
-                    cluster_keys = list(grouped_points.keys())
-                    centroid_pts = np.array([grouped_points[k][0] for k in cluster_keys], dtype=float)
-                    assigned: dict[str, list[list[float]]] = {k: [] for k in cluster_keys}
-                    if len(b_pts) > 0 and len(centroid_pts) > 0:
-                        if cKDTree is not None:
-                            tree = cKDTree(centroid_pts)
-                            _, idx = tree.query(b_pts, k=1)
-                            for p, j in zip(b_pts, idx):
-                                assigned[cluster_keys[int(j)]].append([float(p[0]), float(p[1])])
-                        else:
-                            for p in b_pts:
-                                d2 = np.sum((centroid_pts - p) ** 2, axis=1)
-                                j = int(np.argmin(d2))
-                                assigned[cluster_keys[j]].append([float(p[0]), float(p[1])])
-                        grouped_points = assigned
-            except Exception:
-                pass
-
-    charging_by_cluster: dict[str, list[list[float]]] = {}
-    if charging_station_features:
-        for f in charging_station_features:
-            geom = (f or {}).get("geometry") or {}
-            if geom.get("type") != "Point":
-                continue
-            coords = geom.get("coordinates") or []
-            if len(coords) < 2:
-                continue
-            props = (f or {}).get("properties") or {}
-            cid = props.get("cluster_id")
-            if cid is None:
-                continue
-            charging_by_cluster.setdefault(str(cid), []).append([float(coords[0]), float(coords[1])])
-
-    target_group_size = max(1, int(buildings_per_centroid or 60))
-    out_features = []
-    for cluster_id, pts in grouped_points.items():
-        if len(pts) < 2:
-            continue
-
-        pts_arr = np.asarray(pts, dtype=float)
-        if len(pts_arr) > target_group_size:
-            n_groups = int(np.ceil(len(pts_arr) / float(target_group_size)))
-            n_groups = max(2, min(n_groups, len(pts_arr)))
-            try:
-                from sklearn.cluster import MiniBatchKMeans
-
-                km = MiniBatchKMeans(
-                    n_clusters=n_groups,
-                    random_state=42,
-                    batch_size=min(4096, max(1024, len(pts_arr) // 3)),
-                    n_init=3,
-                    max_iter=200,
-                )
-                labels = km.fit_predict(pts_arr)
-                centers = []
-                for k in range(n_groups):
-                    members = pts_arr[labels == k]
-                    if len(members) > 0:
-                        centers.append(members.mean(axis=0))
-                if len(centers) >= 2:
-                    pts_arr = np.asarray(centers, dtype=float)
-            except Exception:
-                pass
-
-        st_pts = charging_by_cluster.get(str(cluster_id), [])
-        if st_pts:
-            st_arr = np.asarray(st_pts, dtype=float)
-            if len(st_arr) > 0:
-                pts_arr = np.vstack([pts_arr, st_arr])
-                pts_arr = np.unique(pts_arr, axis=0)
-
-        if len(pts_arr) < 2:
-            continue
-        if len(pts_arr) == 2:
-            p0, p1 = pts_arr[0], pts_arr[1]
-            out_features.append(
-                {
-                    "type": "Feature",
-                    "geometry": {"type": "LineString", "coordinates": [[float(p0[0]), float(p0[1])], [float(p1[0]), float(p1[1])]]},
-                    "properties": {"cluster_id": str(cluster_id), "edge_type": "voronoi_local", "source_i": 0, "target_i": 1},
-                }
-            )
-            continue
-
-        try:
-            vor = Voronoi(pts_arr)
-            map_idx = {i: i for i in range(len(pts_arr))}
-        except Exception:
-            uniq, uniq_idx = np.unique(pts_arr, axis=0, return_index=True)
-            if len(uniq) < 3:
-                continue
-            try:
-                vor = Voronoi(uniq)
-                map_idx = {new_i: int(orig_i) for new_i, orig_i in enumerate(uniq_idx.tolist())}
-            except Exception:
-                continue
-
-        seen = set()
-        for ridge in vor.ridge_points:
-            i_raw, j_raw = int(ridge[0]), int(ridge[1])
-            if i_raw not in map_idx or j_raw not in map_idx:
-                continue
-            i, j = map_idx[i_raw], map_idx[j_raw]
-            if i == j:
-                continue
-            a, b = (i, j) if i < j else (j, i)
-            if (a, b) in seen:
-                continue
-            seen.add((a, b))
-            pa, pb = pts_arr[a], pts_arr[b]
-            out_features.append(
-                {
-                    "type": "Feature",
-                    "geometry": {"type": "LineString", "coordinates": [[float(pa[0]), float(pa[1])], [float(pb[0]), float(pb[1])]]},
-                    "properties": {"cluster_id": str(cluster_id), "edge_type": "voronoi_local", "source_i": int(a), "target_i": int(b)},
-                }
-            )
-    return {"type": "FeatureCollection", "features": out_features}
 
 
 def _placement_cache_key(
@@ -750,7 +50,7 @@ def _placement_cache_key(
         "candidates_per_cluster": int(candidates_per_cluster),
         # Смена версии сбрасывает устаревший Redis-кэш (иначе после правок пайплайна
         # клиент может бесконечно получать пустой сохранённый ответ).
-        "placement_schema": 13,
+        "placement_schema": 14,
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()
@@ -1083,7 +383,8 @@ def get_voronoi_local_paths(
         return obj
 
     try:
-        raw_fc = _build_voronoi_local_paths_fc(
+        raw_fc = build_voronoi_local_paths_fc(
+            data_service,
             city=city,
             network_type=network_type,
             simplify=simplify,
@@ -1119,46 +420,62 @@ def get_stations_placement(
     buildings_per_centroid: int = Query(60, description="Сколько зданий агрегировать в 1 центроид для Вороного"),
 ):
     """
-    Временный режим: по кнопке «Рассчитать зарядки» строим только слой Вороного.
+    Полный пайплайн размещения + слой Вороного по кластерам с сайтами станций (cluster_id).
+    Кэш в Redis — JSON ответа для карты.
     """
+    cache_key = _placement_cache_key(
+        city=city,
+        network_type=network_type,
+        simplify=simplify,
+        demand_method=demand_method,
+        dbscan_eps_m=dbscan_eps_m,
+        dbscan_min_samples=dbscan_min_samples,
+        a_by_admin_districts=a_by_admin_districts,
+        candidates_per_cluster=candidates_per_cluster,
+    )
+    redis_client = data_service.get_redis_client()
+
+    if only_saved:
+        if redis_client is None:
+            raise HTTPException(status_code=503, detail="Redis недоступен")
+        cached = redis_client.get(cache_key)
+        if not cached:
+            raise HTTPException(status_code=404, detail="Нет сохранённой расстановки")
+        return JSONResponse(json.loads(cached.decode("utf-8")))
+
+    if use_saved and redis_client is not None:
+        cached = redis_client.get(cache_key)
+        if cached:
+            data = json.loads(cached.decode("utf-8"))
+            data["from_saved"] = True
+            return JSONResponse(data)
+
     try:
-        logger.info("Этап 2/5: Отрисовка локальных маршрутов Вороного")
-        vor_fc = _build_voronoi_local_paths_fc(
-            city,
+        logger.info("Пайплайн размещения + Вороной по кластерам со станциями")
+        raw = run_full_pipeline(
+            data_service,
+            city.strip(),
             network_type=network_type,
             simplify=simplify,
+            demand_method=demand_method,
             dbscan_eps_m=dbscan_eps_m,
             dbscan_min_samples=dbscan_min_samples,
-            use_all_buildings=False,
-            buildings_per_centroid=buildings_per_centroid,
-            charging_station_features=None,
+            candidates_per_cluster=candidates_per_cluster,
+            a_by_admin_districts=a_by_admin_districts,
+            voronoi_buildings_per_centroid=buildings_per_centroid,
         )
-        n_vor = len((vor_fc or {}).get("features", []) or [])
-        logger.info("Этап 2/5 завершён: рёбер Вороного=%s", n_vor)
-        empty_fc = {"type": "FeatureCollection", "features": []}
-        geo = {
-            "charging_type_a": empty_fc,
-            "charging_type_b": empty_fc,
-            "garages": empty_fc,
-            "to_stations": empty_fc,
-            "trunk": empty_fc,
-            "branch_edges": empty_fc,
-            "local_edges": empty_fc,
-            "voronoi_edges": {"type": "FeatureCollection", "features": list((vor_fc or {}).get("features", []) or [])},
-            "metrics": {
-                "coverage_ratio": None,
-                "cluster_count": int(vor_fc.get("clusters_total", 0) if isinstance(vor_fc, dict) else 0),
-                "charging_buildings_in_clusters": None,
-            },
-            "params": {
-                "local_paths_source": "voronoi_buildings_only",
-                "station_voronoi_buildings_per_centroid": int(buildings_per_centroid),
-                "stages_disabled_except_voronoi": True,
-            },
-            "cluster_centroids": empty_fc,
-            "from_saved": False,
-        }
-        logger.info("Этап 5/5: Конец")
+        geo = pipeline_result_to_geojson(raw)
+        geo["from_saved"] = False
+        n_vor = len((geo.get("voronoi_edges") or {}).get("features", []) or [])
+        logger.info("Пайплайн завершён: рёбер Вороного=%s", n_vor)
+        if save_result and redis_client is not None:
+            try:
+                redis_client.set(
+                    cache_key,
+                    json.dumps(geo, ensure_ascii=False).encode("utf-8"),
+                )
+            except Exception as e:
+                logger.warning("Не удалось сохранить расстановку в Redis: %s", e)
         return JSONResponse(geo)
     except Exception as e:
         logger.exception("stations placement")
