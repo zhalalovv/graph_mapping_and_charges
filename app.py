@@ -55,6 +55,7 @@ def _voronoi_only_placement_payload(
     candidates_per_cluster: int,
     buildings_per_centroid: int,
     inter_cluster_max_hull_gap_m: float,
+    inter_cluster_max_edge_length_m: float,
     from_saved: bool,
 ) -> dict:
     """Ответ в формате `/api/stations/placement`, но только слой локальных путей Вороного."""
@@ -68,6 +69,7 @@ def _voronoi_only_placement_payload(
         use_all_buildings=use_all_buildings,
         buildings_per_centroid=buildings_per_centroid,
         inter_cluster_max_hull_gap_m=inter_cluster_max_hull_gap_m,
+        inter_cluster_max_edge_length_m=inter_cluster_max_edge_length_m,
     )
     feats = raw_fc.get("features") or []
     vor_fc = {
@@ -103,6 +105,7 @@ def _voronoi_only_placement_payload(
             "candidates_per_cluster": candidates_per_cluster,
             "buildings_per_centroid": buildings_per_centroid,
             "inter_cluster_max_hull_gap_m": inter_cluster_max_hull_gap_m,
+            "inter_cluster_max_edge_length_m": inter_cluster_max_edge_length_m,
             "pipeline_mode": "voronoi_local_paths_only",
         },
         "cluster_centroids": empty(),
@@ -120,6 +123,7 @@ def _placement_cache_key(
     a_by_admin_districts: bool,
     candidates_per_cluster: int,
     inter_cluster_max_hull_gap_m: float,
+    inter_cluster_max_edge_length_m: float,
 ) -> str:
     payload = {
         "city": city.strip(),
@@ -131,9 +135,10 @@ def _placement_cache_key(
         "a_by_admin_districts": bool(a_by_admin_districts),
         "candidates_per_cluster": int(candidates_per_cluster),
         "inter_cluster_max_hull_gap_m": float(inter_cluster_max_hull_gap_m),
+        "inter_cluster_max_edge_length_m": float(inter_cluster_max_edge_length_m),
         # Смена версии сбрасывает устаревший Redis-кэш (иначе после правок пайплайна
         # клиент может бесконечно получать пустой сохранённый ответ).
-        "placement_schema": 16,
+        "placement_schema": 17,
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()
@@ -451,8 +456,12 @@ def get_voronoi_local_paths(
     use_all_buildings: bool = Query(False, description="Все здания вне no-fly"),
     buildings_per_centroid: int = Query(60, description="Сколько зданий агрегировать в 1 центроид для Вороного"),
     inter_cluster_max_hull_gap_m: float = Query(
-        45.0,
-        description="Макс. зазор между hull соседних кластеров (м) для межкластерных рёбер Вороного",
+        2000.0,
+        description="Макс. зазор между hull кластеров (м), при котором разрешены межкластерные связи (дорога, пустырь)",
+    ),
+    inter_cluster_max_edge_length_m: float = Query(
+        2000.0,
+        description="Макс. длина одного межкластерного отрезка (м); защита от длинных перебросов",
     ),
 ):
     """
@@ -471,6 +480,7 @@ def get_voronoi_local_paths(
             use_all_buildings=use_all_buildings,
             buildings_per_centroid=buildings_per_centroid,
             inter_cluster_max_hull_gap_m=inter_cluster_max_hull_gap_m,
+            inter_cluster_max_edge_length_m=inter_cluster_max_edge_length_m,
         )
         fc = _round_geojson_coords(raw_fc, precision=6)
         return JSONResponse(
@@ -498,8 +508,12 @@ def get_stations_placement(
     save_result: bool = Query(True, description="Сохранять новую расстановку в Redis"),
     buildings_per_centroid: int = Query(60, description="Сколько зданий агрегировать в 1 центроид для Вороного"),
     inter_cluster_max_hull_gap_m: float = Query(
-        45.0,
-        description="Макс. зазор между hull соседних кластеров (м), при котором рисуем межкластерные рёбра Вороного",
+        2000.0,
+        description="Макс. зазор между hull кластеров (м) для межкластерных рёбер",
+    ),
+    inter_cluster_max_edge_length_m: float = Query(
+        2000.0,
+        description="Макс. длина межкластерного отрезка (м)",
     ),
 ):
     """
@@ -516,6 +530,7 @@ def get_stations_placement(
         a_by_admin_districts=a_by_admin_districts,
         candidates_per_cluster=candidates_per_cluster,
         inter_cluster_max_hull_gap_m=inter_cluster_max_hull_gap_m,
+        inter_cluster_max_edge_length_m=inter_cluster_max_edge_length_m,
     )
     redis_client = data_service.get_redis_client()
 
@@ -548,6 +563,7 @@ def get_stations_placement(
             candidates_per_cluster=candidates_per_cluster,
             buildings_per_centroid=buildings_per_centroid,
             inter_cluster_max_hull_gap_m=inter_cluster_max_hull_gap_m,
+            inter_cluster_max_edge_length_m=inter_cluster_max_edge_length_m,
             from_saved=False,
         )
         n_vor = len((geo.get("voronoi_edges") or {}).get("features", []) or [])
@@ -577,8 +593,12 @@ def export_saved_stations(
     a_by_admin_districts: bool = Query(True, description="Режим размещения A по районам/группам"),
     candidates_per_cluster: int = Query(25, description="Кандидатов на кластер при выборе точек зарядки"),
     inter_cluster_max_hull_gap_m: float = Query(
-        45.0,
-        description="Должен совпадать с параметром при сохранении (межкластерные рёбра Вороного)",
+        2000.0,
+        description="Должен совпадать с параметром при сохранении",
+    ),
+    inter_cluster_max_edge_length_m: float = Query(
+        2000.0,
+        description="Должен совпадать с параметром при сохранении",
     ),
 ):
     """Выгрузка сохраненной расстановки станций из Redis в JSON."""
@@ -595,6 +615,7 @@ def export_saved_stations(
         a_by_admin_districts=a_by_admin_districts,
         candidates_per_cluster=candidates_per_cluster,
         inter_cluster_max_hull_gap_m=inter_cluster_max_hull_gap_m,
+        inter_cluster_max_edge_length_m=inter_cluster_max_edge_length_m,
     )
     try:
         cached = redis_client.get(cache_key)

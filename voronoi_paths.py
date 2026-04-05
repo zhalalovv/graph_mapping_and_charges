@@ -420,6 +420,99 @@ def _canonical_cluster_pair_key(cid_a: Any, cid_b: Any) -> tuple[str, str]:
     return tuple(sorted((str(cid_a), str(cid_b))))
 
 
+def _segment_length_m(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
+    """Длина отрезка в метрах (локально equirectangular по средней широте)."""
+    lat0 = 0.5 * (lat1 + lat2)
+    m_lat = 111_320.0
+    m_lon = 111_320.0 * float(np.cos(np.radians(lat0)))
+    return float(np.hypot((lon2 - lon1) * m_lon, (lat2 - lat1) * m_lat))
+
+
+def _inter_cluster_pairs_present(features: list[dict]) -> set[tuple[str, str]]:
+    """Уже есть хотя бы одно межкластерное ребро между этой парой cluster_id."""
+    out: set[tuple[str, str]] = set()
+    for f in features:
+        p = f.get("properties") or {}
+        if not p.get("inter_cluster"):
+            continue
+        cid = p.get("cluster_id")
+        if isinstance(cid, str) and "|" in cid:
+            parts = cid.split("|")
+            if len(parts) == 2:
+                out.add(tuple(sorted((parts[0], parts[1]))))
+    return out
+
+
+def _add_shortest_bridges_for_allowed_pairs(
+    features: list[dict],
+    coords: np.ndarray,
+    flags: np.ndarray,
+    cluster_per_point: list[Any],
+    allowed_pair_keys: set[tuple[str, str]],
+    max_edge_m: float,
+) -> None:
+    """
+    Если для пары кластеров из allowed_pair_keys Delaunay не дал ни одного ребра,
+    добавляет отрезок между ближайшими сайтами (длина <= max_edge_m).
+    """
+    if max_edge_m <= 0 or not allowed_pair_keys:
+        return
+    by_c: dict[str, list[int]] = {}
+    for i, c in enumerate(cluster_per_point):
+        key = str(c)
+        by_c.setdefault(key, []).append(i)
+    have = _inter_cluster_pairs_present(features)
+    for a, b in allowed_pair_keys:
+        pk = tuple(sorted((a, b)))
+        if pk in have:
+            continue
+        ia = by_c.get(a, [])
+        ib = by_c.get(b, [])
+        if not ia or not ib:
+            continue
+        best_i, best_j = -1, -1
+        best_d = float("inf")
+        for i in ia:
+            pi = coords[i]
+            for j in ib:
+                pj = coords[j]
+                d = _segment_length_m(float(pi[0]), float(pi[1]), float(pj[0]), float(pj[1]))
+                if d < best_d:
+                    best_d = d
+                    best_i, best_j = i, j
+        if best_i < 0 or best_d > max_edge_m:
+            continue
+        pi = coords[best_i]
+        pj = coords[best_j]
+        ca, cb = cluster_per_point[best_i], cluster_per_point[best_j]
+        cid_prop = _inter_cluster_pair_label(ca, cb)
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": [
+                        [float(pi[0]), float(pi[1])],
+                        [float(pj[0]), float(pj[1])],
+                    ],
+                },
+                "properties": {
+                    **_station_edge_props(
+                        cid_prop,
+                        "voronoi_local",
+                        best_i,
+                        best_j,
+                        flags,
+                        group_mode=None,
+                    ),
+                    "inter_cluster": True,
+                    "bridge_gap_fill": True,
+                },
+            }
+        )
+        have.add(pk)
+
+
 def _bordering_cluster_pair_keys(
     hulls_norm: gpd.GeoDataFrame | None,
     *,
@@ -498,12 +591,14 @@ def _append_voronoi_edges_global(
     edge_type: str = "voronoi_local",
     *,
     bordering_pair_keys: set[tuple[str, str]] | None = None,
+    inter_cluster_max_edge_length_m: float | None = None,
 ) -> bool:
     """
     Один Voronoi по всем сайтам: рёбра — пары ridge_points (как у Делоне).
     Отрезок всегда между двумя сайтами целиком (без обрезки по hull), в т.ч. внутри одного кластера —
     чтобы линии не обрывались на границе полигона.
-    Межкластерные рёбра — только если пара в bordering_pair_keys (смежные hull / маленький зазор).
+    Межкластерные рёбра — только если пара в bordering_pair_keys (смежные hull / зазор до порога),
+    и длина отрезка не больше inter_cluster_max_edge_length_m (если задано).
     """
     Voronoi = _require_voronoi()
     n0 = len(features)
@@ -529,6 +624,12 @@ def _append_voronoi_edges_global(
             pk = _canonical_cluster_pair_key(c0, c1)
             if bordering_pair_keys is not None and pk not in bordering_pair_keys:
                 return len(features) > n0
+            if inter_cluster_max_edge_length_m is not None and inter_cluster_max_edge_length_m > 0:
+                sl = _segment_length_m(
+                    float(p0[0]), float(p0[1]), float(p1[0]), float(p1[1])
+                )
+                if sl > inter_cluster_max_edge_length_m:
+                    return len(features) > n0
             clipped = [[float(p0[0]), float(p0[1])], [float(p1[0]), float(p1[1])]]
             cid_prop = _inter_cluster_pair_label(c0, c1)
         if clipped is None or len(clipped) < 2:
@@ -585,6 +686,7 @@ def _append_voronoi_edges_global(
                     hulls_norm,
                     edge_type=edge_type,
                     bordering_pair_keys=bordering_pair_keys,
+                    inter_cluster_max_edge_length_m=inter_cluster_max_edge_length_m,
                 )
             try:
                 vor = Voronoi(coords)
@@ -618,6 +720,12 @@ def _append_voronoi_edges_global(
             pk = _canonical_cluster_pair_key(ca, cb)
             if bordering_pair_keys is not None and pk not in bordering_pair_keys:
                 continue
+            if inter_cluster_max_edge_length_m is not None and inter_cluster_max_edge_length_m > 0:
+                sl = _segment_length_m(
+                    float(pi[0]), float(pi[1]), float(pj[0]), float(pj[1])
+                )
+                if sl > inter_cluster_max_edge_length_m:
+                    continue
             clipped = [
                 [float(pi[0]), float(pi[1])],
                 [float(pj[0]), float(pj[1])],
@@ -648,7 +756,8 @@ def build_voronoi_local_paths_fc(
     use_all_buildings: bool,
     buildings_per_centroid: int = 60,
     charging_station_features: list | None = None,
-    inter_cluster_max_hull_gap_m: float = 45.0,
+    inter_cluster_max_hull_gap_m: float = 2000.0,
+    inter_cluster_max_edge_length_m: float = 2000.0,
 ) -> dict:
     _require_voronoi()
 
@@ -880,6 +989,8 @@ def build_voronoi_local_paths_fc(
     bordering_keys = _bordering_cluster_pair_keys(
         hulls_norm, max_boundary_gap_m=float(inter_cluster_max_hull_gap_m)
     )
+    cap_edge = float(inter_cluster_max_edge_length_m)
+    edge_cap: float | None = cap_edge if cap_edge > 0 else None
     _append_voronoi_edges_global(
         features,
         coords_g,
@@ -888,6 +999,15 @@ def build_voronoi_local_paths_fc(
         hulls_norm,
         "voronoi_local",
         bordering_pair_keys=bordering_keys,
+        inter_cluster_max_edge_length_m=edge_cap,
+    )
+    _add_shortest_bridges_for_allowed_pairs(
+        features,
+        coords_g,
+        flags_g,
+        all_cluster,
+        bordering_keys,
+        max_edge_m=cap_edge,
     )
 
     deduped = dedupe_close_parallel_voronoi_edges(
