@@ -239,7 +239,7 @@
                 onclick="toggleBuildings()"
                 title="Включить/выключить отображение зданий по высоте"
             >
-                <span id="buildingsLabel">Скрыть здания</span>
+                <span id="buildingsLabel">Показать здания</span>
             </button>
         </div>
     </div>
@@ -252,7 +252,7 @@
         let voronoiPathsLayer = null;
         let clusterHullsVisible = true;
         let clusterPointsVisible = false; // точки кластеров (центроиды/точки спроса) по умолчанию скрыты
-        let buildingsVisible = true;
+        let buildingsVisible = false; // по умолчанию здания не показываем, пока пользователь не включит
         let trunkLinesVisible = true;
         let localLinesVisible = true;
         let voronoiPathsVisible = true;
@@ -361,8 +361,9 @@
                 };
                 
                 buildingsLayer = L.geoJSON(geojson, layerOptions);
-                buildingsLayer.addTo(map);
-                buildingsVisible = true;
+                if (buildingsVisible) {
+                    buildingsLayer.addTo(map);
+                }
                 updateBuildingsButtonLabel();
                 console.log('✓ Здания по высоте: ' + data.features.length);
             } catch (error) {
