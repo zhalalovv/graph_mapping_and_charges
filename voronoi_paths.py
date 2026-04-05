@@ -405,6 +405,239 @@ def _append_voronoi_edges_for_cluster(
     return len(features) > n0
 
 
+def _cluster_label_for_props(cid: Any) -> Any:
+    if isinstance(cid, (int, np.integer)):
+        return int(cid)
+    return str(cid)
+
+
+def _inter_cluster_pair_label(cid_a: Any, cid_b: Any) -> str:
+    sa, sb = sorted((str(cid_a), str(cid_b)))
+    return f"{sa}|{sb}"
+
+
+def _canonical_cluster_pair_key(cid_a: Any, cid_b: Any) -> tuple[str, str]:
+    return tuple(sorted((str(cid_a), str(cid_b))))
+
+
+def _bordering_cluster_pair_keys(
+    hulls_norm: gpd.GeoDataFrame | None,
+    *,
+    max_boundary_gap_m: float = 45.0,
+) -> set[tuple[str, str]]:
+    """
+    Пары cluster_id, у которых полигоны hull в EPSG:3857 касаются или разделены не больше max_boundary_gap_m.
+    Так отсекаются длинные рёбра Делоне между далёкими кластерами (через реку и т.п.).
+    """
+    if hulls_norm is None or len(hulls_norm) < 2:
+        return set()
+    try:
+        h = hulls_norm.to_crs(epsg=3857)
+    except Exception:
+        return set()
+    out: set[tuple[str, str]] = set()
+    ids: list[str] = [str(x) for x in h["cluster_id"].tolist()]
+    geoms: list = []
+    for g in h.geometry:
+        if g is None or getattr(g, "is_empty", True):
+            geoms.append(None)
+            continue
+        try:
+            geoms.append(g.buffer(0))
+        except Exception:
+            geoms.append(g)
+    tol = float(max_boundary_gap_m)
+    n = len(ids)
+    for i in range(n):
+        gi = geoms[i]
+        if gi is None:
+            continue
+        for j in range(i + 1, n):
+            gj = geoms[j]
+            if gj is None:
+                continue
+            if ids[i] == ids[j]:
+                continue
+            try:
+                d = float(gi.distance(gj))
+            except Exception:
+                continue
+            if d <= tol:
+                out.add(tuple(sorted((ids[i], ids[j]))))
+    return out
+
+
+def _separate_coincident_sites(coords: np.ndarray) -> np.ndarray:
+    """Сдвигает дубликаты координат на ~0.5 m, чтобы сайты разных кластеров не схлопывались в одном Voronoi."""
+    c = np.asarray(coords, dtype=float).copy()
+    if len(c) <= 1:
+        return c
+    ref_lat = float(np.mean(c[:, 1]))
+    m_per_deg_lat = 111_320.0
+    m_per_deg_lon = max(111_320.0 * np.cos(np.radians(ref_lat)), 1e-3)
+    step_lat = 0.5 / m_per_deg_lat
+    step_lon = 0.5 / m_per_deg_lon
+    seen: dict[tuple[float, float], int] = {}
+    for i in range(len(c)):
+        key = (round(float(c[i, 0]), 9), round(float(c[i, 1]), 9))
+        n = seen.get(key, 0)
+        if n > 0:
+            k = n
+            c[i, 0] += (k // 4) * step_lon
+            c[i, 1] += (k % 4) * step_lat
+        seen[key] = n + 1
+    return c
+
+
+def _append_voronoi_edges_global(
+    features: list[dict],
+    pts_arr: np.ndarray,
+    is_station: np.ndarray,
+    cluster_per_point: list[Any],
+    hulls_norm: gpd.GeoDataFrame | None,
+    edge_type: str = "voronoi_local",
+    *,
+    bordering_pair_keys: set[tuple[str, str]] | None = None,
+) -> bool:
+    """
+    Один Voronoi по всем сайтам: рёбра — пары ridge_points (как у Делоне).
+    Отрезок всегда между двумя сайтами целиком (без обрезки по hull), в т.ч. внутри одного кластера —
+    чтобы линии не обрывались на границе полигона.
+    Межкластерные рёбра — только если пара в bordering_pair_keys (смежные hull / маленький зазор).
+    """
+    Voronoi = _require_voronoi()
+    n0 = len(features)
+
+    if len(pts_arr) < 2:
+        return False
+
+    c_labels = list(cluster_per_point)
+    if len(c_labels) != len(pts_arr):
+        return False
+
+    if len(pts_arr) == 2:
+        coords2 = _separate_coincident_sites(np.asarray(pts_arr, dtype=float))
+        p0, p1 = coords2[0], coords2[1]
+        c0, c1 = c_labels[0], c_labels[1]
+        flags = np.asarray(is_station, dtype=bool)
+        if len(flags) != 2:
+            flags = np.array([False, False], dtype=bool)
+        if str(c0) == str(c1):
+            clipped = [[float(p0[0]), float(p0[1])], [float(p1[0]), float(p1[1])]]
+            cid_prop = _cluster_label_for_props(c0)
+        else:
+            pk = _canonical_cluster_pair_key(c0, c1)
+            if bordering_pair_keys is not None and pk not in bordering_pair_keys:
+                return len(features) > n0
+            clipped = [[float(p0[0]), float(p0[1])], [float(p1[0]), float(p1[1])]]
+            cid_prop = _inter_cluster_pair_label(c0, c1)
+        if clipped is None or len(clipped) < 2:
+            return False
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": {"type": "LineString", "coordinates": clipped},
+                "properties": {
+                    **_station_edge_props(cid_prop, edge_type, 0, 1, flags, group_mode=None),
+                    "inter_cluster": str(c0) != str(c1),
+                },
+            }
+        )
+        return True
+
+    coords = _separate_coincident_sites(np.asarray(pts_arr, dtype=float))
+    flags = np.asarray(is_station, dtype=bool)
+    labels = list(c_labels)
+    if len(flags) != len(coords):
+        flags = np.zeros(len(coords), dtype=bool)
+
+    map_idx: dict[int, int] = {i: i for i in range(len(coords))}
+    try:
+        vor = Voronoi(coords)
+    except Exception:
+        rng = np.random.default_rng(42)
+        coords = coords + (rng.random(coords.shape) - 0.5) * 1e-6
+        try:
+            vor = Voronoi(coords)
+        except Exception:
+            uniq, inv = np.unique(coords, axis=0, return_inverse=True)
+            if len(uniq) < 2:
+                return False
+            fu = np.zeros(len(uniq), dtype=bool)
+            lab_u: list[Any] = [None] * len(uniq)
+            for k in range(len(flags)):
+                u = int(inv[k])
+                fu[u] |= bool(flags[k])
+                if lab_u[u] is None:
+                    lab_u[u] = labels[k]
+            if any(x is None for x in lab_u):
+                return False
+            coords = uniq
+            flags = fu
+            labels = lab_u
+            map_idx = {i: i for i in range(len(coords))}
+            if len(coords) == 2:
+                return _append_voronoi_edges_global(
+                    features,
+                    coords,
+                    flags,
+                    labels,
+                    hulls_norm,
+                    edge_type=edge_type,
+                    bordering_pair_keys=bordering_pair_keys,
+                )
+            try:
+                vor = Voronoi(coords)
+            except Exception:
+                return False
+
+    seen_pairs: set[tuple[int, int]] = set()
+    for ridge in vor.ridge_points:
+        i_raw, j_raw = int(ridge[0]), int(ridge[1])
+        if i_raw not in map_idx or j_raw not in map_idx:
+            continue
+        i = map_idx[i_raw]
+        j = map_idx[j_raw]
+        if i == j:
+            continue
+        a, b = (i, j) if i < j else (j, i)
+        if (a, b) in seen_pairs:
+            continue
+        seen_pairs.add((a, b))
+        pi = coords[a]
+        pj = coords[b]
+        ca, cb = labels[a], labels[b]
+        same = str(ca) == str(cb)
+        if same:
+            clipped = [
+                [float(pi[0]), float(pi[1])],
+                [float(pj[0]), float(pj[1])],
+            ]
+            cid_prop = _cluster_label_for_props(ca)
+        else:
+            pk = _canonical_cluster_pair_key(ca, cb)
+            if bordering_pair_keys is not None and pk not in bordering_pair_keys:
+                continue
+            clipped = [
+                [float(pi[0]), float(pi[1])],
+                [float(pj[0]), float(pj[1])],
+            ]
+            cid_prop = _inter_cluster_pair_label(ca, cb)
+        if clipped is None or len(clipped) < 2:
+            continue
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": {"type": "LineString", "coordinates": clipped},
+                "properties": {
+                    **_station_edge_props(cid_prop, edge_type, a, b, flags, group_mode=None),
+                    "inter_cluster": not same,
+                },
+            }
+        )
+    return len(features) > n0
+
+
 def build_voronoi_local_paths_fc(
     data_service: DataService,
     city: str,
@@ -415,6 +648,7 @@ def build_voronoi_local_paths_fc(
     use_all_buildings: bool,
     buildings_per_centroid: int = 60,
     charging_station_features: list | None = None,
+    inter_cluster_max_hull_gap_m: float = 45.0,
 ) -> dict:
     _require_voronoi()
 
@@ -558,12 +792,13 @@ def build_voronoi_local_paths_fc(
     target_group_size = max(1, int(buildings_per_centroid or 20))
     features: list[dict] = []
     clusters_total = 0
-    clusters_with_paths = 0
+    all_coords: list[list[float]] = []
+    all_flags: list[bool] = []
+    all_cluster: list[Any] = []
 
     for group_id, sub in assigned.groupby("cluster_id"):
         if sub is None or len(sub) < 2:
             continue
-        clusters_total += 1
 
         pts = []
         for _, row in sub.iterrows():
@@ -625,10 +860,35 @@ def build_voronoi_local_paths_fc(
 
         if len(pts_arr) < 2:
             continue
-        if _append_voronoi_edges_for_cluster(
-            features, pts_arr, is_station, group_id, "voronoi_local", hull_poly=hull_poly
-        ):
-            clusters_with_paths += 1
+        clusters_total += 1
+        for k in range(len(pts_arr)):
+            all_coords.append([float(pts_arr[k, 0]), float(pts_arr[k, 1])])
+            all_flags.append(bool(is_station[k]))
+            all_cluster.append(group_id)
+
+    if len(all_coords) < 2:
+        return {
+            "type": "FeatureCollection",
+            "features": [],
+            "clusters_total": int(clusters_total),
+            "clusters_with_paths": 0,
+            "edges_total": 0,
+        }
+
+    coords_g = np.asarray(all_coords, dtype=float)
+    flags_g = np.asarray(all_flags, dtype=bool)
+    bordering_keys = _bordering_cluster_pair_keys(
+        hulls_norm, max_boundary_gap_m=float(inter_cluster_max_hull_gap_m)
+    )
+    _append_voronoi_edges_global(
+        features,
+        coords_g,
+        flags_g,
+        all_cluster,
+        hulls_norm,
+        "voronoi_local",
+        bordering_pair_keys=bordering_keys,
+    )
 
     deduped = dedupe_close_parallel_voronoi_edges(
         {
@@ -636,8 +896,20 @@ def build_voronoi_local_paths_fc(
             "features": features,
         }
     )
+
+    touched: set[str] = set()
+    for f in deduped.get("features", []) or []:
+        p = f.get("properties") or {}
+        cid = p.get("cluster_id")
+        if p.get("inter_cluster"):
+            if isinstance(cid, str) and "|" in cid:
+                for part in cid.split("|"):
+                    touched.add(part)
+        elif cid is not None:
+            touched.add(str(cid))
+
     deduped["clusters_total"] = int(clusters_total)
-    deduped["clusters_with_paths"] = int(clusters_with_paths)
+    deduped["clusters_with_paths"] = int(len(touched))
     deduped["edges_total"] = len(deduped.get("features", []) or [])
     return deduped
 
