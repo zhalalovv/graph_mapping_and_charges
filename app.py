@@ -47,98 +47,101 @@ def _voronoi_only_placement_payload(
     city: str,
     network_type: str,
     simplify: bool,
-    demand_method: str,
     dbscan_eps_m: float,
     dbscan_min_samples: int,
-    use_all_buildings: bool,
-    a_by_admin_districts: bool,
-    candidates_per_cluster: int,
     buildings_per_centroid: int,
     inter_cluster_max_hull_gap_m: float,
     inter_cluster_max_edge_length_m: float,
+    use_all_buildings: bool,
+    voronoi_intra_bridge_max_m: float,
     from_saved: bool,
 ) -> dict:
-    """Ответ в формате `/api/stations/placement`, но только слой локальных путей Вороного."""
+    """
+    Только маршруты Вороного (как /api/buildings/voronoi-local-paths): без расстановки станций и без магистрали.
+    Формат ответа совместим с прежним `/api/stations/placement` (пустые слои станций/trunk, заполнен voronoi_edges).
+    """
     raw_fc = build_voronoi_local_paths_fc(
         data_service,
-        city=city,
+        city=city.strip(),
         network_type=network_type,
         simplify=simplify,
         dbscan_eps_m=dbscan_eps_m,
         dbscan_min_samples=dbscan_min_samples,
         use_all_buildings=use_all_buildings,
         buildings_per_centroid=buildings_per_centroid,
+        charging_station_features=None,
         inter_cluster_max_hull_gap_m=inter_cluster_max_hull_gap_m,
         inter_cluster_max_edge_length_m=inter_cluster_max_edge_length_m,
+        voronoi_intra_component_bridge_max_m=float(voronoi_intra_bridge_max_m),
     )
-    feats = raw_fc.get("features") or []
+    empty_fc = _empty_feature_collection()
     vor_fc = {
         "type": "FeatureCollection",
-        "features": _round_geojson_coords(feats, precision=6),
+        "features": list(raw_fc.get("features") or []),
     }
-    empty = _empty_feature_collection
-    clusters_total = raw_fc.get("clusters_total")
-    clusters_with_paths = raw_fc.get("clusters_with_paths")
-    edges_total = raw_fc.get("edges_total")
-    return {
-        "charging_type_a": empty(),
-        "charging_type_b": empty(),
-        "garages": empty(),
-        "to_stations": empty(),
-        "trunk": empty(),
-        "branch_edges": empty(),
-        "local_edges": empty(),
-        "voronoi_edges": vor_fc,
-        "metrics": {
-            "cluster_count": clusters_total,
-            "voronoi_clusters_with_paths": clusters_with_paths,
-            "voronoi_edges_total": edges_total,
-        },
+    metrics = {
+        "voronoi_edges_total": int(raw_fc.get("edges_total", len(vor_fc["features"]))),
+        "voronoi_clusters_with_paths": int(raw_fc.get("clusters_with_paths", 0)),
+        "voronoi_clusters_total": int(raw_fc.get("clusters_total", 0)),
+        "voronoi_intra_component_bridges_added": int(
+            raw_fc.get("voronoi_intra_component_bridges_added", 0)
+        ),
+    }
+    geo = {
+        "charging_type_a": empty_fc,
+        "charging_type_b": empty_fc,
+        "garages": empty_fc,
+        "to_stations": empty_fc,
+        "trunk": empty_fc,
+        "branch_edges": empty_fc,
+        "local_edges": empty_fc,
+        "voronoi_edges": _round_geojson_coords(vor_fc, precision=6),
+        "metrics": metrics,
+        "cluster_centroids": empty_fc,
         "params": {
-            "city": city,
+            "city": city.strip(),
             "network_type": network_type,
             "simplify": simplify,
-            "demand_method": demand_method,
-            "dbscan_eps_m": dbscan_eps_m,
-            "dbscan_min_samples": dbscan_min_samples,
-            "a_by_admin_districts": a_by_admin_districts,
-            "candidates_per_cluster": candidates_per_cluster,
+            "pipeline_mode": "voronoi_only",
             "buildings_per_centroid": buildings_per_centroid,
             "inter_cluster_max_hull_gap_m": inter_cluster_max_hull_gap_m,
             "inter_cluster_max_edge_length_m": inter_cluster_max_edge_length_m,
-            "pipeline_mode": "voronoi_local_paths_only",
+            "dbscan_eps_m": dbscan_eps_m,
+            "dbscan_min_samples": dbscan_min_samples,
+            "use_all_buildings": use_all_buildings,
+            "voronoi_intra_bridge_max_m": float(voronoi_intra_bridge_max_m),
         },
-        "cluster_centroids": empty(),
-        "from_saved": from_saved,
     }
+    geo["from_saved"] = from_saved
+    return geo
 
 
 def _placement_cache_key(
     city: str,
     network_type: str,
     simplify: bool,
-    demand_method: str,
     dbscan_eps_m: float,
     dbscan_min_samples: int,
-    a_by_admin_districts: bool,
-    candidates_per_cluster: int,
+    buildings_per_centroid: int,
     inter_cluster_max_hull_gap_m: float,
     inter_cluster_max_edge_length_m: float,
+    use_all_buildings: bool,
+    voronoi_intra_bridge_max_m: float,
 ) -> str:
     payload = {
         "city": city.strip(),
         "network_type": network_type,
         "simplify": bool(simplify),
-        "demand_method": demand_method,
         "dbscan_eps_m": float(dbscan_eps_m),
         "dbscan_min_samples": int(dbscan_min_samples),
-        "a_by_admin_districts": bool(a_by_admin_districts),
-        "candidates_per_cluster": int(candidates_per_cluster),
+        "buildings_per_centroid": int(buildings_per_centroid),
         "inter_cluster_max_hull_gap_m": float(inter_cluster_max_hull_gap_m),
         "inter_cluster_max_edge_length_m": float(inter_cluster_max_edge_length_m),
+        "use_all_buildings": bool(use_all_buildings),
+        "voronoi_intra_bridge_max_m": float(voronoi_intra_bridge_max_m),
         # Смена версии сбрасывает устаревший Redis-кэш (иначе после правок пайплайна
         # клиент может бесконечно получать пустой сохранённый ответ).
-        "placement_schema": 17,
+        "placement_schema": 36,
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()
@@ -454,7 +457,10 @@ def get_voronoi_local_paths(
     dbscan_eps_m: float = Query(180.0, description="Радиус локального уровня (м)"),
     dbscan_min_samples: int = Query(15, description="min_samples DBSCAN локального уровня"),
     use_all_buildings: bool = Query(False, description="Все здания вне no-fly"),
-    buildings_per_centroid: int = Query(60, description="Сколько зданий агрегировать в 1 центроид для Вороного"),
+    buildings_per_centroid: int = Query(
+        60,
+        description="Зданий на 1 центроид Вороного; в кластерах с большой долей NFZ внутри hull агрегация автоматически ослабляется",
+    ),
     inter_cluster_max_hull_gap_m: float = Query(
         2000.0,
         description="Макс. зазор между hull кластеров (м), при котором разрешены межкластерные связи (дорога, пустырь)",
@@ -462,6 +468,10 @@ def get_voronoi_local_paths(
     inter_cluster_max_edge_length_m: float = Query(
         2000.0,
         description="Макс. длина одного межкластерного отрезка (м); защита от длинных перебросов",
+    ),
+    voronoi_intra_bridge_max_m: float = Query(
+        600.0,
+        description="После вырезания рёбер через NFZ: макс. длина моста внутри кластера между компонентами (м); 0 — не добавлять",
     ),
 ):
     """
@@ -481,6 +491,7 @@ def get_voronoi_local_paths(
             buildings_per_centroid=buildings_per_centroid,
             inter_cluster_max_hull_gap_m=inter_cluster_max_hull_gap_m,
             inter_cluster_max_edge_length_m=inter_cluster_max_edge_length_m,
+            voronoi_intra_component_bridge_max_m=float(voronoi_intra_bridge_max_m),
         )
         fc = _round_geojson_coords(raw_fc, precision=6)
         return JSONResponse(
@@ -506,7 +517,10 @@ def get_stations_placement(
     use_saved: bool = Query(True, description="Использовать сохранённую расстановку, если есть"),
     only_saved: bool = Query(False, description="Только кэш Redis: при промахе 404, без пересчёта пайплайна"),
     save_result: bool = Query(True, description="Сохранять новую расстановку в Redis"),
-    buildings_per_centroid: int = Query(60, description="Сколько зданий агрегировать в 1 центроид для Вороного"),
+    buildings_per_centroid: int = Query(
+        60,
+        description="Зданий на 1 центроид Вороного; при сильном перекрытии hull зонами NFZ — автоматически мельче агрегация",
+    ),
     inter_cluster_max_hull_gap_m: float = Query(
         2000.0,
         description="Макс. зазор между hull кластеров (м) для межкластерных рёбер",
@@ -515,22 +529,31 @@ def get_stations_placement(
         2000.0,
         description="Макс. длина межкластерного отрезка (м)",
     ),
+    use_all_buildings: bool = Query(
+        False,
+        description="Учитывать все здания вне no-fly (как у /api/buildings/voronoi-local-paths)",
+    ),
+    voronoi_intra_bridge_max_m: float = Query(
+        600.0,
+        description="Мосты связности внутри кластера после NFZ (м); 0 — выключить",
+    ),
 ):
     """
-    Только локальные пути Вороного по кластерам (без размещения станций и магистрали).
-    Кэш в Redis — JSON ответа для карты (тот же формат ключей, что и раньше).
+    Пайплайн карты: только маршруты Вороного (меж- и внутрикластерные), без расстановки станций и без магистрали.
+    Параметры demand_method / a_by_admin_districts / candidates_per_cluster оставлены для совместимости запросов и не используются.
+    Кэш в Redis — JSON ответа для карты.
     """
     cache_key = _placement_cache_key(
         city=city,
         network_type=network_type,
         simplify=simplify,
-        demand_method=demand_method,
         dbscan_eps_m=dbscan_eps_m,
         dbscan_min_samples=dbscan_min_samples,
-        a_by_admin_districts=a_by_admin_districts,
-        candidates_per_cluster=candidates_per_cluster,
+        buildings_per_centroid=buildings_per_centroid,
         inter_cluster_max_hull_gap_m=inter_cluster_max_hull_gap_m,
         inter_cluster_max_edge_length_m=inter_cluster_max_edge_length_m,
+        use_all_buildings=use_all_buildings,
+        voronoi_intra_bridge_max_m=float(voronoi_intra_bridge_max_m),
     )
     redis_client = data_service.get_redis_client()
 
@@ -550,20 +573,18 @@ def get_stations_placement(
             return JSONResponse(data)
 
     try:
-        logger.info("Пайплайн: только локальные пути Вороного по кластерам")
+        logger.info("Пайплайн: только маршруты Вороного (станции и магистраль отключены)")
         geo = _voronoi_only_placement_payload(
             city=city.strip(),
             network_type=network_type,
             simplify=simplify,
-            demand_method=demand_method,
             dbscan_eps_m=dbscan_eps_m,
             dbscan_min_samples=dbscan_min_samples,
-            use_all_buildings=False,
-            a_by_admin_districts=a_by_admin_districts,
-            candidates_per_cluster=candidates_per_cluster,
             buildings_per_centroid=buildings_per_centroid,
             inter_cluster_max_hull_gap_m=inter_cluster_max_hull_gap_m,
             inter_cluster_max_edge_length_m=inter_cluster_max_edge_length_m,
+            use_all_buildings=use_all_buildings,
+            voronoi_intra_bridge_max_m=float(voronoi_intra_bridge_max_m),
             from_saved=False,
         )
         n_vor = len((geo.get("voronoi_edges") or {}).get("features", []) or [])
@@ -587,11 +608,9 @@ def export_saved_stations(
     city: str = Query(..., description="Название города"),
     network_type: str = Query("drive", description="Тип сети OSM"),
     simplify: bool = Query(True, description="Упрощение графа"),
-    demand_method: str = Query("dbscan", description="dbscan или grid"),
     dbscan_eps_m: float = Query(180.0, description="eps DBSCAN (м)"),
     dbscan_min_samples: int = Query(15, description="min_samples DBSCAN"),
-    a_by_admin_districts: bool = Query(True, description="Режим размещения A по районам/группам"),
-    candidates_per_cluster: int = Query(25, description="Кандидатов на кластер при выборе точек зарядки"),
+    buildings_per_centroid: int = Query(60, description="Должен совпадать с параметром при сохранении"),
     inter_cluster_max_hull_gap_m: float = Query(
         2000.0,
         description="Должен совпадать с параметром при сохранении",
@@ -600,8 +619,13 @@ def export_saved_stations(
         2000.0,
         description="Должен совпадать с параметром при сохранении",
     ),
+    use_all_buildings: bool = Query(False, description="Должен совпадать с параметром при сохранении"),
+    voronoi_intra_bridge_max_m: float = Query(
+        600.0,
+        description="Должен совпадать с параметром при сохранении",
+    ),
 ):
-    """Выгрузка сохраненной расстановки станций из Redis в JSON."""
+    """Выгрузка сохранённого JSON карты из Redis (режим только Вороного)."""
     redis_client = data_service.get_redis_client()
     if redis_client is None:
         raise HTTPException(status_code=503, detail="Redis недоступен")
@@ -609,13 +633,13 @@ def export_saved_stations(
         city=city,
         network_type=network_type,
         simplify=simplify,
-        demand_method=demand_method,
         dbscan_eps_m=dbscan_eps_m,
         dbscan_min_samples=dbscan_min_samples,
-        a_by_admin_districts=a_by_admin_districts,
-        candidates_per_cluster=candidates_per_cluster,
+        buildings_per_centroid=buildings_per_centroid,
         inter_cluster_max_hull_gap_m=inter_cluster_max_hull_gap_m,
         inter_cluster_max_edge_length_m=inter_cluster_max_edge_length_m,
+        use_all_buildings=use_all_buildings,
+        voronoi_intra_bridge_max_m=float(voronoi_intra_bridge_max_m),
     )
     try:
         cached = redis_client.get(cache_key)

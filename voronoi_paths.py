@@ -1,6 +1,7 @@
 """
 Локальные рёбра диаграммы Вороного по кластерам спроса.
 Сайты — центроиды зданий (возможно агрегированные) и точки зарядных станций в кластере.
+В кластерах, где hull сильно перекрыт NFZ, агрегация зданий автоматически ослабляется (больше сайтов).
 """
 from __future__ import annotations
 
@@ -10,9 +11,74 @@ import geopandas as gpd
 import numpy as np
 
 import pandas as pd
+import logging
+
 from shapely.geometry import LineString, Point
+from shapely.ops import unary_union
 
 from data_service import DataService
+
+logger = logging.getLogger(__name__)
+
+# Доля площади (hull ∩ NFZ) / area(hull) в метрах; выше порога — мельче агрегация сайтов Вороного.
+_NFZ_FRAC_FOR_ADAPTIVE_START = 0.12
+_NFZ_FRAC_FOR_ADAPTIVE_FULL = 0.60
+# При максимальной адаптации effective_bpc ≈ base * (1 - _ADAPTIVE_STRENGTH).
+_ADAPTIVE_STRENGTH = 0.62
+_VORONOI_ADAPTIVE_MIN_BPC = 18
+# После вырезания рёбер через NFZ внутри кластера остаются «острова»; соединяем их короткими безопасными отрезками.
+_DEFAULT_VORONOI_INTRA_COMPONENT_BRIDGE_MAX_M = 600.0
+_MAX_INTRA_BRIDGE_PAIR_EVAL = 80_000
+
+
+def _cluster_id_prop_from_key(cid: str) -> Any:
+    try:
+        return int(cid)
+    except ValueError:
+        return cid
+
+
+def _nfz_coverage_fraction_in_hull(hull_poly: Any, nfz_union: Any) -> float:
+    """Доля площади hull, перекрытая NFZ (EPSG:3857 для площадей)."""
+    if hull_poly is None or getattr(hull_poly, "is_empty", True):
+        return 0.0
+    if nfz_union is None or getattr(nfz_union, "is_empty", True):
+        return 0.0
+    try:
+        hp = hull_poly.buffer(0)
+        h = gpd.GeoSeries([hp], crs="EPSG:4326").to_crs(3857)
+        n = gpd.GeoSeries([nfz_union], crs="EPSG:4326").to_crs(3857)
+        hi = h.geometry.iloc[0]
+        ni = n.geometry.iloc[0]
+        inter = hi.intersection(ni)
+        if inter.is_empty:
+            return 0.0
+        ah = float(hi.area)
+        if ah <= 0:
+            return 0.0
+        return min(1.0, float(inter.area) / ah)
+    except Exception:
+        return 0.0
+
+
+def _voronoi_effective_buildings_per_centroid(
+    base_bpc: int,
+    hull_poly: Any,
+    nfz_union: Any,
+) -> int:
+    """
+    В «лабиринтах» из NFZ уменьшаем размер группы агрегации → больше сайтов Вороного
+    из тех же зданий (без регулярной сетки в свободном пространстве).
+    """
+    base = max(1, int(base_bpc or 60))
+    frac = _nfz_coverage_fraction_in_hull(hull_poly, nfz_union)
+    if frac <= _NFZ_FRAC_FOR_ADAPTIVE_START:
+        return base
+    span = max(_NFZ_FRAC_FOR_ADAPTIVE_FULL - _NFZ_FRAC_FOR_ADAPTIVE_START, 1e-6)
+    t = min(1.0, (frac - _NFZ_FRAC_FOR_ADAPTIVE_START) / span)
+    factor = 1.0 - t * _ADAPTIVE_STRENGTH
+    eff = int(round(base * factor))
+    return max(_VORONOI_ADAPTIVE_MIN_BPC, eff)
 
 
 def _normalize_hulls_gdf(hulls_gdf: gpd.GeoDataFrame | None) -> gpd.GeoDataFrame | None:
@@ -140,6 +206,241 @@ def charging_station_gdfs_to_features(*layers) -> list[dict]:
                     "properties": {"cluster_id": cid_val},
                 }
             )
+    return out
+
+
+def _no_fly_obstacles_union(no_fly_zones: Any) -> Any:
+    """Единый полигон/MultiPolygon no-fly для проверок и маршрутизации (EPSG:4326)."""
+    if no_fly_zones is None:
+        return None
+    try:
+        if isinstance(no_fly_zones, gpd.GeoDataFrame) and len(no_fly_zones) > 0:
+            nz = no_fly_zones.to_crs("EPSG:4326")
+            geoms = [g for g in nz.geometry if g is not None and not getattr(g, "is_empty", True)]
+            if not geoms:
+                return None
+            return unary_union(geoms)
+        if isinstance(no_fly_zones, list) and len(no_fly_zones) > 0:
+            geoms = [g for g in no_fly_zones if g is not None and not getattr(g, "is_empty", True)]
+            if not geoms:
+                return None
+            return unary_union(geoms)
+    except Exception:
+        return None
+    return None
+
+
+def _nfz_union_buffered_for_voronoi_filter(no_fly_zones: Any, city_boundary: Any) -> Any | None:
+    """
+    Объединённый no-fly в EPSG:4326 с буфером NO_FLY_CLEARANCE_M (как при маршрутизации),
+    чтобы не ставить сайты и не рисовать рёбра в запретной зоне.
+    """
+    obstacles = _no_fly_obstacles_union(no_fly_zones)
+    if obstacles is None or getattr(obstacles, "is_empty", True):
+        return None
+    try:
+        from station_placement import NO_FLY_CLEARANCE_M, buffer_geometry_wgs84_m
+
+        if city_boundary is not None and not getattr(city_boundary, "is_empty", True):
+            b = city_boundary.bounds
+            alon = float((b[0] + b[2]) / 2.0)
+            alat = float((b[1] + b[3]) / 2.0)
+        else:
+            b = obstacles.bounds
+            alon = float((b[0] + b[2]) / 2.0)
+            alat = float((b[1] + b[3]) / 2.0)
+        return buffer_geometry_wgs84_m(obstacles, alon, alat, float(NO_FLY_CLEARANCE_M))
+    except Exception:
+        return obstacles
+
+
+def _point_in_nfz_union(lon: float, lat: float, nfz_union: Any) -> bool:
+    if nfz_union is None or getattr(nfz_union, "is_empty", True):
+        return False
+    try:
+        return bool(nfz_union.contains(Point(float(lon), float(lat))))
+    except Exception:
+        return False
+
+
+def _filter_xy_rows_outside_nfz(
+    pts_arr: np.ndarray,
+    is_station: np.ndarray | None,
+    nfz_union: Any,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Удаляет строки сайтов, чей центроид попадает внутрь nfz_union."""
+    if nfz_union is None or len(pts_arr) == 0:
+        return pts_arr, is_station
+    keep_rows: list[int] = []
+    for i in range(len(pts_arr)):
+        lo, la = float(pts_arr[i, 0]), float(pts_arr[i, 1])
+        if _point_in_nfz_union(lo, la, nfz_union):
+            continue
+        keep_rows.append(i)
+    if not keep_rows:
+        return np.empty((0, 2), dtype=float), (
+            np.empty(0, dtype=bool) if is_station is not None else None
+        )
+    idx = np.array(keep_rows, dtype=int)
+    out_pts = pts_arr[idx]
+    out_st = is_station[idx] if is_station is not None and len(is_station) == len(pts_arr) else is_station
+    return out_pts, out_st
+
+
+def _filter_voronoi_fc_linestrings_nfz(fc: dict, nfz_union: Any) -> dict:
+    """Удаляет рёбра LineString, пересекающие внутренность no-fly (is_edge_blocked)."""
+    if nfz_union is None or getattr(nfz_union, "is_empty", True):
+        return fc
+    from station_placement import is_edge_blocked
+
+    feats = list(fc.get("features", []) or [])
+    kept: list[dict] = []
+    for feat in feats:
+        if not isinstance(feat, dict):
+            continue
+        geom = feat.get("geometry") or {}
+        if geom.get("type") != "LineString":
+            kept.append(feat)
+            continue
+        coords = geom.get("coordinates") or []
+        if len(coords) < 2:
+            continue
+        try:
+            line = LineString([(float(c[0]), float(c[1])) for c in coords if len(c) >= 2])
+        except Exception:
+            kept.append(feat)
+            continue
+        if is_edge_blocked(line, nfz_union, safety_buffer=0.0):
+            continue
+        kept.append(feat)
+    out = dict(fc)
+    out["features"] = kept
+    return out
+
+
+def apply_nfz_detours_to_voronoi_fc(
+    fc: dict,
+    *,
+    no_fly_zones: Any,
+    city_boundary: Any,
+) -> dict:
+    """
+    Для **межкластерных** рёбер (properties.inter_cluster=True), пересекающих no-fly, строит обход по контуру зоны.
+    A* не используется. Внутрикластерные рёбра не трогаем — остаются прямыми отрезками Вороного, даже через зону.
+    """
+    if not fc or not isinstance(fc, dict):
+        return fc
+    feats = list(fc.get("features", []) or [])
+    if not feats:
+        return fc
+
+    obstacles = _no_fly_obstacles_union(no_fly_zones)
+    if obstacles is None or getattr(obstacles, "is_empty", True):
+        return fc
+
+    # Ленивый импорт: избегаем циклических зависимостей с station_placement.
+    from station_placement import (
+        NO_FLY_CLEARANCE_M,
+        buffer_geometry_wgs84_m,
+        is_edge_blocked,
+        prepare_air_detour_auxiliary,
+        route_lonlat_segment_with_nfz_detours,
+    )
+
+    try:
+        if city_boundary is not None and not getattr(city_boundary, "is_empty", True):
+            b = city_boundary.bounds
+            utm_anchor = (float((b[0] + b[2]) / 2.0), float((b[1] + b[3]) / 2.0))
+        else:
+            b = obstacles.bounds
+            utm_anchor = (float((b[0] + b[2]) / 2.0), float((b[1] + b[3]) / 2.0))
+    except Exception:
+        utm_anchor = (37.6173, 55.7558)
+
+    try:
+        obstacles_buf = buffer_geometry_wgs84_m(
+            obstacles, utm_anchor[0], utm_anchor[1], float(NO_FLY_CLEARANCE_M)
+        )
+    except Exception:
+        obstacles_buf = obstacles
+
+    # Без воздушного графа: в route_lonlat_segment_with_nfz_detours не вызывается A* (только boundary-обход).
+    _nfz_u, nfz_metric_pair, _air_w, _air_c, _air_i, _air_t = prepare_air_detour_auxiliary(
+        obstacles_buf,
+        None,
+        utm_anchor,
+        no_fly_safety_buffer=0.0,
+    )
+
+    detour_counter: list[int] = [0]
+    n_cross = 0
+    n_ok = 0
+    n_fail = 0
+
+    for idx, feat in enumerate(feats):
+        if not isinstance(feat, dict):
+            continue
+        geom = feat.get("geometry") or {}
+        if geom.get("type") != "LineString":
+            continue
+        coords = geom.get("coordinates") or []
+        if len(coords) < 2:
+            continue
+        props_early = feat.get("properties") or {}
+        # Локальные (внутрикластерные) рёбра: без обходов — только прямая геометрия Вороного.
+        if not props_early.get("inter_cluster"):
+            continue
+        try:
+            line = LineString([(float(c[0]), float(c[1])) for c in coords if len(c) >= 2])
+        except Exception:
+            continue
+        if line.is_empty:
+            continue
+        if not is_edge_blocked(line, obstacles_buf, safety_buffer=0.0):
+            continue
+
+        n_cross += 1
+        lon1, lat1 = float(coords[0][0]), float(coords[0][1])
+        lon2, lat2 = float(coords[-1][0]), float(coords[-1][1])
+        lbl = "vor_edge_%s" % idx
+        routed = route_lonlat_segment_with_nfz_detours(
+            lon1,
+            lat1,
+            lon2,
+            lat2,
+            obstacles_buf,
+            air_graph=None,
+            air_coords=None,
+            air_ids=None,
+            air_tree=None,
+            no_fly_safety_buffer=0.0,
+            nfz_metric=nfz_metric_pair,
+            utm_anchor_lonlat=utm_anchor,
+            logger=logger,
+            detour_counter=detour_counter,
+            log_edge_label=lbl,
+        )
+        props = dict(feat.get("properties") or {})
+        if routed is None:
+            n_fail += 1
+            props["nfz_detour_failed"] = True
+            feat["properties"] = props
+            continue
+        path_ll, _len_km, how = routed
+        if how != "straight" and path_ll and len(path_ll) >= 2:
+            feat["geometry"] = {
+                "type": "LineString",
+                "coordinates": [[float(lon), float(lat)] for lon, lat in path_ll],
+            }
+            props["nfz_route"] = how
+            n_ok += 1
+        feat["properties"] = props
+
+    out = dict(fc)
+    out["features"] = feats
+    out["nfz_voronoi_edges_crossing"] = int(n_cross)
+    out["nfz_voronoi_detours_ok"] = int(n_ok)
+    out["nfz_voronoi_detours_failed"] = int(n_fail)
     return out
 
 
@@ -344,7 +645,10 @@ def _append_voronoi_edges_for_cluster(
                     "type": "LineString",
                     "coordinates": clipped,
                 },
-                "properties": _station_edge_props(cid, edge_type, 0, 1, is_station, group_mode=group_mode),
+                "properties": {
+                    **_station_edge_props(cid, edge_type, 0, 1, is_station, group_mode=group_mode),
+                    "inter_cluster": False,
+                },
             }
         )
         return True
@@ -399,7 +703,10 @@ def _append_voronoi_edges_for_cluster(
                     "type": "LineString",
                     "coordinates": clipped,
                 },
-                "properties": _station_edge_props(cid, edge_type, a, b, flags, group_mode=group_mode),
+                "properties": {
+                    **_station_edge_props(cid, edge_type, a, b, flags, group_mode=group_mode),
+                    "inter_cluster": False,
+                },
             }
         )
     return len(features) > n0
@@ -511,6 +818,191 @@ def _add_shortest_bridges_for_allowed_pairs(
             }
         )
         have.add(pk)
+
+
+def _iter_intra_bridge_candidate_pairs(
+    C1: set[int],
+    C2: set[int],
+    coords: np.ndarray,
+) -> list[tuple[int, int]]:
+    """Пары индексов между двумя компонентами; при переборе слишком большом — только k ближайших к каждой точке меньшей компоненты."""
+    if not C1 or not C2:
+        return []
+    if len(C1) > len(C2):
+        C1, C2 = C2, C1
+    n1, n2 = len(C1), len(C2)
+    if n1 * n2 <= _MAX_INTRA_BRIDGE_PAIR_EVAL:
+        return [(i, j) for i in C1 for j in C2]
+    k = max(12, _MAX_INTRA_BRIDGE_PAIR_EVAL // max(n2, 1))
+    out: list[tuple[int, int]] = []
+    list2 = list(C2)
+    for i in C1:
+        pi = coords[i]
+        dists: list[tuple[float, int]] = []
+        for j in list2:
+            pj = coords[j]
+            d = _segment_length_m(
+                float(pi[0]), float(pi[1]), float(pj[0]), float(pj[1])
+            )
+            dists.append((d, j))
+        dists.sort(key=lambda t: t[0])
+        for _, j in dists[:k]:
+            out.append((i, j))
+    return out
+
+
+def _add_intra_cluster_nfz_safe_bridges(
+    fc: dict,
+    coords: np.ndarray,
+    flags: np.ndarray,
+    cluster_per_point: list[Any],
+    nfz_union: Any,
+    *,
+    max_bridge_m: float,
+) -> dict:
+    """
+    Если после _filter_voronoi_fc_linestrings_nfz внутри одного кластера граф распался на компоненты,
+    добавляет между компонентами кратчайшие отрезки, не пересекающие NFZ (как is_edge_blocked).
+    """
+    if max_bridge_m <= 0:
+        out = dict(fc)
+        out["voronoi_intra_component_bridges_added"] = 0
+        return out
+    if nfz_union is None or getattr(nfz_union, "is_empty", True):
+        out = dict(fc)
+        out.setdefault("voronoi_intra_component_bridges_added", 0)
+        return out
+    from station_placement import is_edge_blocked
+
+    feats = list(fc.get("features", []) or [])
+    n = len(coords)
+    if n < 2 or len(cluster_per_point) != n:
+        out = dict(fc)
+        out.setdefault("voronoi_intra_component_bridges_added", 0)
+        return out
+    fl = np.asarray(flags, dtype=bool)
+    if len(fl) != n:
+        fl = np.zeros(n, dtype=bool)
+
+    intra_pairs: set[tuple[int, int]] = set()
+    adj: dict[int, set[int]] = {i: set() for i in range(n)}
+    for feat in feats:
+        p = feat.get("properties") or {}
+        if p.get("inter_cluster"):
+            continue
+        si = p.get("source_i")
+        ti = p.get("target_i")
+        if si is None or ti is None:
+            continue
+        a, b = int(si), int(ti)
+        if a < 0 or b < 0 or a >= n or b >= n or a == b:
+            continue
+        u, v = (a, b) if a < b else (b, a)
+        intra_pairs.add((u, v))
+        adj[a].add(b)
+        adj[b].add(a)
+
+    by_cluster: dict[str, list[int]] = {}
+    for i, c in enumerate(cluster_per_point):
+        by_cluster.setdefault(str(c), []).append(i)
+
+    added = 0
+    for cid, verts in by_cluster.items():
+        if len(verts) < 2:
+            continue
+        verts_set = set(verts)
+        visited: set[int] = set()
+        components: list[set[int]] = []
+        for v in verts:
+            if v in visited:
+                continue
+            stack = [v]
+            comp: set[int] = set()
+            while stack:
+                x = stack.pop()
+                if x in visited or x not in verts_set:
+                    continue
+                visited.add(x)
+                comp.add(x)
+                for y in adj.get(x, ()):
+                    if y in verts_set and y not in visited:
+                        stack.append(y)
+            if comp:
+                components.append(comp)
+        if len(components) <= 1:
+            continue
+
+        comps = [set(c) for c in components]
+        cid_prop = _cluster_id_prop_from_key(cid)
+
+        while len(comps) > 1:
+            best: tuple[float, int, int, int, int] | None = None
+            for ci in range(len(comps)):
+                for cj in range(ci + 1, len(comps)):
+                    for i, j in _iter_intra_bridge_candidate_pairs(comps[ci], comps[cj], coords):
+                        u, v = (i, j) if i < j else (j, i)
+                        if (u, v) in intra_pairs:
+                            continue
+                        pi, pj = coords[i], coords[j]
+                        d = _segment_length_m(
+                            float(pi[0]), float(pi[1]), float(pj[0]), float(pj[1])
+                        )
+                        if d > max_bridge_m:
+                            continue
+                        line = LineString(
+                            [
+                                (float(pi[0]), float(pi[1])),
+                                (float(pj[0]), float(pj[1])),
+                            ]
+                        )
+                        if is_edge_blocked(line, nfz_union, safety_buffer=0.0):
+                            continue
+                        if best is None or d < best[0]:
+                            best = (d, i, j, ci, cj)
+            if best is None:
+                break
+            _d, i, j, ci, cj = best
+            u, v = (i, j) if i < j else (j, i)
+            intra_pairs.add((u, v))
+            adj[i].add(j)
+            adj[j].add(i)
+            merged = comps[ci] | comps[cj]
+            hi, lo = (ci, cj) if ci > cj else (cj, ci)
+            comps.pop(hi)
+            comps.pop(lo)
+            comps.append(merged)
+
+            pi, pj = coords[i], coords[j]
+            feats.append(
+                {
+                    "type": "Feature",
+                    "geometry": {
+                        "type": "LineString",
+                        "coordinates": [
+                            [float(pi[0]), float(pi[1])],
+                            [float(pj[0]), float(pj[1])],
+                        ],
+                    },
+                    "properties": {
+                        **_station_edge_props(
+                            cid_prop,
+                            "voronoi_local",
+                            i,
+                            j,
+                            fl,
+                            group_mode=None,
+                        ),
+                        "inter_cluster": False,
+                        "intra_component_bridge": True,
+                    },
+                }
+            )
+            added += 1
+
+    out = dict(fc)
+    out["features"] = feats
+    out["voronoi_intra_component_bridges_added"] = int(added)
+    return out
 
 
 def _bordering_cluster_pair_keys(
@@ -758,14 +1250,18 @@ def build_voronoi_local_paths_fc(
     charging_station_features: list | None = None,
     inter_cluster_max_hull_gap_m: float = 2000.0,
     inter_cluster_max_edge_length_m: float = 2000.0,
+    voronoi_intra_component_bridge_max_m: float = _DEFAULT_VORONOI_INTRA_COMPONENT_BRIDGE_MAX_M,
 ) -> dict:
     _require_voronoi()
 
-    data = data_service.get_city_data(city, network_type=network_type, simplify=simplify)
+    data = data_service.get_city_data(
+        city, network_type=network_type, simplify=simplify, load_no_fly_zones=True
+    )
     buildings = data.get("buildings")
     road_graph = data.get("road_graph")
     city_boundary = data.get("city_boundary")
     no_fly_zones = data.get("no_fly_zones")
+    nfz_union_f = _nfz_union_buffered_for_voronoi_filter(no_fly_zones, city_boundary)
 
     if buildings is None or len(buildings) == 0:
         return {
@@ -898,7 +1394,6 @@ def build_voronoi_local_paths_fc(
             key = str(cid)
             charging_by_cluster.setdefault(key, []).append([float(coords[0]), float(coords[1])])
 
-    target_group_size = max(1, int(buildings_per_centroid or 20))
     features: list[dict] = []
     clusters_total = 0
     all_coords: list[list[float]] = []
@@ -915,11 +1410,22 @@ def build_voronoi_local_paths_fc(
             if geom is None or geom.is_empty:
                 continue
             try:
-                pts.append([float(geom.x), float(geom.y)])
+                lon, lat = float(geom.x), float(geom.y)
             except Exception:
                 continue
+            if nfz_union_f is not None and _point_in_nfz_union(lon, lat, nfz_union_f):
+                continue
+            pts.append([lon, lat])
         if len(pts) < 2:
             continue
+
+        hull_poly = _hull_polygon_for_cluster(hulls_norm, group_id)
+        target_group_size = max(
+            1,
+            _voronoi_effective_buildings_per_centroid(
+                buildings_per_centroid, hull_poly, nfz_union_f
+            ),
+        )
 
         pts_arr = np.array(pts, dtype=float)
         if len(pts_arr) > target_group_size:
@@ -956,16 +1462,19 @@ def build_voronoi_local_paths_fc(
                 if len(centers) >= 2:
                     pts_arr = np.asarray(centers, dtype=float)
 
+        pts_arr, _ = _filter_xy_rows_outside_nfz(pts_arr, None, nfz_union_f)
+
         st_points = charging_by_cluster.get(str(group_id), [])
-        hull_poly = _hull_polygon_for_cluster(hulls_norm, group_id)
-        if st_points and hull_poly is not None:
+        if st_points:
             st_points = [
                 [float(x), float(y)]
                 for x, y in st_points
-                if _point_in_hull(float(x), float(y), hull_poly)
+                if (nfz_union_f is None or not _point_in_nfz_union(float(x), float(y), nfz_union_f))
+                and (hull_poly is None or _point_in_hull(float(x), float(y), hull_poly))
             ]
         st_arr = np.asarray(st_points, dtype=float) if st_points else None
         pts_arr, is_station = merge_xy_with_station_flags(pts_arr, st_arr)
+        pts_arr, is_station = _filter_xy_rows_outside_nfz(pts_arr, is_station, nfz_union_f)
 
         if len(pts_arr) < 2:
             continue
@@ -1016,6 +1525,21 @@ def build_voronoi_local_paths_fc(
             "features": features,
         }
     )
+
+    deduped = _filter_voronoi_fc_linestrings_nfz(deduped, nfz_union_f)
+    deduped = _add_intra_cluster_nfz_safe_bridges(
+        deduped,
+        coords_g,
+        flags_g,
+        all_cluster,
+        nfz_union_f,
+        max_bridge_m=float(voronoi_intra_component_bridge_max_m),
+    )
+
+    # Обходы no-fly для рёбер Вороного не строим — прямые отрезки как у диаграммы (без boundary/A*).
+    deduped["nfz_voronoi_edges_crossing"] = 0
+    deduped["nfz_voronoi_detours_ok"] = 0
+    deduped["nfz_voronoi_detours_failed"] = 0
 
     touched: set[str] = set()
     for f in deduped.get("features", []) or []:
@@ -1111,6 +1635,7 @@ def build_voronoi_edges_from_pipeline_raw(
         return {"type": "FeatureCollection", "features": []}
 
     hulls_norm = _normalize_hulls_gdf(raw.get("demand_hulls"))
+    nfz_union_f = _nfz_union_buffered_for_voronoi_filter(raw.get("no_fly_zones"), raw.get("city_boundary"))
 
     grouped_points: dict[str, list[list[float]]] = {}
     for cluster_id, sub in d.groupby("cluster_id"):
@@ -1120,9 +1645,12 @@ def build_voronoi_edges_from_pipeline_raw(
             if g is None or g.is_empty:
                 continue
             try:
-                pts.append([float(g.x), float(g.y)])
+                lo, la = float(g.x), float(g.y)
             except Exception:
                 continue
+            if nfz_union_f is not None and _point_in_nfz_union(lo, la, nfz_union_f):
+                continue
+            pts.append([lo, la])
         if pts:
             grouped_points[str(cluster_id)] = pts
 
@@ -1173,9 +1701,12 @@ def build_voronoi_edges_from_pipeline_raw(
                             if g is None or g.is_empty or cid is None:
                                 continue
                             try:
-                                gp.setdefault(str(cid), []).append([float(g.x), float(g.y)])
+                                lo, la = float(g.x), float(g.y)
                             except Exception:
                                 continue
+                            if nfz_union_f is not None and _point_in_nfz_union(lo, la, nfz_union_f):
+                                continue
+                            gp.setdefault(str(cid), []).append([lo, la])
                         if gp:
                             grouped_points = gp
             except Exception:
@@ -1199,13 +1730,23 @@ def build_voronoi_edges_from_pipeline_raw(
             cid = props.get("cluster_id")
             if cid is None:
                 continue
-            charging_by_cluster.setdefault(str(cid), []).append([float(coords[0]), float(coords[1])])
+            lo, la = float(coords[0]), float(coords[1])
+            if nfz_union_f is not None and _point_in_nfz_union(lo, la, nfz_union_f):
+                continue
+            charging_by_cluster.setdefault(str(cid), []).append([lo, la])
 
-    target_group_size = max(1, int(buildings_per_centroid or 60))
     out_features: list[dict] = []
     for cluster_id, pts in grouped_points.items():
         if len(pts) < 2:
             continue
+
+        hull_poly = _hull_polygon_for_cluster(hulls_norm, cluster_id)
+        target_group_size = max(
+            1,
+            _voronoi_effective_buildings_per_centroid(
+                buildings_per_centroid, hull_poly, nfz_union_f
+            ),
+        )
 
         pts_arr = np.asarray(pts, dtype=float)
         if len(pts_arr) > target_group_size:
@@ -1232,16 +1773,19 @@ def build_voronoi_edges_from_pipeline_raw(
             except Exception:
                 pass
 
+        pts_arr, _ = _filter_xy_rows_outside_nfz(pts_arr, None, nfz_union_f)
+
         st_pts = charging_by_cluster.get(str(cluster_id), [])
-        hull_poly = _hull_polygon_for_cluster(hulls_norm, cluster_id)
-        if st_pts and hull_poly is not None:
+        if st_pts:
             st_pts = [
                 [float(x), float(y)]
                 for x, y in st_pts
-                if _point_in_hull(float(x), float(y), hull_poly)
+                if (nfz_union_f is None or not _point_in_nfz_union(float(x), float(y), nfz_union_f))
+                and (hull_poly is None or _point_in_hull(float(x), float(y), hull_poly))
             ]
         st_arr = np.asarray(st_pts, dtype=float) if st_pts else None
         pts_arr, is_station = merge_xy_with_station_flags(pts_arr, st_arr)
+        pts_arr, is_station = _filter_xy_rows_outside_nfz(pts_arr, is_station, nfz_union_f)
 
         if len(pts_arr) < 2:
             continue
@@ -1253,4 +1797,6 @@ def build_voronoi_edges_from_pipeline_raw(
             "voronoi_local",
             hull_poly=hull_poly,
         )
-    return {"type": "FeatureCollection", "features": out_features}
+    fc_out = {"type": "FeatureCollection", "features": out_features}
+    fc_out = _filter_voronoi_fc_linestrings_nfz(fc_out, nfz_union_f)
+    return fc_out
