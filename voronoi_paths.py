@@ -1,7 +1,8 @@
 """
 Локальные рёбра диаграммы Вороного по кластерам спроса.
 Сайты — центроиды зданий (возможно агрегированные) и точки зарядных станций в кластере.
-В кластерах, где hull сильно перекрыт NFZ, агрегация зданий автоматически ослабляется (больше сайтов).
+Площадь hull (м²): до порога — одно здание на один сайт; выше — агрегация по параметру buildings_per_centroid
+(по умолчанию 60). No-fly зоны для Вороного не учитываются (ни отбор точек, ни обрезка рёбер).
 """
 from __future__ import annotations
 
@@ -20,13 +21,11 @@ from data_service import DataService
 
 logger = logging.getLogger(__name__)
 
-# Доля площади (hull ∩ NFZ) / area(hull) в метрах; выше порога — мельче агрегация сайтов Вороного.
-_NFZ_FRAC_FOR_ADAPTIVE_START = 0.12
-_NFZ_FRAC_FOR_ADAPTIVE_FULL = 0.60
-# При максимальной адаптации effective_bpc ≈ base * (1 - _ADAPTIVE_STRENGTH).
-_ADAPTIVE_STRENGTH = 0.62
-_VORONOI_ADAPTIVE_MIN_BPC = 18
-# После вырезания рёбер через NFZ внутри кластера остаются «острова»; соединяем их короткими безопасными отрезками.
+# Hull площадью до этого порога (м², EPSG:3857) — без агрегации (1 здание = 1 сайт).
+_VORONOI_BPC_SMALL_CLUSTER_MAX_AREA_M2 = 2_000_000.0
+# Если в запросе не задан buildings_per_centroid, для крупных кластеров используется это значение.
+_VORONOI_BPC_LARGE_CLUSTER_FALLBACK = 60
+# Мосты между компонентами графа внутри кластера (если включён фильтр по препятствиям — с проверкой пересечений).
 _DEFAULT_VORONOI_INTRA_COMPONENT_BRIDGE_MAX_M = 600.0
 _MAX_INTRA_BRIDGE_PAIR_EVAL = 80_000
 
@@ -38,47 +37,27 @@ def _cluster_id_prop_from_key(cid: str) -> Any:
         return cid
 
 
-def _nfz_coverage_fraction_in_hull(hull_poly: Any, nfz_union: Any) -> float:
-    """Доля площади hull, перекрытая NFZ (EPSG:3857 для площадей)."""
+def _hull_area_m2(hull_poly: Any) -> float:
+    """Площадь hull в м² (EPSG:3857)."""
     if hull_poly is None or getattr(hull_poly, "is_empty", True):
-        return 0.0
-    if nfz_union is None or getattr(nfz_union, "is_empty", True):
         return 0.0
     try:
         hp = hull_poly.buffer(0)
         h = gpd.GeoSeries([hp], crs="EPSG:4326").to_crs(3857)
-        n = gpd.GeoSeries([nfz_union], crs="EPSG:4326").to_crs(3857)
-        hi = h.geometry.iloc[0]
-        ni = n.geometry.iloc[0]
-        inter = hi.intersection(ni)
-        if inter.is_empty:
-            return 0.0
-        ah = float(hi.area)
-        if ah <= 0:
-            return 0.0
-        return min(1.0, float(inter.area) / ah)
+        return float(h.geometry.iloc[0].area)
     except Exception:
         return 0.0
 
 
-def _voronoi_effective_buildings_per_centroid(
-    base_bpc: int,
-    hull_poly: Any,
-    nfz_union: Any,
-) -> int:
+def _voronoi_effective_buildings_per_centroid(base_bpc: int, hull_poly: Any) -> int:
     """
-    В «лабиринтах» из NFZ уменьшаем размер группы агрегации → больше сайтов Вороного
-    из тех же зданий (без регулярной сетки в свободном пространстве).
+    При площади hull ≤ порога — 1 здание на сайт.
+    При большей площади — `base_bpc` зданий на сайт (или fallback 60).
     """
-    base = max(1, int(base_bpc or 60))
-    frac = _nfz_coverage_fraction_in_hull(hull_poly, nfz_union)
-    if frac <= _NFZ_FRAC_FOR_ADAPTIVE_START:
-        return base
-    span = max(_NFZ_FRAC_FOR_ADAPTIVE_FULL - _NFZ_FRAC_FOR_ADAPTIVE_START, 1e-6)
-    t = min(1.0, (frac - _NFZ_FRAC_FOR_ADAPTIVE_START) / span)
-    factor = 1.0 - t * _ADAPTIVE_STRENGTH
-    eff = int(round(base * factor))
-    return max(_VORONOI_ADAPTIVE_MIN_BPC, eff)
+    area_m2 = _hull_area_m2(hull_poly)
+    if area_m2 <= _VORONOI_BPC_SMALL_CLUSTER_MAX_AREA_M2:
+        return 1
+    return max(1, int(base_bpc or _VORONOI_BPC_LARGE_CLUSTER_FALLBACK))
 
 
 def _normalize_hulls_gdf(hulls_gdf: gpd.GeoDataFrame | None) -> gpd.GeoDataFrame | None:
@@ -228,30 +207,6 @@ def _no_fly_obstacles_union(no_fly_zones: Any) -> Any:
     except Exception:
         return None
     return None
-
-
-def _nfz_union_buffered_for_voronoi_filter(no_fly_zones: Any, city_boundary: Any) -> Any | None:
-    """
-    Объединённый no-fly в EPSG:4326 с буфером NO_FLY_CLEARANCE_M (как при маршрутизации),
-    чтобы не ставить сайты и не рисовать рёбра в запретной зоне.
-    """
-    obstacles = _no_fly_obstacles_union(no_fly_zones)
-    if obstacles is None or getattr(obstacles, "is_empty", True):
-        return None
-    try:
-        from station_placement import NO_FLY_CLEARANCE_M, buffer_geometry_wgs84_m
-
-        if city_boundary is not None and not getattr(city_boundary, "is_empty", True):
-            b = city_boundary.bounds
-            alon = float((b[0] + b[2]) / 2.0)
-            alat = float((b[1] + b[3]) / 2.0)
-        else:
-            b = obstacles.bounds
-            alon = float((b[0] + b[2]) / 2.0)
-            alat = float((b[1] + b[3]) / 2.0)
-        return buffer_geometry_wgs84_m(obstacles, alon, alat, float(NO_FLY_CLEARANCE_M))
-    except Exception:
-        return obstacles
 
 
 def _point_in_nfz_union(lon: float, lat: float, nfz_union: Any) -> bool:
@@ -1261,7 +1216,7 @@ def build_voronoi_local_paths_fc(
     road_graph = data.get("road_graph")
     city_boundary = data.get("city_boundary")
     no_fly_zones = data.get("no_fly_zones")
-    nfz_union_f = _nfz_union_buffered_for_voronoi_filter(no_fly_zones, city_boundary)
+    nfz_union_f = None  # Вороной без учёта no-fly
 
     if buildings is None or len(buildings) == 0:
         return {
@@ -1422,13 +1377,11 @@ def build_voronoi_local_paths_fc(
         hull_poly = _hull_polygon_for_cluster(hulls_norm, group_id)
         target_group_size = max(
             1,
-            _voronoi_effective_buildings_per_centroid(
-                buildings_per_centroid, hull_poly, nfz_union_f
-            ),
+            _voronoi_effective_buildings_per_centroid(buildings_per_centroid, hull_poly),
         )
 
         pts_arr = np.array(pts, dtype=float)
-        if len(pts_arr) > target_group_size:
+        if target_group_size > 1 and len(pts_arr) > target_group_size:
             n_groups = int(np.ceil(len(pts_arr) / float(target_group_size)))
             n_groups = max(2, min(n_groups, len(pts_arr)))
             try:
@@ -1635,7 +1588,7 @@ def build_voronoi_edges_from_pipeline_raw(
         return {"type": "FeatureCollection", "features": []}
 
     hulls_norm = _normalize_hulls_gdf(raw.get("demand_hulls"))
-    nfz_union_f = _nfz_union_buffered_for_voronoi_filter(raw.get("no_fly_zones"), raw.get("city_boundary"))
+    nfz_union_f = None  # Вороной без учёта no-fly
 
     grouped_points: dict[str, list[list[float]]] = {}
     for cluster_id, sub in d.groupby("cluster_id"):
@@ -1743,13 +1696,11 @@ def build_voronoi_edges_from_pipeline_raw(
         hull_poly = _hull_polygon_for_cluster(hulls_norm, cluster_id)
         target_group_size = max(
             1,
-            _voronoi_effective_buildings_per_centroid(
-                buildings_per_centroid, hull_poly, nfz_union_f
-            ),
+            _voronoi_effective_buildings_per_centroid(buildings_per_centroid, hull_poly),
         )
 
         pts_arr = np.asarray(pts, dtype=float)
-        if len(pts_arr) > target_group_size:
+        if target_group_size > 1 and len(pts_arr) > target_group_size:
             n_groups = int(np.ceil(len(pts_arr) / float(target_group_size)))
             n_groups = max(2, min(n_groups, len(pts_arr)))
             try:
