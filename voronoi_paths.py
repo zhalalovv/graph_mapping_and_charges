@@ -1,12 +1,13 @@
 """
 Локальные рёбра диаграммы Вороного по кластерам спроса.
 Сайты — центроиды зданий (возможно агрегированные) и точки зарядных станций в кластере.
-Площадь hull (м²) до порога 2_000_000: обычно 3 здания на сайт; при площади выше порога —
+Площадь hull (м²) до порога 3_000_000: для не-МКД в однородном малом кластере — 3 здания на сайт;
+МКД в малом кластере (только МКД или в смеси с другими) — 2 здания на сайт. Выше порога —
 агрегация по buildings_per_centroid (по умолчанию 60).
 Если площадь hull не больше порога и в кластере одновременно есть МКД и прочие типы зданий,
-МКД агрегируются по 3 здания на сайт, остальные (частные, промышленные, магазины и т.д.) —
-по buildings_per_centroid (по умолчанию 60).
-No-fly зоны для Вороного не учитываются (ни отбор точек, ни обрезка рёбер).
+не-МКД — по buildings_per_centroid зданий на сайт (по умолчанию 60).
+Сайты (центроиды), попадающие в no-fly, отбрасываются; рёбра LineString, с нетривиальным
+пересечением внутренности NFZ, удаляются (как в _filter_voronoi_fc_linestrings_nfz).
 """
 from __future__ import annotations
 
@@ -27,9 +28,11 @@ from data_service import DataService
 logger = logging.getLogger(__name__)
 
 # Hull площадью до этого порога (м², EPSG:3857) — без агрегации (1 здание = 1 сайт).
-_VORONOI_BPC_SMALL_CLUSTER_MAX_AREA_M2 = 2_000_000.0
-# Для небольших кластеров (<= порога): 3 здания на 1 сайт/центроид.
+_VORONOI_BPC_SMALL_CLUSTER_MAX_AREA_M2 = 3_000_000.0
+# Малый кластер (<= порога), однородные не-МКД: 3 здания на 1 сайт.
 _VORONOI_BPC_SMALL_CLUSTER_BUILDINGS_PER_CENTROID = 3
+# Малый кластер: МКД — 2 здания на 1 центроид (только МКД или в смешанном режиме).
+_VORONOI_BPC_SMALL_CLUSTER_MKD_BUILDINGS_PER_CENTROID = 2
 # Дополнительное уплотнение графа для небольших кластеров.
 _SMALL_CLUSTER_EXTRA_KNN = 2
 _SMALL_CLUSTER_EXTRA_EDGE_MAX_M = 450.0
@@ -62,7 +65,8 @@ def _hull_area_m2(hull_poly: Any) -> float:
 
 def _voronoi_effective_buildings_per_centroid(base_bpc: int, hull_poly: Any) -> int:
     """
-    При площади hull ≤ порога — 3 здания на сайт (однородный кластер по типам).
+    При площади hull ≤ порога — 3 здания на сайт для однородного не-МКД кластера
+    (для только МКД размер группы задаётся отдельно — см. _VORONOI_BPC_SMALL_CLUSTER_MKD_BUILDINGS_PER_CENTROID).
     При большей площади — `base_bpc` зданий на сайт (или fallback 60).
     """
     area_m2 = _hull_area_m2(hull_poly)
@@ -1732,19 +1736,24 @@ def build_voronoi_local_paths_fc(
             continue
 
         hull_poly = _hull_polygon_for_cluster(hulls_norm, group_id)
-        bpc_large = max(1, int(buildings_per_centroid or _VORONOI_BPC_LARGE_CLUSTER_FALLBACK))
         if _small_cluster_mixed_mkd_nonmkd(hull_poly, pts_mkd, pts_non):
             pts_arr = _voronoi_centroids_mixed_small_cluster(
                 pts_mkd,
                 pts_non,
-                bpc_mkd=_VORONOI_BPC_SMALL_CLUSTER_BUILDINGS_PER_CENTROID,
-                bpc_non=bpc_large,
+                bpc_mkd=_VORONOI_BPC_SMALL_CLUSTER_MKD_BUILDINGS_PER_CENTROID,
+                bpc_non=max(1, int(buildings_per_centroid or _VORONOI_BPC_LARGE_CLUSTER_FALLBACK)),
             )
         else:
             target_group_size = max(
                 1,
                 _voronoi_effective_buildings_per_centroid(buildings_per_centroid, hull_poly),
             )
+            if (
+                _hull_area_m2(hull_poly) <= _VORONOI_BPC_SMALL_CLUSTER_MAX_AREA_M2
+                and len(pts_non) == 0
+                and len(pts_mkd) >= 2
+            ):
+                target_group_size = max(1, _VORONOI_BPC_SMALL_CLUSTER_MKD_BUILDINGS_PER_CENTROID)
             pts_arr = np.asarray(pts_mkd + pts_non, dtype=float)
             pts_arr = _aggregate_points_to_centroids(pts_arr, target_group_size)
 
@@ -2053,7 +2062,6 @@ def build_voronoi_edges_from_pipeline_raw(
         hull_poly = _hull_polygon_for_cluster(hulls_norm, cluster_id)
         sk = str(cluster_id)
         split = mkd_split_by_cluster.get(sk) if mkd_split_by_cluster else None
-        bpc_large = max(1, int(buildings_per_centroid or _VORONOI_BPC_LARGE_CLUSTER_FALLBACK))
         if (
             split is not None
             and _small_cluster_mixed_mkd_nonmkd(hull_poly, split[0], split[1])
@@ -2061,14 +2069,21 @@ def build_voronoi_edges_from_pipeline_raw(
             pts_arr = _voronoi_centroids_mixed_small_cluster(
                 split[0],
                 split[1],
-                bpc_mkd=_VORONOI_BPC_SMALL_CLUSTER_BUILDINGS_PER_CENTROID,
-                bpc_non=bpc_large,
+                bpc_mkd=_VORONOI_BPC_SMALL_CLUSTER_MKD_BUILDINGS_PER_CENTROID,
+                bpc_non=max(1, int(buildings_per_centroid or _VORONOI_BPC_LARGE_CLUSTER_FALLBACK)),
             )
         else:
             target_group_size = max(
                 1,
                 _voronoi_effective_buildings_per_centroid(buildings_per_centroid, hull_poly),
             )
+            if (
+                split is not None
+                and _hull_area_m2(hull_poly) <= _VORONOI_BPC_SMALL_CLUSTER_MAX_AREA_M2
+                and len(split[0]) >= 2
+                and len(split[1]) == 0
+            ):
+                target_group_size = max(1, _VORONOI_BPC_SMALL_CLUSTER_MKD_BUILDINGS_PER_CENTROID)
             pts_arr = np.asarray(pts, dtype=float)
             pts_arr = _aggregate_points_to_centroids(pts_arr, target_group_size)
 
