@@ -1,7 +1,7 @@
 """
 Локальные рёбра диаграммы Вороного по кластерам спроса.
 Сайты — центроиды зданий (возможно агрегированные) и точки зарядных станций в кластере.
-Площадь hull (м²): до порога — одно здание на один сайт; выше — агрегация по параметру buildings_per_centroid
+Площадь hull (м²): до порога — 3 здания на один сайт; выше — агрегация по параметру buildings_per_centroid
 (по умолчанию 60). No-fly зоны для Вороного не учитываются (ни отбор точек, ни обрезка рёбер).
 """
 from __future__ import annotations
@@ -16,6 +16,7 @@ import logging
 
 from shapely.geometry import LineString, Point
 from shapely.ops import unary_union
+from shapely.prepared import prep
 
 from data_service import DataService
 
@@ -23,6 +24,12 @@ logger = logging.getLogger(__name__)
 
 # Hull площадью до этого порога (м², EPSG:3857) — без агрегации (1 здание = 1 сайт).
 _VORONOI_BPC_SMALL_CLUSTER_MAX_AREA_M2 = 2_000_000.0
+# Для небольших кластеров (<= порога): 3 здания на 1 сайт/центроид.
+_VORONOI_BPC_SMALL_CLUSTER_BUILDINGS_PER_CENTROID = 3
+# Дополнительное уплотнение графа для небольших кластеров.
+_SMALL_CLUSTER_EXTRA_KNN = 2
+_SMALL_CLUSTER_EXTRA_EDGE_MAX_M = 450.0
+_SMALL_CLUSTER_EXTRA_MAX_POINTS = 1500
 # Если в запросе не задан buildings_per_centroid, для крупных кластеров используется это значение.
 _VORONOI_BPC_LARGE_CLUSTER_FALLBACK = 60
 # Мосты между компонентами графа внутри кластера (если включён фильтр по препятствиям — с проверкой пересечений).
@@ -51,12 +58,12 @@ def _hull_area_m2(hull_poly: Any) -> float:
 
 def _voronoi_effective_buildings_per_centroid(base_bpc: int, hull_poly: Any) -> int:
     """
-    При площади hull ≤ порога — 1 здание на сайт.
+    При площади hull ≤ порога — 3 здания на сайт.
     При большей площади — `base_bpc` зданий на сайт (или fallback 60).
     """
     area_m2 = _hull_area_m2(hull_poly)
     if area_m2 <= _VORONOI_BPC_SMALL_CLUSTER_MAX_AREA_M2:
-        return 1
+        return _VORONOI_BPC_SMALL_CLUSTER_BUILDINGS_PER_CENTROID
     return max(1, int(base_bpc or _VORONOI_BPC_LARGE_CLUSTER_FALLBACK))
 
 
@@ -246,7 +253,11 @@ def _filter_voronoi_fc_linestrings_nfz(fc: dict, nfz_union: Any) -> dict:
     """Удаляет рёбра LineString, пересекающие внутренность no-fly (is_edge_blocked)."""
     if nfz_union is None or getattr(nfz_union, "is_empty", True):
         return fc
-    from station_placement import is_edge_blocked
+    eps = 1e-9
+    try:
+        nfz_prepared = prep(nfz_union)
+    except Exception:
+        nfz_prepared = None
 
     feats = list(fc.get("features", []) or [])
     kept: list[dict] = []
@@ -261,13 +272,47 @@ def _filter_voronoi_fc_linestrings_nfz(fc: dict, nfz_union: Any) -> dict:
         if len(coords) < 2:
             continue
         try:
-            line = LineString([(float(c[0]), float(c[1])) for c in coords if len(c) >= 2])
+            line_coords = []
+            for c in coords:
+                if len(c) >= 2:
+                    line_coords.append((float(c[0]), float(c[1])))
+            if len(line_coords) < 2:
+                continue
+            line = LineString(line_coords)
         except Exception:
             kept.append(feat)
             continue
-        if is_edge_blocked(line, nfz_union, safety_buffer=0.0):
+        try:
+            if nfz_prepared is not None and not nfz_prepared.intersects(line):
+                kept.append(feat)
+                continue
+            inter = nfz_union.intersection(line)
+            if inter.is_empty:
+                kept.append(feat)
+                continue
+            # Касание границы точкой считаем допустимым.
+            if inter.geom_type in ("Point", "MultiPoint"):
+                kept.append(feat)
+                continue
+            if inter.geom_type == "GeometryCollection":
+                parts = list(getattr(inter, "geoms", []))
+                if parts and all(
+                    (
+                        p.geom_type in ("Point", "MultiPoint")
+                        or getattr(p, "length", 0.0) <= eps
+                    )
+                    for p in parts
+                ):
+                    kept.append(feat)
+                    continue
+            # Любая нетривиальная линейная/площадная часть внутри NFZ — блокируем.
+            if getattr(inter, "length", 0.0) > eps or getattr(inter, "area", 0.0) > eps:
+                continue
             continue
-        kept.append(feat)
+        except Exception:
+            # Консервативно оставляем ребро при ошибке геометрии.
+            kept.append(feat)
+            continue
     out = dict(fc)
     out["features"] = kept
     return out
@@ -960,6 +1005,123 @@ def _add_intra_cluster_nfz_safe_bridges(
     return out
 
 
+def _add_extra_intra_edges_for_small_clusters(
+    fc: dict,
+    coords: np.ndarray,
+    flags: np.ndarray,
+    cluster_per_point: list[Any],
+    hulls_norm: gpd.GeoDataFrame | None,
+    *,
+    k_neighbors: int = _SMALL_CLUSTER_EXTRA_KNN,
+    max_edge_m: float = _SMALL_CLUSTER_EXTRA_EDGE_MAX_M,
+) -> dict:
+    """
+    Добавляет короткие дополнительные рёбра внутри небольших кластеров (по k ближайшим соседям),
+    чтобы повысить локальную связность там, где чистого Voronoi недостаточно.
+    """
+    if not fc or not isinstance(fc, dict):
+        return {"type": "FeatureCollection", "features": []}
+    feats = list(fc.get("features", []) or [])
+    n = len(coords)
+    if n < 3 or len(cluster_per_point) != n:
+        return {"type": "FeatureCollection", "features": feats}
+    if k_neighbors <= 0 or max_edge_m <= 0:
+        return {"type": "FeatureCollection", "features": feats}
+
+    fl = np.asarray(flags, dtype=bool)
+    if len(fl) != n:
+        fl = np.zeros(n, dtype=bool)
+
+    # Уже существующие внутрикластерные рёбра, чтобы не дублировать.
+    existing_pairs: set[tuple[int, int]] = set()
+    for feat in feats:
+        p = feat.get("properties") or {}
+        if p.get("inter_cluster"):
+            continue
+        si, ti = p.get("source_i"), p.get("target_i")
+        if si is None or ti is None:
+            continue
+        a, b = int(si), int(ti)
+        if a < 0 or b < 0 or a >= n or b >= n or a == b:
+            continue
+        existing_pairs.add((a, b) if a < b else (b, a))
+
+    by_cluster: dict[str, list[int]] = {}
+    for i, c in enumerate(cluster_per_point):
+        by_cluster.setdefault(str(c), []).append(i)
+
+    added = 0
+    for cid, idxs in by_cluster.items():
+        if len(idxs) < 3:
+            continue
+        if len(idxs) > _SMALL_CLUSTER_EXTRA_MAX_POINTS:
+            continue
+        hp = _hull_polygon_for_cluster(hulls_norm, cid)
+        area = _hull_area_m2(hp)
+        if area > _VORONOI_BPC_SMALL_CLUSTER_MAX_AREA_M2:
+            continue
+
+        local = np.asarray([coords[i] for i in idxs], dtype=float)
+        for li, gi in enumerate(idxs):
+            pi = local[li]
+            dists = np.empty(len(idxs), dtype=float)
+            for lj in range(len(idxs)):
+                if lj == li:
+                    dists[lj] = np.inf
+                    continue
+                pj = local[lj]
+                dists[lj] = _segment_length_m(
+                    float(pi[0]), float(pi[1]), float(pj[0]), float(pj[1])
+                )
+            k_eff = min(k_neighbors, max(0, len(idxs) - 1))
+            if k_eff <= 0:
+                continue
+            nbr_local_idx = np.argpartition(dists, k_eff)[:k_eff]
+            for lj in nbr_local_idx.tolist():
+                gj = idxs[int(lj)]
+                if gi == gj:
+                    continue
+                u, v = (gi, gj) if gi < gj else (gj, gi)
+                if (u, v) in existing_pairs:
+                    continue
+                d = float(dists[int(lj)])
+                if not np.isfinite(d) or d > max_edge_m:
+                    continue
+                p1 = coords[u]
+                p2 = coords[v]
+                feats.append(
+                    {
+                        "type": "Feature",
+                        "geometry": {
+                            "type": "LineString",
+                            "coordinates": [
+                                [float(p1[0]), float(p1[1])],
+                                [float(p2[0]), float(p2[1])],
+                            ],
+                        },
+                        "properties": {
+                            **_station_edge_props(
+                                _cluster_id_prop_from_key(cid),
+                                "voronoi_local",
+                                u,
+                                v,
+                                fl,
+                                group_mode=None,
+                            ),
+                            "inter_cluster": False,
+                            "small_cluster_knn_extra": True,
+                        },
+                    }
+                )
+                existing_pairs.add((u, v))
+                added += 1
+
+    out = dict(fc)
+    out["features"] = feats
+    out["small_cluster_extra_edges_added"] = int(added)
+    return out
+
+
 def _bordering_cluster_pair_keys(
     hulls_norm: gpd.GeoDataFrame | None,
     *,
@@ -1005,6 +1167,111 @@ def _bordering_cluster_pair_keys(
             if d <= tol:
                 out.add(tuple(sorted((ids[i], ids[j]))))
     return out
+
+
+def _filter_inter_cluster_edges_through_third_cluster(
+    fc: dict,
+    hulls_norm: gpd.GeoDataFrame | None,
+) -> dict:
+    """
+    Удаляет межкластерные рёбра, если они проходят через hull любого третьего кластера.
+    Для скорости использует spatial index по hull bbox.
+    """
+    if not fc or not isinstance(fc, dict):
+        return {"type": "FeatureCollection", "features": []}
+    feats = list(fc.get("features", []) or [])
+    if not feats or hulls_norm is None or len(hulls_norm) == 0:
+        return {"type": "FeatureCollection", "features": feats}
+
+    h = hulls_norm[["cluster_id", "geometry"]].copy()
+    h = h[h["cluster_id"].notna()].copy()
+    if len(h) == 0:
+        return {"type": "FeatureCollection", "features": feats}
+    try:
+        h["geometry"] = h.geometry.buffer(0)
+    except Exception:
+        pass
+    h = h[h.geometry.notna()].copy()
+    h = h[~h.geometry.is_empty].copy()
+    if len(h) == 0:
+        return {"type": "FeatureCollection", "features": feats}
+
+    try:
+        sidx = h.sindex
+    except Exception:
+        sidx = None
+
+    eps = 1e-9
+    kept: list[dict] = []
+    for feat in feats:
+        if not isinstance(feat, dict):
+            continue
+        props = feat.get("properties") or {}
+        if not props.get("inter_cluster"):
+            kept.append(feat)
+            continue
+        cid_raw = props.get("cluster_id")
+        if not (isinstance(cid_raw, str) and "|" in cid_raw):
+            kept.append(feat)
+            continue
+        pair_parts = [p.strip() for p in cid_raw.split("|") if str(p).strip()]
+        if len(pair_parts) != 2:
+            kept.append(feat)
+            continue
+        endpoint_clusters = {pair_parts[0], pair_parts[1]}
+
+        geom = feat.get("geometry") or {}
+        if geom.get("type") != "LineString":
+            kept.append(feat)
+            continue
+        coords = geom.get("coordinates") or []
+        if len(coords) < 2:
+            continue
+        try:
+            line = LineString([(float(c[0]), float(c[1])) for c in coords if len(c) >= 2])
+        except Exception:
+            kept.append(feat)
+            continue
+        if line.is_empty:
+            continue
+
+        blocked = False
+        try:
+            cand_idx = list(sidx.intersection(line.bounds)) if sidx is not None else list(range(len(h)))
+            for hi in cand_idx:
+                row = h.iloc[int(hi)]
+                other_cid = str(row["cluster_id"])
+                if other_cid in endpoint_clusters:
+                    continue
+                g = row["geometry"]
+                if g is None or getattr(g, "is_empty", True):
+                    continue
+                inter = line.intersection(g)
+                if inter.is_empty:
+                    continue
+                if inter.geom_type in ("Point", "MultiPoint"):
+                    continue
+                if inter.geom_type == "GeometryCollection":
+                    parts = list(getattr(inter, "geoms", []))
+                    if parts and all(
+                        (p.geom_type in ("Point", "MultiPoint") or getattr(p, "length", 0.0) <= eps)
+                        for p in parts
+                    ):
+                        continue
+                if getattr(inter, "length", 0.0) > eps or getattr(inter, "area", 0.0) > eps:
+                    blocked = True
+                    break
+                blocked = True
+                break
+        except Exception:
+            kept.append(feat)
+            continue
+
+        if blocked:
+            continue
+        kept.append(feat)
+
+    return {"type": "FeatureCollection", "features": kept}
 
 
 def _separate_coincident_sites(coords: np.ndarray) -> np.ndarray:
@@ -1216,7 +1483,7 @@ def build_voronoi_local_paths_fc(
     road_graph = data.get("road_graph")
     city_boundary = data.get("city_boundary")
     no_fly_zones = data.get("no_fly_zones")
-    nfz_union_f = None  # Вороной без учёта no-fly
+    nfz_union_f = _no_fly_obstacles_union(no_fly_zones)
 
     if buildings is None or len(buildings) == 0:
         return {
@@ -1478,6 +1745,14 @@ def build_voronoi_local_paths_fc(
             "features": features,
         }
     )
+    deduped = _filter_inter_cluster_edges_through_third_cluster(deduped, hulls_norm)
+    deduped = _add_extra_intra_edges_for_small_clusters(
+        deduped,
+        coords_g,
+        flags_g,
+        all_cluster,
+        hulls_norm,
+    )
 
     deduped = _filter_voronoi_fc_linestrings_nfz(deduped, nfz_union_f)
     deduped = _add_intra_cluster_nfz_safe_bridges(
@@ -1588,7 +1863,7 @@ def build_voronoi_edges_from_pipeline_raw(
         return {"type": "FeatureCollection", "features": []}
 
     hulls_norm = _normalize_hulls_gdf(raw.get("demand_hulls"))
-    nfz_union_f = None  # Вороной без учёта no-fly
+    nfz_union_f = _no_fly_obstacles_union(raw.get("no_fly_zones"))
 
     grouped_points: dict[str, list[list[float]]] = {}
     for cluster_id, sub in d.groupby("cluster_id"):

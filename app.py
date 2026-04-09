@@ -459,7 +459,7 @@ def get_voronoi_local_paths(
     use_all_buildings: bool = Query(False, description="Все здания вне no-fly"),
     buildings_per_centroid: int = Query(
         60,
-        description="Для кластера с hull > 2 000 000 м² — зданий на 1 сайт Вороного (по умолчанию 60); при hull ≤ 2 000 000 м² всегда 1:1; no-fly для Вороного не применяется",
+        description="Для кластера с hull > 2 000 000 м² — зданий на 1 сайт Вороного (по умолчанию 60); при hull ≤ 2 000 000 м² — 3 здания на 1 сайт; no-fly для Вороного не применяется",
     ),
     inter_cluster_max_hull_gap_m: float = Query(
         2000.0,
@@ -519,7 +519,7 @@ def get_stations_placement(
     save_result: bool = Query(True, description="Сохранять новую расстановку в Redis"),
     buildings_per_centroid: int = Query(
         60,
-        description="Для hull > 2 000 000 м² — зданий на сайт (по умолчанию 60); при hull ≤ 2 000 000 м² — 1:1; no-fly для Вороного не применяется",
+        description="Для hull > 2 000 000 м² — зданий на сайт (по умолчанию 60); при hull ≤ 2 000 000 м² — 3 здания на 1 сайт; no-fly для Вороного не применяется",
     ),
     inter_cluster_max_hull_gap_m: float = Query(
         2000.0,
