@@ -1508,6 +1508,56 @@ class DataService:
         return gdf
 
     @staticmethod
+    def _building_levels_from_osm_row(row) -> Optional[int]:
+        """Надземные этажи из тегов OSM (как во внутренней логике get_demand_points_weighted)."""
+        for key in ("building:levels", "levels"):
+            val = row.get(key) if hasattr(row, "get") else None
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                continue
+            try:
+                s = str(val).strip().split()[0]
+                n = int(float(s.replace(",", ".")))
+                if 0 < n <= 200:
+                    return n
+            except (ValueError, TypeError):
+                pass
+        val = row.get("height") if hasattr(row, "get") else None
+        if val is not None and str(val).strip():
+            try:
+                s = (
+                    str(val)
+                    .strip()
+                    .lower()
+                    .replace("m", "")
+                    .replace("м", "")
+                    .strip()
+                    .split()[0]
+                )
+                h = float(s.replace(",", "."))
+                if 2 < h < 500:
+                    return max(1, int(round(h / 3.0)))
+            except (ValueError, TypeError):
+                pass
+        return None
+
+    def row_is_mkd_building(self, row) -> bool:
+        """
+        МКД для агрегации сайтов Вороного — те же признаки, что тип apartment в get_demand_points_weighted.
+        """
+        if self._is_apartment(row):
+            return True
+        btag_raw = row.get("building") if hasattr(row, "get") else None
+        btag = (
+            str(btag_raw).lower().strip()
+            if btag_raw is not None and not (isinstance(btag_raw, float) and pd.isna(btag_raw))
+            else ""
+        )
+        if btag not in ("residential", "yes", "true", "1"):
+            return False
+        levels = self._building_levels_from_osm_row(row)
+        return levels is not None and levels >= 3
+
+    @staticmethod
     def _is_apartment(row) -> bool:
         """Многоквартирный дом по OSM-тегу building."""
         tag = row.get('building') if hasattr(row, 'get') else None

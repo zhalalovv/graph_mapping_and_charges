@@ -1,8 +1,12 @@
 """
 Локальные рёбра диаграммы Вороного по кластерам спроса.
 Сайты — центроиды зданий (возможно агрегированные) и точки зарядных станций в кластере.
-Площадь hull (м²): до порога — 3 здания на один сайт; выше — агрегация по параметру buildings_per_centroid
-(по умолчанию 60). No-fly зоны для Вороного не учитываются (ни отбор точек, ни обрезка рёбер).
+Площадь hull (м²) до порога 2_000_000: обычно 3 здания на сайт; при площади выше порога —
+агрегация по buildings_per_centroid (по умолчанию 60).
+Если площадь hull не больше порога и в кластере одновременно есть МКД и прочие типы зданий,
+МКД агрегируются по 3 здания на сайт, остальные (частные, промышленные, магазины и т.д.) —
+по buildings_per_centroid (по умолчанию 60).
+No-fly зоны для Вороного не учитываются (ни отбор точек, ни обрезка рёбер).
 """
 from __future__ import annotations
 
@@ -58,13 +62,90 @@ def _hull_area_m2(hull_poly: Any) -> float:
 
 def _voronoi_effective_buildings_per_centroid(base_bpc: int, hull_poly: Any) -> int:
     """
-    При площади hull ≤ порога — 3 здания на сайт.
+    При площади hull ≤ порога — 3 здания на сайт (однородный кластер по типам).
     При большей площади — `base_bpc` зданий на сайт (или fallback 60).
     """
     area_m2 = _hull_area_m2(hull_poly)
     if area_m2 <= _VORONOI_BPC_SMALL_CLUSTER_MAX_AREA_M2:
         return _VORONOI_BPC_SMALL_CLUSTER_BUILDINGS_PER_CENTROID
     return max(1, int(base_bpc or _VORONOI_BPC_LARGE_CLUSTER_FALLBACK))
+
+
+def _aggregate_points_to_centroids(pts_arr: np.ndarray, target_group_size: int) -> np.ndarray:
+    """
+    Сжимает набор точек [lon, lat] в центроиды групп (~target_group_size точек в группе).
+    KMeans с запасным вариантом по лексикографическим чанкам (как в build_voronoi_local_paths_fc).
+    """
+    pts_arr = np.asarray(pts_arr, dtype=float)
+    tg = max(1, int(target_group_size))
+    if tg <= 1 or len(pts_arr) <= tg:
+        return pts_arr
+    n_groups = int(np.ceil(len(pts_arr) / float(tg)))
+    n_groups = max(2, min(n_groups, len(pts_arr)))
+    try:
+        from sklearn.cluster import MiniBatchKMeans
+
+        km = MiniBatchKMeans(
+            n_clusters=n_groups,
+            random_state=42,
+            batch_size=min(4096, max(1024, len(pts_arr) // 3)),
+            n_init=3,
+            max_iter=200,
+        )
+        labels = km.fit_predict(pts_arr)
+        centers = []
+        for k in range(n_groups):
+            members = pts_arr[labels == k]
+            if len(members) == 0:
+                continue
+            centers.append(members.mean(axis=0))
+        if len(centers) >= 2:
+            return np.asarray(centers, dtype=float)
+    except Exception:
+        pass
+    order = np.lexsort((pts_arr[:, 1], pts_arr[:, 0]))
+    ordered = pts_arr[order]
+    centers = []
+    for i in range(0, len(ordered), tg):
+        chunk = ordered[i : i + tg]
+        if len(chunk) == 0:
+            continue
+        centers.append(chunk.mean(axis=0))
+    if len(centers) >= 2:
+        return np.asarray(centers, dtype=float)
+    return pts_arr
+
+
+def _voronoi_centroids_mixed_small_cluster(
+    pts_mkd: list[list[float]],
+    pts_non: list[list[float]],
+    *,
+    bpc_mkd: int,
+    bpc_non: int,
+) -> np.ndarray:
+    """Объединённые сайты Вороного: МКД и не-МКД агрегируются с разным размером группы."""
+    parts: list[np.ndarray] = []
+    for bucket, bpc in ((pts_mkd, bpc_mkd), (pts_non, bpc_non)):
+        arr = np.asarray(bucket, dtype=float) if bucket else np.empty((0, 2), dtype=float)
+        if len(arr) == 0:
+            continue
+        parts.append(_aggregate_points_to_centroids(arr, max(1, int(bpc))))
+    if not parts:
+        return np.empty((0, 2), dtype=float)
+    if len(parts) == 1:
+        return parts[0]
+    return np.vstack(parts)
+
+
+def _small_cluster_mixed_mkd_nonmkd(
+    hull_poly: Any,
+    pts_mkd: list[list[float]],
+    pts_non: list[list[float]],
+) -> bool:
+    """Площадь hull ≤ порогу и в кластере после фильтра NFZ есть и МКД, и другие здания."""
+    if _hull_area_m2(hull_poly) > _VORONOI_BPC_SMALL_CLUSTER_MAX_AREA_M2:
+        return False
+    return len(pts_mkd) > 0 and len(pts_non) > 0
 
 
 def _normalize_hulls_gdf(hulls_gdf: gpd.GeoDataFrame | None) -> gpd.GeoDataFrame | None:
@@ -1626,8 +1707,9 @@ def build_voronoi_local_paths_fc(
         if sub is None or len(sub) < 2:
             continue
 
-        pts = []
-        for _, row in sub.iterrows():
+        pts_mkd: list[list[float]] = []
+        pts_non: list[list[float]] = []
+        for bid, row in sub.iterrows():
             geom = row.get("geometry")
             if geom is None or geom.is_empty:
                 continue
@@ -1637,50 +1719,34 @@ def build_voronoi_local_paths_fc(
                 continue
             if nfz_union_f is not None and _point_in_nfz_union(lon, lat, nfz_union_f):
                 continue
-            pts.append([lon, lat])
-        if len(pts) < 2:
+            try:
+                b_row = buildings_wgs.loc[bid]
+            except (KeyError, TypeError, IndexError):
+                b_row = row
+            if data_service.row_is_mkd_building(b_row):
+                pts_mkd.append([lon, lat])
+            else:
+                pts_non.append([lon, lat])
+
+        if len(pts_mkd) + len(pts_non) < 2:
             continue
 
         hull_poly = _hull_polygon_for_cluster(hulls_norm, group_id)
-        target_group_size = max(
-            1,
-            _voronoi_effective_buildings_per_centroid(buildings_per_centroid, hull_poly),
-        )
-
-        pts_arr = np.array(pts, dtype=float)
-        if target_group_size > 1 and len(pts_arr) > target_group_size:
-            n_groups = int(np.ceil(len(pts_arr) / float(target_group_size)))
-            n_groups = max(2, min(n_groups, len(pts_arr)))
-            try:
-                from sklearn.cluster import MiniBatchKMeans
-
-                km = MiniBatchKMeans(
-                    n_clusters=n_groups,
-                    random_state=42,
-                    batch_size=min(4096, max(1024, len(pts_arr) // 3)),
-                    n_init=3,
-                    max_iter=200,
-                )
-                labels = km.fit_predict(pts_arr)
-                centers = []
-                for k in range(n_groups):
-                    members = pts_arr[labels == k]
-                    if len(members) == 0:
-                        continue
-                    centers.append(members.mean(axis=0))
-                if len(centers) >= 2:
-                    pts_arr = np.asarray(centers, dtype=float)
-            except Exception:
-                order = np.lexsort((pts_arr[:, 1], pts_arr[:, 0]))
-                ordered = pts_arr[order]
-                centers = []
-                for i in range(0, len(ordered), target_group_size):
-                    chunk = ordered[i : i + target_group_size]
-                    if len(chunk) == 0:
-                        continue
-                    centers.append(chunk.mean(axis=0))
-                if len(centers) >= 2:
-                    pts_arr = np.asarray(centers, dtype=float)
+        bpc_large = max(1, int(buildings_per_centroid or _VORONOI_BPC_LARGE_CLUSTER_FALLBACK))
+        if _small_cluster_mixed_mkd_nonmkd(hull_poly, pts_mkd, pts_non):
+            pts_arr = _voronoi_centroids_mixed_small_cluster(
+                pts_mkd,
+                pts_non,
+                bpc_mkd=_VORONOI_BPC_SMALL_CLUSTER_BUILDINGS_PER_CENTROID,
+                bpc_non=bpc_large,
+            )
+        else:
+            target_group_size = max(
+                1,
+                _voronoi_effective_buildings_per_centroid(buildings_per_centroid, hull_poly),
+            )
+            pts_arr = np.asarray(pts_mkd + pts_non, dtype=float)
+            pts_arr = _aggregate_points_to_centroids(pts_arr, target_group_size)
 
         pts_arr, _ = _filter_xy_rows_outside_nfz(pts_arr, None, nfz_union_f)
 
@@ -1866,6 +1932,7 @@ def build_voronoi_edges_from_pipeline_raw(
     nfz_union_f = _no_fly_obstacles_union(raw.get("no_fly_zones"))
 
     grouped_points: dict[str, list[list[float]]] = {}
+    mkd_split_by_cluster: dict[str, tuple[list[list[float]], list[list[float]]]] | None = None
     for cluster_id, sub in d.groupby("cluster_id"):
         pts = []
         for _, row in sub.iterrows():
@@ -1923,6 +1990,8 @@ def build_voronoi_edges_from_pipeline_raw(
                             assigned["_bid"] = assigned.index
                         assigned = assigned.drop_duplicates(subset=["_bid"])
                         gp: dict[str, list[list[float]]] = {}
+                        gp_mkd: dict[str, list[list[float]]] = {}
+                        gp_non: dict[str, list[list[float]]] = {}
                         for _, row in assigned.iterrows():
                             g = row.geometry
                             cid = row.get("cluster_id")
@@ -1934,9 +2003,22 @@ def build_voronoi_edges_from_pipeline_raw(
                                 continue
                             if nfz_union_f is not None and _point_in_nfz_union(lo, la, nfz_union_f):
                                 continue
-                            gp.setdefault(str(cid), []).append([lo, la])
+                            sk = str(cid)
+                            gp.setdefault(sk, []).append([lo, la])
+                            bid = row.get("_bid")
+                            try:
+                                b_row = b.loc[bid] if bid is not None else row
+                            except (KeyError, TypeError, IndexError):
+                                b_row = row
+                            if data_service.row_is_mkd_building(b_row):
+                                gp_mkd.setdefault(sk, []).append([lo, la])
+                            else:
+                                gp_non.setdefault(sk, []).append([lo, la])
                         if gp:
                             grouped_points = gp
+                            mkd_split_by_cluster = {
+                                sk: (gp_mkd.get(sk, []), gp_non.get(sk, [])) for sk in gp
+                            }
             except Exception:
                 pass
 
@@ -1969,35 +2051,26 @@ def build_voronoi_edges_from_pipeline_raw(
             continue
 
         hull_poly = _hull_polygon_for_cluster(hulls_norm, cluster_id)
-        target_group_size = max(
-            1,
-            _voronoi_effective_buildings_per_centroid(buildings_per_centroid, hull_poly),
-        )
-
-        pts_arr = np.asarray(pts, dtype=float)
-        if target_group_size > 1 and len(pts_arr) > target_group_size:
-            n_groups = int(np.ceil(len(pts_arr) / float(target_group_size)))
-            n_groups = max(2, min(n_groups, len(pts_arr)))
-            try:
-                from sklearn.cluster import MiniBatchKMeans
-
-                km = MiniBatchKMeans(
-                    n_clusters=n_groups,
-                    random_state=42,
-                    batch_size=min(4096, max(1024, len(pts_arr) // 3)),
-                    n_init=3,
-                    max_iter=200,
-                )
-                labels = km.fit_predict(pts_arr)
-                centers = []
-                for k in range(n_groups):
-                    members = pts_arr[labels == k]
-                    if len(members) > 0:
-                        centers.append(members.mean(axis=0))
-                if len(centers) >= 2:
-                    pts_arr = np.asarray(centers, dtype=float)
-            except Exception:
-                pass
+        sk = str(cluster_id)
+        split = mkd_split_by_cluster.get(sk) if mkd_split_by_cluster else None
+        bpc_large = max(1, int(buildings_per_centroid or _VORONOI_BPC_LARGE_CLUSTER_FALLBACK))
+        if (
+            split is not None
+            and _small_cluster_mixed_mkd_nonmkd(hull_poly, split[0], split[1])
+        ):
+            pts_arr = _voronoi_centroids_mixed_small_cluster(
+                split[0],
+                split[1],
+                bpc_mkd=_VORONOI_BPC_SMALL_CLUSTER_BUILDINGS_PER_CENTROID,
+                bpc_non=bpc_large,
+            )
+        else:
+            target_group_size = max(
+                1,
+                _voronoi_effective_buildings_per_centroid(buildings_per_centroid, hull_poly),
+            )
+            pts_arr = np.asarray(pts, dtype=float)
+            pts_arr = _aggregate_points_to_centroids(pts_arr, target_group_size)
 
         pts_arr, _ = _filter_xy_rows_outside_nfz(pts_arr, None, nfz_union_f)
 
