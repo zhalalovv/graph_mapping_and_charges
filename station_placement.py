@@ -46,6 +46,10 @@ NO_FLY_CLEARANCE_M = 0.0
 # Максимум станций типа Б, присоединённых веткой к одной станции типа А.
 MAX_TYPE_B_BRANCHES_PER_TYPE_A = 4
 
+# Выбор между boundary и A*: сначала минимизируем длину/хорду (насколько обход близок к прямой), затем абсолютную длину.
+# Доп. штраф за километры «сверх хорды» (слабее ratio, чтобы не ломать выбор при почти равных ratio).
+DETOUR_SCORE_EXCESS_PER_KM = 0.08
+
 # Шаг дискретизации контура при обходе по границе (метры) — меньше = плавнее повороты.
 NO_FLY_BOUNDARY_STEP_M = 10.0
 # Скругление обходов после A*/контура: (edge_frac, итерации Chaikin), по возрастанию силы.
@@ -1448,6 +1452,27 @@ def route_lonlat_segment_with_nfz_detours(
         except Exception:
             return route_coords
 
+    def _tighten_detour_route(
+        route_coords: Optional[List[Tuple[float, float]]],
+    ) -> Optional[List[Tuple[float, float]]]:
+        """
+        Сжимает обход к более короткому эквиваленту (подмножество вершин + string-pull с концов),
+        чтобы траектория была ближе к длине прямой хорды, пока удаётся уменьшать число вершин.
+        """
+        cur = route_coords
+        if cur is None or len(cur) < 2:
+            return cur
+        for _ in range(8):
+            prev_n = len(cur)
+            cur2 = _compress_route_min_length_dp(cur)
+            if cur2 is None:
+                break
+            cur3 = _shortcut_visible_endpoints(cur2)
+            cur = cur3 if cur3 is not None else cur2
+            if len(cur) >= prev_n:
+                break
+        return cur
+
     def _iterative_boundary_detour(
         alon1: float,
         alat1: float,
@@ -1518,7 +1543,8 @@ def route_lonlat_segment_with_nfz_detours(
             n_air = int(len(air_ids))
             k_keep = int(min(max(32, 72), n_air))
             k_query = int(min(n_air, max(k_keep * 4, 120)))
-            max_attach_km = max(2.0, grid_spacing_km * 18.0)
+            # Уже привязка к сетке — меньше «крюков», ближе к короткой дуге вокруг препятствия.
+            max_attach_km = max(2.0, grid_spacing_km * 12.0)
 
             def _attach_ranked(tmp_nid: str, x0: float, y0: float, ox: float, oy: float) -> None:
                 """Рёбра к k_keep узлам с минимальной оценкой w(x0,n)+haversine(n→другой конец) — меньше ложных «крюков»."""
@@ -1587,9 +1613,7 @@ def route_lonlat_segment_with_nfz_detours(
     candidates: List[Tuple[float, List[Tuple[float, float]], str]] = []
 
     bd_coords, _bd_len = _iterative_boundary_detour(lon1, lat1, lon2, lat2)
-    bd_coords = _compress_route_min_length_dp(bd_coords)
-    bd_coords = _shortcut_visible_endpoints(bd_coords)
-    bd_coords = _compress_route_min_length_dp(bd_coords)
+    bd_coords = _tighten_detour_route(bd_coords)
     if bd_coords is not None and _route_is_safe(bd_coords):
         bd_km = _route_length_km(bd_coords)
         if bd_km is not None:
@@ -1599,9 +1623,7 @@ def route_lonlat_segment_with_nfz_detours(
 
     if air_graph is not None and air_tree is not None:
         ast_coords, _al = _astar_detour(lon1, lat1, lon2, lat2)
-        ast_coords = _compress_route_min_length_dp(ast_coords)
-        ast_coords = _shortcut_visible_endpoints(ast_coords)
-        ast_coords = _compress_route_min_length_dp(ast_coords)
+        ast_coords = _tighten_detour_route(ast_coords)
         if ast_coords is not None and _route_is_safe(ast_coords):
             ast_km = _route_length_km(ast_coords)
             if ast_km is not None:
@@ -1616,10 +1638,15 @@ def route_lonlat_segment_with_nfz_detours(
         )
         return None
 
-    candidates.sort(key=lambda x: x[0])
+    chord_ref = max(float(d_km), 1e-9)
+    candidates.sort(
+        key=lambda t: (
+            (t[0] / chord_ref) + float(DETOUR_SCORE_EXCESS_PER_KM) * max(0.0, t[0] - chord_ref),
+            t[0],
+        )
+    )
     detour_len, detour_coords, how = candidates[0]
-    detour_coords = _shortcut_visible_endpoints(detour_coords)
-    detour_coords = _compress_route_min_length_dp(detour_coords)
+    detour_coords = _tighten_detour_route(detour_coords)
     if detour_coords is not None:
         rl0 = _route_length_km(detour_coords)
         if rl0 is not None:
@@ -1646,7 +1673,17 @@ def route_lonlat_segment_with_nfz_detours(
         rl2 = _route_length_km(detour_coords)
         if rl2 is not None:
             detour_len = float(rl2)
-    log.info("Обход no-fly (%s): %s, длина %.3f км, точек %s", how, lbl, detour_len, len(detour_coords))
+        # Не вызывать _tighten_detour_route после Chaikin: сжатие снова оставляет 3–4 угла и ломает скругление.
+    ratio = float(detour_len) / chord_ref
+    log.info(
+        "Обход no-fly (%s): %s, хорда %.3f км, путь %.3f км (×%.2f к прямой), точек %s",
+        how,
+        lbl,
+        float(d_km),
+        float(detour_len),
+        ratio,
+        len(detour_coords),
+    )
     return (detour_coords, float(detour_len), how)
 
 
