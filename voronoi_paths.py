@@ -425,8 +425,6 @@ def apply_nfz_detours_to_voronoi_fc(
 
     # Ленивый импорт: избегаем циклических зависимостей с station_placement.
     from station_placement import (
-        NO_FLY_CLEARANCE_M,
-        buffer_geometry_wgs84_m,
         is_edge_blocked,
         prepare_air_detour_auxiliary,
         route_lonlat_segment_with_nfz_detours,
@@ -442,12 +440,7 @@ def apply_nfz_detours_to_voronoi_fc(
     except Exception:
         utm_anchor = (37.6173, 55.7558)
 
-    try:
-        obstacles_buf = buffer_geometry_wgs84_m(
-            obstacles, utm_anchor[0], utm_anchor[1], float(NO_FLY_CLEARANCE_M)
-        )
-    except Exception:
-        obstacles_buf = obstacles
+    obstacles_buf = obstacles
 
     # Без воздушного графа: в route_lonlat_segment_with_nfz_detours не вызывается A* (только boundary-обход).
     _nfz_u, nfz_metric_pair, _air_w, _air_c, _air_i, _air_t = prepare_air_detour_auxiliary(
@@ -1558,12 +1551,17 @@ def build_voronoi_local_paths_fc(
     inter_cluster_max_hull_gap_m: float = 2000.0,
     inter_cluster_max_edge_length_m: float = 2000.0,
     voronoi_intra_component_bridge_max_m: float = _DEFAULT_VORONOI_INTRA_COMPONENT_BRIDGE_MAX_M,
+    *,
+    city_data: dict | None = None,
 ) -> dict:
     _require_voronoi()
 
-    data = data_service.get_city_data(
-        city, network_type=network_type, simplify=simplify, load_no_fly_zones=True
-    )
+    if city_data is not None:
+        data = city_data
+    else:
+        data = data_service.get_city_data(
+            city, network_type=network_type, simplify=simplify, load_no_fly_zones=True
+        )
     buildings = data.get("buildings")
     road_graph = data.get("road_graph")
     city_boundary = data.get("city_boundary")

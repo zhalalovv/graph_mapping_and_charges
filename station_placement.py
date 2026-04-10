@@ -7,9 +7,9 @@
 Шаги:
   1) Точки спроса (кластеры/сетка 250×250 м с весом).
   2) Зарядки: weighted maximum coverage / set cover (жадный).
-  3) Гаражи и ТО: по ceil(N_A/3) каждого, промзона; разнос между точками и от зарядок (см. MIN_FACILITY_SEPARATION_KM); ветви к ближайшим A как у B→A.
-  4) Магистраль: только между станциями Charge_A (MST по A); гаражи/ТО — ответвления к ближайшим A (ветки на карте).
-  5) Локальная сеть и метрики.
+  3) Гаражи и ТО: по ceil(N_A/3) каждого, промзона; разнос между точками и от зарядок (см. MIN_FACILITY_SEPARATION_KM); ветви только к ближайшей зарядке A.
+  4) Магистраль: только между станциями Charge_A (MST по A); станции Б — по одной ветке к A (глобальный min-cost при квоте MAX_TYPE_B_BRANCHES_PER_TYPE_A Б на A), плюс до двух локальных связей Б↔Б; гараж/ТО — только к A.
+  5) Локальная сеть Б↔Б, метрики; в ответе placement — полный слой Вороного (сайты зданий + станции с cluster_id).
 """
 
 from __future__ import annotations
@@ -40,12 +40,12 @@ R_GARAGE_TO_KM = 0.8 * D_MAX_KM / 4.0
 # Разные типы станций (гараж / ТО / зарядка) и несколько гаражей — не в одной точке (разные корпуса).
 MIN_FACILITY_SEPARATION_KM = 0.4
 
-# Дополнительный метрический отступ от границы no-fly при построении "дуги" облёта.
-# Важно: no-fly зоны в данных уже буферизуются (порядка десятков метров),
-# поэтому здесь держим небольшой offset, чтобы не раздувать detour.
+# Резерв имён (раньше использовался доп. буфер вокруг NFZ для маршрутизации; сейчас геометрия зон берётся как в данных).
 NO_FLY_DETOUR_OFFSET_M = 10.0
-# Запас по периметру зоны для траекторий БПЛА (метры, в проекции UTM — не градусы WGS84).
-NO_FLY_CLEARANCE_M = 50.0
+NO_FLY_CLEARANCE_M = 0.0
+# Максимум станций типа Б, присоединённых веткой к одной станции типа А.
+MAX_TYPE_B_BRANCHES_PER_TYPE_A = 4
+
 # Шаг дискретизации контура при обходе по границе (метры) — меньше = плавнее повороты.
 NO_FLY_BOUNDARY_STEP_M = 10.0
 # Скругление обходов после A*/контура: (edge_frac, итерации Chaikin), по возрастанию силы.
@@ -62,12 +62,20 @@ DETOUR_SMOOTH_SCHEDULE: Tuple[Tuple[float, int], ...] = (
     # Классический Chaikin (0.25) с несколькими итерациями — мягкие дуги без «ломаных» после simplify.
     (0.25, 3),
     (0.25, 4),
+    (0.22, 3),
+    (0.20, 2),
 )
 # Обратная совместимость имён (если где-то импортировали константу).
 DETOUR_SMOOTH_EDGE_FRACS: Tuple[float, ...] = tuple(f for f, _ in DETOUR_SMOOTH_SCHEDULE)
 # Параметры сетки «воздушного» графа для A* (плотнее — короче допустимый обход при тех же ограничениях).
-UAV_AIR_GRID_SPACING_KM = 0.075
-UAV_AIR_GRID_MAX_NODES = 24000
+# Грубее сетка и меньше узлов — быстрее A* (раньше до 24k узлов × полный copy на каждый сегмент).
+UAV_AIR_GRID_SPACING_KM = 0.10
+UAV_AIR_GRID_MAX_NODES = 10000
+
+# Назначение Б→А: только рёбра «каждая А — до 4 ближайших Б» (+ гарантия хотя бы одно ребро на Б).
+BRANCH_NEAREST_B_PER_STATION_A = 4
+# Штраф в целевой функции min-cost за превышение max_branch_km: scale * (d + K * max(0, d-max)^2).
+BRANCH_ASSIGN_OVER_MAX_KM_PENALTY = 4.0
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -550,10 +558,51 @@ def astar_path_safe(
     return {"status": "no_path", "path_nodes": [], "path_coords": [], "path_length_km": 0.0}
 
 
+def buildings_footprint_union_wgs84(buildings: Any) -> Any:
+    """Объединение контуров зданий (EPSG:4326), упрощение для скорости. None если нечего."""
+    if buildings is None:
+        return None
+    try:
+        if hasattr(buildings, "__len__") and len(buildings) == 0:
+            return None
+        b = buildings
+        if hasattr(b, "to_crs"):
+            b = b.to_crs("EPSG:4326")
+        geoms: List[Any] = []
+        geom_series = getattr(b, "geometry", None)
+        if geom_series is None:
+            return None
+        for g in geom_series:
+            if g is None or getattr(g, "is_empty", True):
+                continue
+            try:
+                geoms.append(g.simplify(0.00006, preserve_topology=True))
+            except Exception:
+                geoms.append(g)
+        if not geoms:
+            return None
+        # Полный union тысяч зданий может занимать минуты; упрощаем сильнее и при перегрузе пропускаем.
+        if len(geoms) > 3000:
+            log = logging.getLogger(__name__)
+            log.warning(
+                "Зданий %s — объединение контуров для воздушного графа пропущено (слишком много полигонов). "
+                "Учитываются только NFZ; при необходимости уменьшите область города.",
+                len(geoms),
+            )
+            return None
+        u = unary_union(geoms)
+        if u is None or getattr(u, "is_empty", True):
+            return None
+        return u
+    except Exception:
+        return None
+
+
 def build_uav_air_graph_grid(
     city_boundary: Any,
     no_fly_zones: Any,
     *,
+    building_union: Any = None,
     grid_spacing_km: float = 0.35,
     connect_diagonal: bool = True,
     max_nodes: int = 8000,
@@ -562,7 +611,7 @@ def build_uav_air_graph_grid(
     """
     Сеточный "воздушный" граф для A*: узлы — точки в свободном пространстве,
     рёбра — прямые сегменты между соседями (8-связность), веса — haversine_km.
-    Узлы/рёбра фильтруются по no-fly зонам геометрией.
+    Узлы/рёбра фильтруются по no-fly и (опционально) по контурам зданий.
     """
     G = nx.Graph()
     if city_boundary is None or getattr(city_boundary, "is_empty", True):
@@ -612,6 +661,12 @@ def build_uav_air_graph_grid(
             # Узел должен быть вне no-fly.
             if no_fly_zones is not None and is_point_in_no_fly_zone((lon, lat), no_fly_zones, safety_buffer=safety_buffer):
                 continue
+            if building_union is not None and not getattr(building_union, "is_empty", True):
+                try:
+                    if building_union.contains(pt) or building_union.covers(pt):
+                        continue
+                except Exception:
+                    pass
             nid = f"air_{ix}_{iy}"
             G.add_node(nid, lon=float(lon), lat=float(lat), node_type="air")
             grid_to_node[(ix, iy)] = nid
@@ -641,6 +696,12 @@ def build_uav_air_graph_grid(
             line = LineString([(lon1, lat1), (lon2, lat2)])
             if no_fly_zones is not None and is_edge_blocked(line, no_fly_zones, safety_buffer=safety_buffer):
                 continue
+            if building_union is not None and not getattr(building_union, "is_empty", True):
+                try:
+                    if is_edge_blocked(line, building_union, safety_buffer=0.0):
+                        continue
+                except Exception:
+                    pass
 
             w_km = haversine_km(lat1, lon1, lat2, lon2)
             if w_km <= 0:
@@ -809,6 +870,35 @@ def polish_detour_polyline(
         ):
             best = cand
     return best
+
+
+def light_extra_smoothing_lonlat(
+    coords_lonlat: List[Tuple[float, float]],
+    nfz_union: Any,
+    *,
+    nfz_metric: Optional[Tuple[Any, Optional[Transformer]]] = None,
+    utm_anchor_lonlat: Optional[Tuple[float, float]] = None,
+    no_fly_safety_buffer: float = 0.0,
+) -> List[Tuple[float, float]]:
+    """Дополнительное сглаживание после polish_detour — только если ломаная остаётся допустимой для NFZ."""
+    if len(coords_lonlat) < 3:
+        return list(coords_lonlat)
+    alon = float(utm_anchor_lonlat[0]) if utm_anchor_lonlat is not None else float(coords_lonlat[0][0])
+    alat = float(utm_anchor_lonlat[1]) if utm_anchor_lonlat is not None else float(coords_lonlat[0][1])
+    for it, ef in ((2, 0.17), (1, 0.14)):
+        cand = smooth_lonlat_polyline_chaikin(coords_lonlat, alon, alat, int(it), edge_frac=float(ef))
+        if len(cand) < 3:
+            continue
+        if nfz_union is None or getattr(nfz_union, "is_empty", True):
+            return cand
+        if route_coords_clear_of_nfz(
+            cand,
+            nfz_union,
+            nfz_metric=nfz_metric,
+            no_fly_safety_buffer=no_fly_safety_buffer,
+        ):
+            return cand
+    return list(coords_lonlat)
 
 
 def _ring_signed_area_xy(coords_xy: List[Tuple[float, float]]) -> float:
@@ -1415,11 +1505,13 @@ def route_lonlat_segment_with_nfz_detours(
     def _astar_detour(alon1: float, alat1: float, alon2: float, alat2: float):
         if air_graph is None or air_tree is None or air_coords is None or not air_ids:
             return None, None
+        H = air_graph
+        ctr[0] += 1
+        tmp_start = "air_tmp_start_%s" % ctr[0]
+        tmp_goal = "air_tmp_goal_%s" % ctr[0]
+        out_coords: Optional[List[Tuple[float, float]]] = None
+        out_len: Optional[float] = None
         try:
-            ctr[0] += 1
-            tmp_start = "air_tmp_start_%s" % ctr[0]
-            tmp_goal = "air_tmp_goal_%s" % ctr[0]
-            H = air_graph.copy()
             H.add_node(tmp_start, lon=float(alon1), lat=float(alat1), node_type="air_tmp")
             H.add_node(tmp_goal, lon=float(alon2), lat=float(alat2), node_type="air_tmp")
             grid_spacing_km = float(air_graph.graph.get("__grid_spacing_km", UAV_AIR_GRID_SPACING_KM))
@@ -1442,7 +1534,7 @@ def route_lonlat_segment_with_nfz_detours(
                 scored: List[Tuple[float, float, Any]] = []
                 for idx in idxs:
                     nid2 = air_ids[int(idx)]
-                    d = air_graph.nodes[nid2]
+                    d = H.nodes[nid2]
                     elon = d.get("lon") or d.get("x")
                     elat = d.get("lat") or d.get("y")
                     if elon is None or elat is None:
@@ -1469,15 +1561,24 @@ def route_lonlat_segment_with_nfz_detours(
                 safety_buffer=no_fly_safety_buffer,
                 weight_attr="weight",
             )
-            if res.get("status") != "success":
-                return None, None
-            coords = res.get("path_coords") or []
-            length_km = res.get("path_length_km")
-            if not coords or length_km is None:
-                return None, None
-            return coords, float(length_km)
+            if res.get("status") == "success":
+                coords = res.get("path_coords") or []
+                length_km = res.get("path_length_km")
+                if coords and length_km is not None:
+                    out_coords = coords
+                    out_len = float(length_km)
         except Exception:
+            pass
+        finally:
+            for tn in (tmp_start, tmp_goal):
+                try:
+                    if H.has_node(tn):
+                        H.remove_node(tn)
+                except Exception:
+                    pass
+        if out_coords is None or out_len is None:
             return None, None
+        return out_coords, out_len
 
     if not _edge_blocked(lon1, lat1, lon2, lat2):
         return (straight, float(d_km), "straight")
@@ -1535,6 +1636,16 @@ def route_lonlat_segment_with_nfz_detours(
         rl = _route_length_km(detour_coords)
         if rl is not None:
             detour_len = float(rl)
+        detour_coords = light_extra_smoothing_lonlat(
+            detour_coords,
+            nfz_union,
+            nfz_metric=nfz_metric,
+            utm_anchor_lonlat=utm_anchor_lonlat,
+            no_fly_safety_buffer=no_fly_safety_buffer,
+        )
+        rl2 = _route_length_km(detour_coords)
+        if rl2 is not None:
+            detour_len = float(rl2)
     log.info("Обход no-fly (%s): %s, длина %.3f км, точек %s", how, lbl, detour_len, len(detour_coords))
     return (detour_coords, float(detour_len), how)
 
@@ -2722,17 +2833,64 @@ class StationPlacement:
         )
         return G
 
+    def _route_branch_segment_lonlat(
+        self,
+        lon1: float,
+        lat1: float,
+        lon2: float,
+        lat2: float,
+        nfz_union: Any,
+        nfz_metric_pair: Optional[Tuple[Any, Optional[Transformer]]],
+        air_work: Optional[nx.Graph],
+        air_coords: Optional[np.ndarray],
+        air_ids: Optional[List[Any]],
+        air_tree: Optional[Any],
+        anchor: Tuple[float, float],
+        detour_counter: List[int],
+        log_label: str,
+        *,
+        no_fly_safety_buffer: float = 0.0,
+    ) -> Tuple[List[List[float]], float]:
+        """Полилиния ветки с обходом NFZ (контур / A*), иначе прямой отрезок."""
+        routed = route_lonlat_segment_with_nfz_detours(
+            lon1,
+            lat1,
+            lon2,
+            lat2,
+            nfz_union,
+            air_graph=air_work,
+            air_coords=air_coords,
+            air_ids=air_ids,
+            air_tree=air_tree,
+            no_fly_safety_buffer=no_fly_safety_buffer,
+            nfz_metric=nfz_metric_pair,
+            utm_anchor_lonlat=anchor,
+            logger=self.logger,
+            detour_counter=detour_counter,
+            log_edge_label=log_label,
+        )
+        d0 = haversine_km(float(lat1), float(lon1), float(lat2), float(lon2))
+        if routed is None:
+            self.logger.warning("Ветка %s: обход не построен (конец в NFZ или ошибка) — прямая линия.", log_label)
+            return [[float(lon1), float(lat1)], [float(lon2), float(lat2)]], round(float(d0), 4)
+        coords, w_km, _how = routed
+        line_coords = [[float(c[0]), float(c[1])] for c in coords]
+        return line_coords, round(float(w_km), 4)
+
     def build_branch_edges(
         self,
         charge_stations: gpd.GeoDataFrame,
-        garage_points: Optional[gpd.GeoDataFrame] = None,
-        to_points: Optional[gpd.GeoDataFrame] = None,
         *,
-        k_nearest: int = 3,
+        max_b_per_type_a: int = MAX_TYPE_B_BRANCHES_PER_TYPE_A,
         max_branch_km: float = R_GARAGE_TO_KM,
+        obstacles: Any = None,
+        air_graph: Optional[nx.Graph] = None,
+        no_fly_safety_buffer: float = 0.0,
     ) -> List[Dict[str, Any]]:
         """
-        Ветки от станций типа Б к ближайшим узлам: зарядки А, гаражи, ТО (любые). Макс. k_nearest связей на станцию Б.
+        Ветки только Б→А: у каждой Б ровно одна ветка. Min-cost flow только по рёбрам «до k ближайших Б к каждой А» (k=BRANCH_NEAREST_B_PER_STATION_A),
+        не более max_b_per_type_a Б на одну А; в весах d + штраф за превышение max_branch_km (квадрат излишка).
+        При заданных obstacles / air_graph геометрия ветки — обход NFZ (контур и/или A*), как у магистрали и Б↔Б.
         Returns: список GeoJSON-like Feature (LineString, edge_type="branch", source_id, target_id, weight_km).
         """
         if charge_stations is None or len(charge_stations) == 0:
@@ -2749,47 +2907,281 @@ class StationPlacement:
         )
         a_indices = [i for i in charge_stations.index[type_a]]
         b_indices = [i for i in charge_stations.index[type_b]]
-        if not b_indices:
+        if not b_indices or not a_indices:
             return []
-        targets_pts: List[Tuple[float, float, str]] = []
-        for i in a_indices:
-            lon, lat = _coords_from_geom(charge_stations.loc[i].geometry)
-            targets_pts.append((lon, lat, f"charge_{i}"))
+        cap = max(1, int(max_b_per_type_a))
+        a_pts = {i: _coords_from_geom(charge_stations.loc[i].geometry) for i in a_indices}
+        b_pts = np.array([_coords_from_geom(charge_stations.loc[i].geometry) for i in b_indices])
+        n_b = len(b_indices)
+        n_a = len(a_indices)
+        dist = np.zeros((n_b, n_a), dtype=float)
+        for bi in range(n_b):
+            lon_b, lat_b = float(b_pts[bi, 0]), float(b_pts[bi, 1])
+            for aj in range(n_a):
+                ia = a_indices[aj]
+                lon_a, lat_a = a_pts[ia]
+                dist[bi, aj] = haversine_km(lat_b, lon_b, lat_a, lon_a)
+
+        # Рёбра назначения: только до BRANCH_NEAREST_B_PER_STATION_A ближайших Б к каждой А (+ хотя бы одно ребро на каждую Б).
+        k_near = min(int(BRANCH_NEAREST_B_PER_STATION_A), n_b)
+        allowed = np.zeros((n_b, n_a), dtype=bool)
+        for aj in range(n_a):
+            order = np.argsort(dist[:, aj])
+            for t in range(k_near):
+                allowed[int(order[t]), aj] = True
+        for bi in range(n_b):
+            if not np.any(allowed[bi, :]):
+                jn = int(np.argmin(dist[bi, :]))
+                allowed[bi, jn] = True
+
+        # Веса целочисленные; штраф за переполнение квоты >> любой суммы «нормальных» расстояний.
+        scale = 1_000_000
+        overflow_penalty = int(50_000 * scale)
+        pen_k = float(BRANCH_ASSIGN_OVER_MAX_KM_PENALTY)
+        mbrk = float(max_branch_km)
+
+        def _decode_flow(flow: Dict[str, Dict[str, int]]) -> List[int]:
+            chosen_aj: List[int] = []
+            for bi in range(n_b):
+                bnode = f"__b{bi}"
+                aj_pick = -1
+                for v, amt in (flow.get(bnode) or {}).items():
+                    if amt > 0 and v.startswith("__a") and v.endswith("_in"):
+                        aj_pick = int(v[len("__a") : -len("_in")])
+                        break
+                chosen_aj.append(aj_pick)
+            return chosen_aj
+
+        def _greedy_by_margin() -> List[int]:
+            """Запасной вариант: сначала Б с наименьшим «зазором» между 1-й и 2-й по расстоянию А."""
+            def _margin_bi(bi: int) -> float:
+                row = dist[bi]
+                if n_a <= 1:
+                    return 0.0
+                rs = np.sort(row)
+                return float(rs[1] - rs[0])
+
+            order = sorted(range(n_b), key=_margin_bi)
+            used = [0] * n_a
+            pick: Dict[int, int] = {}
+            for bi in order:
+                js = np.argsort(dist[bi])
+                chosen_j = int(js[0])
+                for j in js:
+                    jj = int(j)
+                    if used[jj] < cap:
+                        chosen_j = jj
+                        break
+                used[chosen_j] += 1
+                pick[bi] = chosen_j
+            return [pick[i] for i in range(n_b)]
+
+        G = nx.DiGraph()
+        G.add_node("__S", demand=-n_b)
+        G.add_node("__T", demand=n_b)
+        for bi in range(n_b):
+            bnode = f"__b{bi}"
+            G.add_edge("__S", bnode, capacity=1, weight=0)
+            for aj in range(n_a):
+                if not allowed[bi, aj]:
+                    continue
+                ain = f"__a{aj}_in"
+                d_km = float(dist[bi, aj])
+                excess = max(0.0, d_km - mbrk)
+                w = int(scale * (d_km + pen_k * excess * excess))
+                G.add_edge(bnode, ain, capacity=1, weight=w)
+        for aj in range(n_a):
+            ain, aout, aov = f"__a{aj}_in", f"__a{aj}_out", f"__a{aj}_ov"
+            G.add_edge(ain, aout, capacity=cap, weight=0)
+            G.add_edge(aout, "__T", capacity=cap, weight=0)
+            G.add_edge(ain, aov, capacity=n_b, weight=overflow_penalty)
+            G.add_edge(aov, "__T", capacity=n_b, weight=0)
+
+        chosen_aj: List[int]
+        n_overflow = 0
+        try:
+            flow = nx.min_cost_flow(G)
+            chosen_aj = _decode_flow(flow)
+            if any(j < 0 for j in chosen_aj):
+                raise nx.NetworkXError("incomplete B→A flow decode")
+            for aj in range(n_a):
+                ain, aov = f"__a{aj}_in", f"__a{aj}_ov"
+                ov = int((flow.get(ain) or {}).get(aov, 0))
+                n_overflow += ov
+        except (nx.NetworkXError, nx.NetworkXUnfeasible, ValueError, KeyError) as e:
+            self.logger.warning("Ветки Б→А: min-cost flow не удался (%s), запасной жадный разбор по зазору.", e)
+            chosen_aj = _greedy_by_margin()
+            n_overflow = 0
+
+        lons_anchor: List[float] = [float(x) for x in b_pts[:, 0]]
+        lats_anchor: List[float] = [float(x) for x in b_pts[:, 1]]
+        for bi in range(n_b):
+            ia = a_indices[chosen_aj[bi]]
+            la, lata = a_pts[ia]
+            lons_anchor.append(float(la))
+            lats_anchor.append(float(lata))
+        anchor = (float(np.mean(lons_anchor)), float(np.mean(lats_anchor)))
+        nfz_union, nfz_metric_pair, air_work, air_coords, air_ids, air_tree = prepare_air_detour_auxiliary(
+            obstacles,
+            air_graph,
+            anchor,
+            no_fly_safety_buffer=no_fly_safety_buffer,
+        )
+        detour_counter = [0]
+
+        features: List[Dict[str, Any]] = []
+        for bi, idx_b in enumerate(b_indices):
+            aj = chosen_aj[bi]
+            ia = a_indices[aj]
+            lon_b, lat_b = float(b_pts[bi, 0]), float(b_pts[bi, 1])
+            lon_a, lat_a = float(a_pts[ia][0]), float(a_pts[ia][1])
+            line_coords, w_km = self._route_branch_segment_lonlat(
+                lon_b,
+                lat_b,
+                lon_a,
+                lat_a,
+                nfz_union,
+                nfz_metric_pair,
+                air_work,
+                air_coords,
+                air_ids,
+                air_tree,
+                anchor,
+                detour_counter,
+                "branch_B %s→A %s" % (idx_b, ia),
+                no_fly_safety_buffer=no_fly_safety_buffer,
+            )
+            features.append(
+                {
+                    "type": "Feature",
+                    "geometry": {"type": "LineString", "coordinates": line_coords},
+                    "properties": {
+                        "edge_type": "branch",
+                        "source_id": str(idx_b),
+                        "target_id": f"charge_{ia}",
+                        "weight_km": w_km,
+                    },
+                }
+            )
+        if n_overflow > 0:
+            self.logger.warning(
+                "Ветки Б→А: %s соединений с превышением квоты %s Б на А (min-cost с штрафом).",
+                n_overflow,
+                cap,
+            )
+        self.logger.info("Ветки Б→А (макс. %s Б на одну А, min-cost): %s рёбер", cap, len(features))
+        return features
+
+    def build_facility_branch_edges(
+        self,
+        charge_stations: gpd.GeoDataFrame,
+        garage_points: Optional[gpd.GeoDataFrame] = None,
+        to_points: Optional[gpd.GeoDataFrame] = None,
+        *,
+        max_branch_km: float = R_GARAGE_TO_KM,
+        obstacles: Any = None,
+        air_graph: Optional[nx.Graph] = None,
+        no_fly_safety_buffer: float = 0.0,
+    ) -> List[Dict[str, Any]]:
+        """
+        Ветки гараж и ТО только к ближайшей зарядке А (по одной на объект; в пределах max_branch_km, иначе ближайшая без порога).
+        Геометрия — обход NFZ при заданных obstacles / air_graph.
+        """
+        if charge_stations is None or len(charge_stations) == 0:
+            return []
+        type_a = (
+            charge_stations["station_type"] == "charge_a"
+            if "station_type" in charge_stations.columns
+            else pd.Series([True] * len(charge_stations))
+        )
+        a_indices = [i for i in charge_stations.index[type_a]]
+        if not a_indices:
+            return []
+        a_pts = {i: _coords_from_geom(charge_stations.loc[i].geometry) for i in a_indices}
+        features: List[Dict[str, Any]] = []
+
+        def _nearest_a(lon_f: float, lat_f: float) -> Tuple[Any, float, float, float]:
+            best_ia: Any = a_indices[0]
+            best_d = math.inf
+            for ia in a_indices:
+                lon_a, lat_a = a_pts[ia]
+                d_km = haversine_km(lat_f, lon_f, lat_a, lon_a)
+                if d_km < best_d:
+                    best_d = d_km
+                    best_ia = ia
+            la, lata = a_pts[best_ia]
+            return best_ia, float(la), float(lata), float(best_d)
+
+        pending: List[Tuple[str, Any, float, float, float, float, str]] = []
         if garage_points is not None:
             for i, row in garage_points.iterrows():
-                lon, lat = _coords_from_geom(row.geometry)
-                targets_pts.append((lon, lat, f"garage_{i}"))
+                lon_f, lat_f = _coords_from_geom(row.geometry)
+                ia, lon_a, lat_a, d_km = _nearest_a(lon_f, lat_f)
+                if d_km > max_branch_km:
+                    self.logger.info(
+                        "Гараж %s: ближайшая А на %.2f км (порог %.2f км) — ветка к ближайшей А.",
+                        i,
+                        d_km,
+                        max_branch_km,
+                    )
+                pending.append((f"garage_{i}", ia, lon_f, lat_f, lon_a, lat_a, "branch_garage %s→A %s" % (i, ia)))
         if to_points is not None:
             for i, row in to_points.iterrows():
-                lon, lat = _coords_from_geom(row.geometry)
-                targets_pts.append((lon, lat, f"to_{i}"))
-        if not targets_pts:
+                lon_f, lat_f = _coords_from_geom(row.geometry)
+                ia, lon_a, lat_a, d_km = _nearest_a(lon_f, lat_f)
+                if d_km > max_branch_km:
+                    self.logger.info(
+                        "ТО %s: ближайшая А на %.2f км (порог %.2f км) — ветка к ближайшей А.",
+                        i,
+                        d_km,
+                        max_branch_km,
+                    )
+                pending.append((f"to_{i}", ia, lon_f, lat_f, lon_a, lat_a, "branch_to %s→A %s" % (i, ia)))
+
+        if not pending:
             return []
-        b_pts = np.array([_coords_from_geom(charge_stations.loc[i].geometry) for i in b_indices])
-        features = []
-        kk = min(k_nearest, len(targets_pts))
-        for bi, idx_b in enumerate(b_indices):
-            lon_b, lat_b = b_pts[bi, 0], b_pts[bi, 1]
-            cand = []
-            for lon_t, lat_t, tid in targets_pts:
-                d_km = haversine_km(lat_b, lon_b, lat_t, lon_t)
-                if d_km <= max_branch_km:
-                    cand.append((d_km, lon_t, lat_t, tid))
-            cand.sort(key=lambda x: x[0])
-            for d_km, lon_t, lat_t, tid in cand[:kk]:
-                features.append(
-                    {
-                        "type": "Feature",
-                        "geometry": {"type": "LineString", "coordinates": [[lon_b, lat_b], [lon_t, lat_t]]},
-                        "properties": {
-                            "edge_type": "branch",
-                            "source_id": str(idx_b),
-                            "target_id": tid,
-                            "weight_km": round(d_km, 4),
-                        },
-                    }
-                )
-        self.logger.info(f"Ветки Б→А/гараж/ТО (макс. {kk} на станцию): {len(features)} рёбер")
+
+        lons_a = [t[2] for t in pending] + [t[4] for t in pending]
+        lats_a = [t[3] for t in pending] + [t[5] for t in pending]
+        anchor = (float(np.mean(lons_a)), float(np.mean(lats_a)))
+        nfz_union, nfz_metric_pair, air_work, air_coords, air_ids, air_tree = prepare_air_detour_auxiliary(
+            obstacles,
+            air_graph,
+            anchor,
+            no_fly_safety_buffer=no_fly_safety_buffer,
+        )
+        detour_counter = [0]
+
+        for sid, ia, lon_f, lat_f, lon_a, lat_a, lbl in pending:
+            line_coords, w_km = self._route_branch_segment_lonlat(
+                lon_f,
+                lat_f,
+                lon_a,
+                lat_a,
+                nfz_union,
+                nfz_metric_pair,
+                air_work,
+                air_coords,
+                air_ids,
+                air_tree,
+                anchor,
+                detour_counter,
+                lbl,
+                no_fly_safety_buffer=no_fly_safety_buffer,
+            )
+            features.append(
+                {
+                    "type": "Feature",
+                    "geometry": {"type": "LineString", "coordinates": line_coords},
+                    "properties": {
+                        "edge_type": "branch",
+                        "source_id": sid,
+                        "target_id": f"charge_{ia}",
+                        "weight_km": w_km,
+                    },
+                }
+            )
+        self.logger.info("Ветки гараж/ТО→А: %s рёбер", len(features))
         return features
 
     def build_local_edges(
@@ -3261,9 +3653,10 @@ def run_full_pipeline(
     voronoi_buildings_per_centroid: int = 60,
     inter_cluster_max_hull_gap_m: float = 2000.0,
     inter_cluster_max_edge_length_m: float = 2000.0,
+    voronoi_intra_component_bridge_max_m: float = 600.0,
 ) -> Dict[str, Any]:
     """
-    Запускает полный пайплайн: данные города → спрос (DBSCAN или сетка) → зарядки → гаражи/ТО → метрики.
+    Запускает полный пайплайн: данные города → спрос → зарядки → гаражи/ТО → магистраль → ветки → локальные Б↔Б → слой Вороного (как у voronoi-local-paths, с сайтами станций).
     """
     logger = logging.getLogger(__name__)
     data = data_service.get_city_data(city_name, network_type=network_type, simplify=simplify, load_no_fly_zones=True)
@@ -3763,27 +4156,8 @@ def run_full_pipeline(
         except Exception:
             obstacles_union = None
 
+    # Маршрутизация и обходы — по геометрии no-fly из данных, без дополнительного метрического буфера.
     obstacles_routing = obstacles_union
-    if obstacles_union is not None and not getattr(obstacles_union, "is_empty", True):
-        try:
-            if city_boundary is not None and not getattr(city_boundary, "is_empty", True):
-                _bb = city_boundary.bounds
-                _rlon = float((_bb[0] + _bb[2]) / 2.0)
-                _rlat = float((_bb[1] + _bb[3]) / 2.0)
-            else:
-                _bb = obstacles_union.bounds
-                _rlon = float((_bb[0] + _bb[2]) / 2.0)
-                _rlat = float((_bb[1] + _bb[3]) / 2.0)
-            obstacles_routing = buffer_geometry_wgs84_m(
-                obstacles_union, _rlon, _rlat, float(NO_FLY_CLEARANCE_M)
-            )
-        except Exception as e:
-            logger.warning(
-                "Расширение no-fly на %.0f м для маршрутизации: %s", NO_FLY_CLEARANCE_M, e
-            )
-            obstacles_routing = obstacles_union
-    else:
-        obstacles_routing = None
 
     n_a_for_facilities = 0
     if (
@@ -3834,9 +4208,11 @@ def run_full_pipeline(
     uav_air_graph = None
     try:
         nfz_for_air = obstacles_routing if obstacles_routing is not None else no_fly_zones
+        b_union_air = buildings_footprint_union_wgs84(buildings)
         uav_air_graph = build_uav_air_graph_grid(
             city_boundary,
             nfz_for_air,
+            building_union=b_union_air,
             grid_spacing_km=UAV_AIR_GRID_SPACING_KM,
             connect_diagonal=True,
             max_nodes=UAV_AIR_GRID_MAX_NODES,
@@ -3869,42 +4245,71 @@ def run_full_pipeline(
                 nid = f"charge_{idx}"
                 if trunk.has_node(nid):
                     charge_stations.iloc[pos, charge_stations.columns.get_loc("trunk_degree")] = int(trunk.degree[nid])
-    branch_edges: List[Dict[str, Any]] = []
-    local_edges: List[Dict[str, Any]] = []
-
-    br_nfz: Any = None
-    br_metric: Optional[Tuple[Any, Optional[Transformer]]] = None
-    br_air: Optional[nx.Graph] = None
-    br_coords: Optional[np.ndarray] = None
-    br_ids: Optional[List[Any]] = None
-    br_tree: Optional[Any] = None
-    branch_detour_counter: List[int] = [0]
-    anchor_lon, anchor_lat = 0.0, 0.0
-    if charge_stations is not None and len(charge_stations) > 0:
-        _anchor_pts = np.array([_coords_from_geom(r.geometry) for _, r in charge_stations.iterrows()])
-        anchor_lon, anchor_lat = float(np.mean(_anchor_pts[:, 0])), float(np.mean(_anchor_pts[:, 1]))
-        br_nfz, br_metric, br_air, br_coords, br_ids, br_tree = prepare_air_detour_auxiliary(
-            obstacles_routing,
-            uav_air_graph,
-            (anchor_lon, anchor_lat),
+    cs_for_edges = charge_stations if charge_stations is not None else gpd.GeoDataFrame()
+    branch_edges = placement.build_branch_edges(
+        cs_for_edges,
+        max_b_per_type_a=MAX_TYPE_B_BRANCHES_PER_TYPE_A,
+        max_branch_km=R_GARAGE_TO_KM,
+        obstacles=obstacles_routing,
+        air_graph=uav_air_graph,
+        no_fly_safety_buffer=0.0,
+    )
+    branch_edges.extend(
+        placement.build_facility_branch_edges(
+            cs_for_edges,
+            garages if garages is not None and len(garages) > 0 else None,
+            to_stations if to_stations is not None and len(to_stations) > 0 else None,
+            max_branch_km=R_GARAGE_TO_KM,
+            obstacles=obstacles_routing,
+            air_graph=uav_air_graph,
             no_fly_safety_buffer=0.0,
         )
+    )
+    local_edges = placement.build_local_edges(
+        cs_for_edges,
+        obstacles_routing,
+        uav_air_graph,
+        max_edge_km=R_GARAGE_TO_KM,
+        max_neighbors_b=2,
+        no_fly_safety_buffer=0.0,
+    )
 
-    # Только магистрали А-А: связи «спутник → A» (B→A, garage→A, to→A) не строим.
-    # branch_edges остаётся пустым, local_edges и trunk рисуются отдельно.
+    from voronoi_paths import build_voronoi_local_paths_fc, charging_station_gdfs_to_features
 
-    # Временно: локальные рёбра Б↔Б не строим (обработка — станции, ветки к А, магистраль).
-    # Было: placement.build_local_edges(...)
+    st_voronoi_features = charging_station_gdfs_to_features(
+        charge_stations if charge_stations is not None and len(charge_stations) > 0 else None,
+        garages if garages is not None and len(garages) > 0 else None,
+        to_stations if to_stations is not None and len(to_stations) > 0 else None,
+    )
+    st_voronoi_arg: Optional[List[Dict[str, Any]]] = st_voronoi_features if st_voronoi_features else None
+    try:
+        voronoi_edges = build_voronoi_local_paths_fc(
+            data_service,
+            city_name,
+            network_type,
+            simplify,
+            dbscan_eps_m,
+            dbscan_min_samples,
+            use_all_buildings,
+            buildings_per_centroid=voronoi_buildings_per_centroid,
+            charging_station_features=st_voronoi_arg,
+            inter_cluster_max_hull_gap_m=inter_cluster_max_hull_gap_m,
+            inter_cluster_max_edge_length_m=inter_cluster_max_edge_length_m,
+            voronoi_intra_component_bridge_max_m=voronoi_intra_component_bridge_max_m,
+            city_data=data,
+        )
+    except Exception as e:
+        logger.warning("Вороной в placement: не удалось построить (%s)", e)
+        voronoi_edges = {"type": "FeatureCollection", "features": []}
 
     metrics = placement.compute_metrics(demand, charge_stations, trunk)
     metrics["charge"] = charge_metrics
     metrics["cluster_count"] = cluster_count
     metrics["charging_buildings_in_clusters"] = charging_buildings_in_clusters
-
-    # Пути Вороного в пайплайне временно отключены (эндпоинт /api/buildings/voronoi-local-paths без изменений).
-    voronoi_edges: Dict[str, Any] = {"type": "FeatureCollection", "features": []}
-    metrics["voronoi_edges_total"] = 0
-    metrics["voronoi_clusters_with_paths"] = 0
+    vf = list((voronoi_edges or {}).get("features") or [])
+    metrics["voronoi_edges_total"] = len(vf)
+    metrics["voronoi_clusters_with_paths"] = int((voronoi_edges or {}).get("clusters_with_paths") or 0)
+    metrics["voronoi_clusters_total"] = int((voronoi_edges or {}).get("clusters_total") or 0)
 
     return {
         "buildings": buildings,
@@ -3922,10 +4327,11 @@ def run_full_pipeline(
         "demand_hulls": cluster_hulls_gdf,
         "params": {
             "voronoi_buildings_per_centroid": int(voronoi_buildings_per_centroid),
-            "voronoi_includes_station_sites": True,
+            "voronoi_includes_station_sites": bool(st_voronoi_arg),
             "inter_cluster_max_hull_gap_m": float(inter_cluster_max_hull_gap_m),
             "inter_cluster_max_edge_length_m": float(inter_cluster_max_edge_length_m),
-            "voronoi_mode": "disabled",
+            "voronoi_mode": "full_in_placement",
+            "voronoi_intra_component_bridge_max_m": float(voronoi_intra_component_bridge_max_m),
         },
     }
 
@@ -4011,8 +4417,10 @@ def pipeline_result_to_geojson(raw: Dict[str, Any]) -> Dict[str, Any]:
     """Ответ API `/api/stations/placement`: слои для карты + метрики и параметры."""
     err = raw.get("error")
     charge = raw.get("charge_stations")
+    charging_b = gpd.GeoDataFrame()
     if charge is not None and len(charge) > 0 and "station_type" in charge.columns:
         charging_a = charge[charge["station_type"] == "charge_a"]
+        charging_b = charge[charge["station_type"] == "charge_b"]
     elif charge is not None and len(charge) > 0:
         # На случай старых схем — если станций A/B нет, считаем что пришедший GeoDataFrame и есть А.
         charging_a = charge
@@ -4050,16 +4458,24 @@ def pipeline_result_to_geojson(raw: Dict[str, Any]) -> Dict[str, Any]:
                         keep_cols.append(extra)
                 cluster_centroids = demand_for_link[[*keep_cols, "geometry"]]
 
+    ve = raw.get("voronoi_edges")
+    if isinstance(ve, dict) and ve.get("type") == "FeatureCollection":
+        voronoi_fc: Dict[str, Any] = {
+            "type": "FeatureCollection",
+            "features": list(ve.get("features") or []),
+        }
+    else:
+        voronoi_fc = empty_fc
+
     out: Dict[str, Any] = {
         "charging_type_a": _gdf_to_fc(charging_a),
-        # В этом режиме рисуем только магистрали А-А: отключаем B→A ветки и прочие слои.
-        "charging_type_b": empty_fc,
-        "garages": empty_fc,
-        "to_stations": empty_fc,
+        "charging_type_b": _gdf_to_fc(charging_b),
+        "garages": _gdf_to_fc(raw.get("garages")),
+        "to_stations": _gdf_to_fc(raw.get("to_stations")),
         "trunk": {"type": "FeatureCollection", "features": trunk_feats},
-        "branch_edges": empty_fc,
-        "local_edges": empty_fc,
-        "voronoi_edges": empty_fc,
+        "branch_edges": _list_features_to_fc(raw.get("branch_edges")),
+        "local_edges": _list_features_to_fc(raw.get("local_edges")),
+        "voronoi_edges": voronoi_fc,
         "metrics": raw.get("metrics") or {},
         "params": raw.get("params") or {},
         "cluster_centroids": _gdf_to_fc(cluster_centroids),

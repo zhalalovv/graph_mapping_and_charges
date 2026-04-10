@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from data_service import DataService
+from station_placement import pipeline_result_to_geojson, run_full_pipeline
 from voronoi_paths import build_voronoi_local_paths_fc
 
 
@@ -28,10 +29,6 @@ data_service = DataService()
 logger = logging.getLogger(__name__)
 
 
-def _empty_feature_collection() -> dict:
-    return {"type": "FeatureCollection", "features": []}
-
-
 def _round_geojson_coords(obj, precision: int = 6):
     if isinstance(obj, dict):
         return {k: _round_geojson_coords(v, precision) for k, v in obj.items()}
@@ -40,80 +37,6 @@ def _round_geojson_coords(obj, precision: int = 6):
     if isinstance(obj, float):
         return round(obj, precision)
     return obj
-
-
-def _voronoi_only_placement_payload(
-    *,
-    city: str,
-    network_type: str,
-    simplify: bool,
-    dbscan_eps_m: float,
-    dbscan_min_samples: int,
-    buildings_per_centroid: int,
-    inter_cluster_max_hull_gap_m: float,
-    inter_cluster_max_edge_length_m: float,
-    use_all_buildings: bool,
-    voronoi_intra_bridge_max_m: float,
-    from_saved: bool,
-) -> dict:
-    """
-    Только маршруты Вороного (как /api/buildings/voronoi-local-paths): без расстановки станций и без магистрали.
-    Формат ответа совместим с прежним `/api/stations/placement` (пустые слои станций/trunk, заполнен voronoi_edges).
-    """
-    raw_fc = build_voronoi_local_paths_fc(
-        data_service,
-        city=city.strip(),
-        network_type=network_type,
-        simplify=simplify,
-        dbscan_eps_m=dbscan_eps_m,
-        dbscan_min_samples=dbscan_min_samples,
-        use_all_buildings=use_all_buildings,
-        buildings_per_centroid=buildings_per_centroid,
-        charging_station_features=None,
-        inter_cluster_max_hull_gap_m=inter_cluster_max_hull_gap_m,
-        inter_cluster_max_edge_length_m=inter_cluster_max_edge_length_m,
-        voronoi_intra_component_bridge_max_m=float(voronoi_intra_bridge_max_m),
-    )
-    empty_fc = _empty_feature_collection()
-    vor_fc = {
-        "type": "FeatureCollection",
-        "features": list(raw_fc.get("features") or []),
-    }
-    metrics = {
-        "voronoi_edges_total": int(raw_fc.get("edges_total", len(vor_fc["features"]))),
-        "voronoi_clusters_with_paths": int(raw_fc.get("clusters_with_paths", 0)),
-        "voronoi_clusters_total": int(raw_fc.get("clusters_total", 0)),
-        "voronoi_intra_component_bridges_added": int(
-            raw_fc.get("voronoi_intra_component_bridges_added", 0)
-        ),
-    }
-    geo = {
-        "charging_type_a": empty_fc,
-        "charging_type_b": empty_fc,
-        "garages": empty_fc,
-        "to_stations": empty_fc,
-        "trunk": empty_fc,
-        "branch_edges": empty_fc,
-        "local_edges": empty_fc,
-        "voronoi_edges": _round_geojson_coords(vor_fc, precision=6),
-        "metrics": metrics,
-        "cluster_centroids": empty_fc,
-        "params": {
-            "city": city.strip(),
-            "network_type": network_type,
-            "simplify": simplify,
-            "pipeline_mode": "voronoi_only",
-            "buildings_per_centroid": buildings_per_centroid,
-            "inter_cluster_max_hull_gap_m": inter_cluster_max_hull_gap_m,
-            "inter_cluster_max_edge_length_m": inter_cluster_max_edge_length_m,
-            "dbscan_eps_m": dbscan_eps_m,
-            "dbscan_min_samples": dbscan_min_samples,
-            "use_all_buildings": use_all_buildings,
-            "voronoi_intra_bridge_max_m": float(voronoi_intra_bridge_max_m),
-        },
-    }
-    geo["from_saved"] = from_saved
-    return geo
 
 
 def _placement_cache_key(
@@ -141,7 +64,7 @@ def _placement_cache_key(
         "voronoi_intra_bridge_max_m": float(voronoi_intra_bridge_max_m),
         # Смена версии сбрасывает устаревший Redis-кэш (иначе после правок пайплайна
         # клиент может бесконечно получать пустой сохранённый ответ).
-        "placement_schema": 36,
+        "placement_schema": 41,
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()
@@ -519,7 +442,7 @@ def get_stations_placement(
     save_result: bool = Query(True, description="Сохранять новую расстановку в Redis"),
     buildings_per_centroid: int = Query(
         60,
-        description="Для hull > 3 000 000 м² — зданий на сайт (по умолчанию 60); при hull ≤ 3 000 000 м² — «малый» режим агрегации Вороного. Сайты в no-fly не включаются; рёбра с пересечением внутренности no-fly вырезаются.",
+        description="Плотность агрегации сайтов Вороного; используется и в placement, и в /api/buildings/voronoi-local-paths.",
     ),
     inter_cluster_max_hull_gap_m: float = Query(
         2000.0,
@@ -535,12 +458,11 @@ def get_stations_placement(
     ),
     voronoi_intra_bridge_max_m: float = Query(
         600.0,
-        description="Мосты связности внутри кластера после NFZ (м); 0 — выключить",
+        description="Мосты внутри компоненты Вороного после вырезания NFZ; placement и /api/buildings/voronoi-local-paths.",
     ),
 ):
     """
-    Пайплайн карты: только маршруты Вороного (меж- и внутрикластерные), без расстановки станций и без магистрали.
-    Параметры demand_method / a_by_admin_districts / candidates_per_cluster оставлены для совместимости запросов и не используются.
+    Полный пайплайн: зарядки A/B, гаражи/ТО, магистраль A–A, ветки B→A и гараж/ТО→A, локальные Б↔Б, слой Вороного (как у GET /api/buildings/voronoi-local-paths, с учётом точек станций в кластерах).
     Кэш в Redis — JSON ответа для карты.
     """
     cache_key = _placement_cache_key(
@@ -573,22 +495,31 @@ def get_stations_placement(
             return JSONResponse(data)
 
     try:
-        logger.info("Пайплайн: только маршруты Вороного (станции и магистраль отключены)")
-        geo = _voronoi_only_placement_payload(
-            city=city.strip(),
+        logger.info("Пайплайн placement: run_full_pipeline")
+        raw = run_full_pipeline(
+            data_service,
+            city.strip(),
             network_type=network_type,
             simplify=simplify,
+            demand_method=demand_method,
+            demand_cell_m=250.0,
             dbscan_eps_m=dbscan_eps_m,
             dbscan_min_samples=dbscan_min_samples,
-            buildings_per_centroid=buildings_per_centroid,
+            candidates_per_cluster=candidates_per_cluster,
+            use_all_buildings=use_all_buildings,
+            a_by_admin_districts=a_by_admin_districts,
+            voronoi_buildings_per_centroid=buildings_per_centroid,
             inter_cluster_max_hull_gap_m=inter_cluster_max_hull_gap_m,
             inter_cluster_max_edge_length_m=inter_cluster_max_edge_length_m,
-            use_all_buildings=use_all_buildings,
-            voronoi_intra_bridge_max_m=float(voronoi_intra_bridge_max_m),
-            from_saved=False,
+            voronoi_intra_component_bridge_max_m=float(voronoi_intra_bridge_max_m),
         )
+        geo = pipeline_result_to_geojson(raw)
+        geo = _round_geojson_coords(geo, precision=6)
+        geo["from_saved"] = False
         n_vor = len((geo.get("voronoi_edges") or {}).get("features", []) or [])
-        logger.info("Пайплайн завершён: рёбер Вороного=%s", n_vor)
+        n_a = len((geo.get("charging_type_a") or {}).get("features", []) or [])
+        n_b = len((geo.get("charging_type_b") or {}).get("features", []) or [])
+        logger.info("Пайплайн завершён: зарядки A=%s B=%s (voronoi_edges в placement: %s)", n_a, n_b, n_vor)
         if save_result and redis_client is not None:
             try:
                 redis_client.set(
@@ -625,7 +556,7 @@ def export_saved_stations(
         description="Должен совпадать с параметром при сохранении",
     ),
 ):
-    """Выгрузка сохранённого JSON карты из Redis (режим только Вороного)."""
+    """Выгрузка сохранённого JSON карты из Redis (полный пайплайн)."""
     redis_client = data_service.get_redis_client()
     if redis_client is None:
         raise HTTPException(status_code=503, detail="Redis недоступен")
