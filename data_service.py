@@ -1629,6 +1629,13 @@ class DataService:
     MIN_FLIGHT_LEVEL = 40.0  # м, минимальный эшелон (выше типичной застройки)
     FLIGHT_LEVEL_MARGIN = 10.0  # м, запас над высочайшими зданиями
     NUM_FLIGHT_LEVELS = 5  # количество эшелонов (5-й на MAX_DRONE_ALTITUDE)
+    # Фиксированные высоты эшелонов (м): маршрутизация и препятствия завязаны на этот ряд.
+    FIXED_FLIGHT_LEVEL_ALTITUDES_M: tuple[float, ...] = (40.0, 67.5, 95.0, 122.5, 150.0)
+    # Здание считается препятствием на эшелоне, если его высота не ниже эшелона более чем на этот запас (м).
+    FLIGHT_ALTITUDE_CLEARANCE_M = 5.0
+    # Номера эшелонов (1-based) для разных типов маршрутов на карте.
+    VORONOI_FLIGHT_ECHELON_LEVELS: tuple[int, ...] = (1, 2, 3)
+    HIGH_ALTITUDE_STATION_ECHELON_LEVELS: tuple[int, ...] = (4, 5)
 
     @staticmethod
     def _parse_osm_height(value) -> float | None:
@@ -1693,49 +1700,114 @@ class DataService:
         min_altitude: float | None = None,
     ) -> list[dict]:
         """
-        Вычисляет эшелоны полётов на основе высот зданий.
-
-        Args:
-            buildings: GeoDataFrame с колонкой height_m
-            num_levels: количество эшелонов (по умолчанию NUM_FLIGHT_LEVELS, 5)
-            max_altitude: максимальная высота (м), по умолчанию MAX_DRONE_ALTITUDE (150)
-            min_altitude: минимальная высота первого эшелона (м)
-
-        Returns:
-            Список dict: [{"level": 1, "altitude_m": 45, "label": "Эшелон 1"}, ...]
+        Фиксированный набор эшелонов (м): 40, 67.5, 95, 122.5, 150.
+        Статистика по высотам зданий логируется для справки, но не сдвигает эшелоны.
         """
         num_levels = num_levels if num_levels is not None else self.NUM_FLIGHT_LEVELS
-        max_alt = max_altitude if max_altitude is not None else self.MAX_DRONE_ALTITUDE
-        min_alt = min_altitude
-
-        if buildings is not None and len(buildings) > 0 and 'height_m' in buildings.columns:
-            p95 = float(np.percentile(buildings['height_m'], 95))
-            base_alt = max(
-                p95 + self.FLIGHT_LEVEL_MARGIN,
-                self.MIN_FLIGHT_LEVEL,
+        fixed = self.FIXED_FLIGHT_LEVEL_ALTITUDES_M
+        if num_levels > len(fixed):
+            self.logger.warning(
+                "Запрошено эшелонов %s, в фиксированном ряду только %s — лишние отброшены.",
+                num_levels,
+                len(fixed),
             )
-            if min_alt is not None:
-                base_alt = max(base_alt, min_alt)
+        n = max(1, min(int(num_levels), len(fixed)))
+
+        if buildings is not None and len(buildings) > 0 and "height_m" in buildings.columns:
+            p95 = float(np.percentile(buildings["height_m"], 95))
             self.logger.info(
-                f"Высоты зданий: p95={p95:.1f}м, базовый эшелон={base_alt:.1f}м"
+                "Высоты зданий: p95=%.1f м; эшелоны фиксированные: %s",
+                p95,
+                list(fixed[:n]),
             )
         else:
-            base_alt = self.MIN_FLIGHT_LEVEL
-            if min_alt is not None:
-                base_alt = max(base_alt, min_alt)
+            self.logger.info("Эшелоны полётов (фиксированные): %s", list(fixed[:n]))
 
-        # Равномерно распределяем эшелоны от base_alt до max_alt
-        step = (max_alt - base_alt) / max(1, num_levels - 1) if num_levels > 1 else 0
         levels = []
-        for i in range(num_levels):
-            alt = round(base_alt + i * step, 1)
-            levels.append({
-                "level": i + 1,
-                "altitude_m": alt,
-                "label": f"Эшелон {i + 1} ({alt:.0f} м)",
-            })
-        self.logger.info(f"Эшелоны полётов: {[l['altitude_m'] for l in levels]}")
+        for i in range(n):
+            alt = float(fixed[i])
+            levels.append(
+                {
+                    "level": i + 1,
+                    "altitude_m": alt,
+                    "label": f"Эшелон {i + 1} ({alt:g} м)",
+                }
+            )
         return levels
+
+    @staticmethod
+    def voronoi_echelon_altitudes_m(flight_levels: list | None) -> list[float]:
+        """Высоты эшелонов 1–3 (м), по которым строится локальный слой Вороного."""
+        fixed = DataService.FIXED_FLIGHT_LEVEL_ALTITUDES_M
+        if flight_levels is not None and len(flight_levels) >= 3:
+            try:
+                return [float(flight_levels[i]["altitude_m"]) for i in range(3)]
+            except (KeyError, TypeError, ValueError):
+                pass
+        return [float(fixed[i]) for i in range(3)]
+
+    @staticmethod
+    def echelon_altitude_to_building_obstacle_min_m(altitude_m: float) -> float:
+        """Минимальная высота здания (м), при которой оно препятствует полёту на данном эшелоне: alt − 5."""
+        return float(altitude_m) - float(DataService.FLIGHT_ALTITUDE_CLEARANCE_M)
+
+    @staticmethod
+    def all_echelon_building_obstacle_min_heights_m(flight_levels: list | None) -> dict[int, float]:
+        """
+        Для эшелонов 1…5: минимальная высота здания (м), при h ≥ которой не летаем на этом эшелоне
+        (высота эшелона − FLIGHT_ALTITUDE_CLEARANCE_M).
+        """
+        fixed = DataService.FIXED_FLIGHT_LEVEL_ALTITUDES_M
+        clearance = float(DataService.FLIGHT_ALTITUDE_CLEARANCE_M)
+        out: dict[int, float] = {}
+        for i in range(len(fixed)):
+            level = i + 1
+            try:
+                if flight_levels is not None and len(flight_levels) > i:
+                    alt = float(flight_levels[i]["altitude_m"])
+                else:
+                    alt = float(fixed[i])
+            except (KeyError, TypeError, ValueError, IndexError):
+                alt = float(fixed[i])
+            out[level] = alt - clearance
+        return out
+
+    @staticmethod
+    def voronoi_building_obstacle_min_height_m(flight_levels: list | None) -> float:
+        """
+        Самый жёсткий порог среди эшелонов 1–3 (м) — как у эшелона 1; для обратной совместимости.
+        Отдельные слои рёбер задаются в voronoi_by_echelon с порогом на каждый эшелон.
+        """
+        alts = DataService.voronoi_echelon_altitudes_m(flight_levels)
+        return min(alts) - float(DataService.FLIGHT_ALTITUDE_CLEARANCE_M)
+
+    @staticmethod
+    def voronoi_route_altitude_m(flight_levels: list | None) -> float:
+        """Нижняя высота из эшелонов Вороного (1–3), м — для обратной совместимости метаданных."""
+        return float(min(DataService.voronoi_echelon_altitudes_m(flight_levels)))
+
+    @staticmethod
+    def magistral_building_obstacle_min_height_m(flight_levels: list | None) -> float:
+        """
+        Порог (м) для общей геометрии магистрали и веток на эшелонах 4–5 при одном графе:
+        min(порог эшелона 4, порог эшелона 5) = min(122.5,150)−5 — безопасно и для 4-го, и для 5-го.
+        На эшелоне 5 отдельно достаточно порога 145 м (см. all_echelon_building_obstacle_min_heights_m).
+        """
+        clearance = float(DataService.FLIGHT_ALTITUDE_CLEARANCE_M)
+        fixed = DataService.FIXED_FLIGHT_LEVEL_ALTITUDES_M
+        if flight_levels is not None and len(flight_levels) >= 5:
+            try:
+                a4 = float(flight_levels[3]["altitude_m"])
+                a5 = float(flight_levels[4]["altitude_m"])
+                return min(a4, a5) - clearance
+            except (KeyError, TypeError, ValueError):
+                pass
+        return min(fixed[3], fixed[4]) - clearance
+
+    @staticmethod
+    def high_altitude_station_routing_obstacle_min_height_m(flight_levels: list | None) -> float:
+        """Синоним порога для всех маршрутов станций на эшелонах 4–5 (см. magistral_building_obstacle_min_height_m)."""
+        return DataService.magistral_building_obstacle_min_height_m(flight_levels)
 
     def ensure_flight_levels(self, data: dict, num_levels: int | None = None) -> dict:
         """

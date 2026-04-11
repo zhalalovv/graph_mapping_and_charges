@@ -6,11 +6,13 @@
 агрегация по buildings_per_centroid (по умолчанию 60).
 Если площадь hull не больше порога и в кластере одновременно есть МКД и прочие типы зданий,
 не-МКД — по buildings_per_centroid зданий на сайт (по умолчанию 60).
-Сайты (центроиды), попадающие в no-fly, отбрасываются; рёбра LineString, с нетривиальным
-пересечением внутренности NFZ, удаляются (как в _filter_voronoi_fc_linestrings_nfz).
+Сайты (центроиды), попадающие в no-fly, отбрасываются; для эшелонов 1–3 рёбра режутся отдельно:
+на эшелоне k не летаем над зданием, если height_m ≥ (высота_эшелона_k − 5 м) — см. voronoi_by_echelon.
+NFZ учитывается на всех эшелонах (как в _filter_voronoi_fc_linestrings_nfz).
 """
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 import geopandas as gpd
@@ -26,6 +28,47 @@ from shapely.prepared import prep
 from data_service import DataService
 
 logger = logging.getLogger(__name__)
+
+
+def _merge_polygon_unions_wgs84(*parts: Any) -> Any:
+    """Объединяет несколько shapely-геометрий (EPSG:4326); пустые пропускает."""
+    geoms = [g for g in parts if g is not None and not getattr(g, "is_empty", True)]
+    if not geoms:
+        return None
+    if len(geoms) == 1:
+        return geoms[0]
+    try:
+        u = unary_union(geoms)
+        return u if u is not None and not getattr(u, "is_empty", True) else None
+    except Exception:
+        return geoms[0]
+
+
+def _voronoi_fc_copy_filter_and_bridges(
+    fc_base: dict,
+    *,
+    barrier_union: Any,
+    coords_g: np.ndarray,
+    flags_g: np.ndarray,
+    all_cluster: list[Any],
+    max_bridge_m: float,
+) -> dict:
+    """Копия FC → фильтр по NFZ+зданиям → безопасные мосты внутри кластера."""
+    fc = {
+        "type": "FeatureCollection",
+        "features": copy.deepcopy(list(fc_base.get("features") or [])),
+    }
+    fc = _filter_voronoi_fc_linestrings_nfz(fc, barrier_union)
+    fc = _add_intra_cluster_nfz_safe_bridges(
+        fc,
+        coords_g,
+        flags_g,
+        all_cluster,
+        barrier_union,
+        max_bridge_m=float(max_bridge_m),
+    )
+    return fc
+
 
 # Hull площадью до этого порога (м², EPSG:3857) — без агрегации (1 здание = 1 сайт).
 _VORONOI_BPC_SMALL_CLUSTER_MAX_AREA_M2 = 3_000_000.0
@@ -1589,6 +1632,9 @@ def build_voronoi_local_paths_fc(
             "edges_total": 0,
         }
 
+    if "height_m" not in buildings_wgs.columns:
+        buildings_wgs = data_service._compute_building_heights(buildings_wgs)
+
     hulls_gdf = data.get("demand_hulls")
     if hulls_gdf is None or len(hulls_gdf) == 0:
         result = data_service.get_demand_points_weighted(
@@ -1827,20 +1873,60 @@ def build_voronoi_local_paths_fc(
         hulls_norm,
     )
 
-    deduped = _filter_voronoi_fc_linestrings_nfz(deduped, nfz_union_f)
-    deduped = _add_intra_cluster_nfz_safe_bridges(
-        deduped,
-        coords_g,
-        flags_g,
-        all_cluster,
-        nfz_union_f,
-        max_bridge_m=float(voronoi_intra_component_bridge_max_m),
+    from station_placement import buildings_footprint_union_min_height_wgs84
+
+    deduped_pre_barrier = deduped
+    voronoi_alts = DataService.voronoi_echelon_altitudes_m(data.get("flight_levels"))
+    echelon_levels = list(DataService.VORONOI_FLIGHT_ECHELON_LEVELS)
+    voronoi_by_echelon: dict[str, dict[str, Any]] = {}
+    bridge_m = float(voronoi_intra_component_bridge_max_m)
+
+    for idx, alt in enumerate(voronoi_alts):
+        level = int(echelon_levels[idx]) if idx < len(echelon_levels) else idx + 1
+        min_h_b = float(DataService.echelon_altitude_to_building_obstacle_min_m(float(alt)))
+        tall_i = buildings_footprint_union_min_height_wgs84(buildings_wgs, min_h_b)
+        barrier_i = _merge_polygon_unions_wgs84(nfz_union_f, tall_i)
+        fc_i = _voronoi_fc_copy_filter_and_bridges(
+            deduped_pre_barrier,
+            barrier_union=barrier_i,
+            coords_g=coords_g,
+            flags_g=flags_g,
+            all_cluster=all_cluster,
+            max_bridge_m=bridge_m,
+        )
+        voronoi_by_echelon[str(level)] = {
+            "type": "FeatureCollection",
+            "features": list(fc_i.get("features") or []),
+            "voronoi_echelon_level": level,
+            "voronoi_echelon_altitude_m": float(alt),
+            "voronoi_building_obstacle_min_height_m": min_h_b,
+            "voronoi_intra_component_bridges_added": int(fc_i.get("voronoi_intra_component_bridges_added") or 0),
+        }
+
+    e1 = voronoi_by_echelon.get("1") or next(iter(voronoi_by_echelon.values()))
+    deduped = dict(deduped_pre_barrier)
+    deduped["type"] = "FeatureCollection"
+    deduped["features"] = list(e1.get("features") or [])
+    deduped["voronoi_intra_component_bridges_added"] = int(
+        e1.get("voronoi_intra_component_bridges_added") or 0
     )
+    deduped["voronoi_by_echelon"] = voronoi_by_echelon
 
     # Обходы no-fly для рёбер Вороного не строим — прямые отрезки как у диаграммы (без boundary/A*).
     deduped["nfz_voronoi_edges_crossing"] = 0
     deduped["nfz_voronoi_detours_ok"] = 0
     deduped["nfz_voronoi_detours_failed"] = 0
+    deduped["voronoi_echelon_levels"] = list(DataService.VORONOI_FLIGHT_ECHELON_LEVELS)
+    deduped["voronoi_echelon_altitudes_m"] = [float(x) for x in voronoi_alts]
+    deduped["voronoi_echelon_altitude_m"] = float(min(voronoi_alts))
+    deduped["voronoi_building_obstacle_min_height_m"] = float(
+        DataService.voronoi_building_obstacle_min_height_m(data.get("flight_levels"))
+    )
+    deduped["flight_echelon_building_obstacle_min_height_m"] = {
+        int(k): float(v) for k, v in DataService.all_echelon_building_obstacle_min_heights_m(
+            data.get("flight_levels")
+        ).items()
+    }
 
     touched: set[str] = set()
     for f in deduped.get("features", []) or []:
@@ -2110,5 +2196,53 @@ def build_voronoi_edges_from_pipeline_raw(
             hull_poly=hull_poly,
         )
     fc_out = {"type": "FeatureCollection", "features": out_features}
+    fc_pre = {"type": "FeatureCollection", "features": list(out_features)}
+    try:
+        b_raw = raw.get("buildings")
+        if b_raw is not None and len(b_raw) > 0:
+            b_w = b_raw.to_crs("EPSG:4326").copy()
+            if "height_m" not in b_w.columns:
+                b_w = data_service._compute_building_heights(b_w)
+            from station_placement import buildings_footprint_union_min_height_wgs84
+
+            v_alts = DataService.voronoi_echelon_altitudes_m(raw.get("flight_levels"))
+            levels = list(DataService.VORONOI_FLIGHT_ECHELON_LEVELS)
+            vbe: dict[str, dict[str, Any]] = {}
+            for idx, alt in enumerate(v_alts):
+                level = int(levels[idx]) if idx < len(levels) else idx + 1
+                min_h_b = float(DataService.echelon_altitude_to_building_obstacle_min_m(float(alt)))
+                tall_u = buildings_footprint_union_min_height_wgs84(b_w, min_h_b)
+                barrier_u = _merge_polygon_unions_wgs84(nfz_union_f, tall_u)
+                fc_i = {
+                    "type": "FeatureCollection",
+                    "features": copy.deepcopy(list(fc_pre.get("features") or [])),
+                }
+                fc_i = _filter_voronoi_fc_linestrings_nfz(fc_i, barrier_u)
+                vbe[str(level)] = {
+                    "type": "FeatureCollection",
+                    "features": list(fc_i.get("features") or []),
+                    "voronoi_echelon_level": level,
+                    "voronoi_echelon_altitude_m": float(alt),
+                    "voronoi_building_obstacle_min_height_m": min_h_b,
+                }
+            e1 = vbe.get("1")
+            if e1:
+                fc_out["features"] = list(e1["features"])
+            fc_out["voronoi_by_echelon"] = vbe
+            fc_out["voronoi_echelon_levels"] = list(DataService.VORONOI_FLIGHT_ECHELON_LEVELS)
+            fc_out["voronoi_echelon_altitudes_m"] = [float(x) for x in v_alts]
+            fc_out["voronoi_echelon_altitude_m"] = float(min(v_alts))
+            fc_out["voronoi_building_obstacle_min_height_m"] = float(
+                DataService.voronoi_building_obstacle_min_height_m(raw.get("flight_levels"))
+            )
+            fc_out["flight_echelon_building_obstacle_min_height_m"] = {
+                int(k): float(v)
+                for k, v in DataService.all_echelon_building_obstacle_min_heights_m(
+                    raw.get("flight_levels")
+                ).items()
+            }
+            return fc_out
+    except Exception:
+        pass
     fc_out = _filter_voronoi_fc_linestrings_nfz(fc_out, nfz_union_f)
     return fc_out

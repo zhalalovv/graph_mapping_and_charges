@@ -602,6 +602,58 @@ def buildings_footprint_union_wgs84(buildings: Any) -> Any:
         return None
 
 
+def buildings_footprint_union_min_height_wgs84(buildings: Any, min_height_m: float) -> Any:
+    """
+    Объединение контуров зданий (EPSG:4326) с height_m >= min_height_m.
+    Для магистрали / Вороного: препятствие на эшелоне, если здание не ниже эшелона более чем на 5 м.
+    """
+    if buildings is None:
+        return None
+    try:
+        if hasattr(buildings, "__len__") and len(buildings) == 0:
+            return None
+        mh = float(min_height_m)
+    except (TypeError, ValueError):
+        return None
+    try:
+        b = buildings
+        if hasattr(b, "to_crs"):
+            b = b.to_crs("EPSG:4326")
+        if getattr(b, "geometry", None) is None:
+            return None
+        geoms: List[Any] = []
+        for _idx, row in b.iterrows():
+            try:
+                h = float(row.get("height_m", 0.0))
+            except (TypeError, ValueError):
+                h = 0.0
+            if h < mh:
+                continue
+            g = row.geometry
+            if g is None or getattr(g, "is_empty", True):
+                continue
+            try:
+                geoms.append(g.simplify(0.00006, preserve_topology=True))
+            except Exception:
+                geoms.append(g)
+        if not geoms:
+            return None
+        if len(geoms) > 3000:
+            log = logging.getLogger(__name__)
+            log.warning(
+                "Зданий выше порога %.1f м — %s; объединение контуров для маршрутизации пропущено.",
+                mh,
+                len(geoms),
+            )
+            return None
+        u = unary_union(geoms)
+        if u is None or getattr(u, "is_empty", True):
+            return None
+        return u
+    except Exception:
+        return None
+
+
 def build_uav_air_graph_grid(
     city_boundary: Any,
     no_fly_zones: Any,
@@ -2528,14 +2580,14 @@ class StationPlacement:
         no_fly_safety_buffer: float = 0.0,
     ) -> nx.Graph:
         """
-        Магистраль (спина сети): только станции типа А (зарядки А).
+        Магистраль (спина сети): только станции типа А (зарядки А), полёт на эшелонах 4–5.
         Гаражи и ТО в магистраль не входят — к ближайшим А ведут ветки (см. branch_edges в пайплайне).
 
         Рёбра магистрали соединяют каждую станцию А с ближайшими соседями-А в пределах max_edge_km (км),
         не более 2 рёбер на станцию (даже если max_neighbors_a > 2).
 
-        Если прямая связь между станциями пересекает препятствия (бесполётные зоны / высокие здания),
-        и есть предварительно построенный
+        Если прямая связь между станциями пересекает препятствия (бесполётные зоны / высокие здания
+        для эшелонов 4–5), и есть предварительно построенный
         воздушный граф air_graph, то вместо прямого отрезка строится обход по воздушному графу
         (A* по весу рёбер). Полученная полилиния сохраняется в атрибуте geometry_coords ребра.
         """
@@ -2925,9 +2977,9 @@ class StationPlacement:
         no_fly_safety_buffer: float = 0.0,
     ) -> List[Dict[str, Any]]:
         """
-        Ветки только Б→А: у каждой Б ровно одна ветка. Min-cost flow только по рёбрам «до k ближайших Б к каждой А» (k=BRANCH_NEAREST_B_PER_STATION_A),
+        Ветки только Б→А (полёт на эшелонах 4–5): у каждой Б ровно одна ветка. Min-cost flow только по рёбрам «до k ближайших Б к каждой А» (k=BRANCH_NEAREST_B_PER_STATION_A),
         не более max_b_per_type_a Б на одну А; в весах d + штраф за превышение max_branch_km (квадрат излишка).
-        При заданных obstacles / air_graph геометрия ветки — обход NFZ (контур и/или A*), как у магистрали и Б↔Б.
+        При заданных obstacles / air_graph геометрия ветки — обход NFZ и высоких зданий (контур и/или A*), как у магистрали.
         Returns: список GeoJSON-like Feature (LineString, edge_type="branch", source_id, target_id, weight_km).
         """
         if charge_stations is None or len(charge_stations) == 0:
@@ -3121,8 +3173,8 @@ class StationPlacement:
         no_fly_safety_buffer: float = 0.0,
     ) -> List[Dict[str, Any]]:
         """
-        Ветки гараж и ТО только к ближайшей зарядке А (по одной на объект; в пределах max_branch_km, иначе ближайшая без порога).
-        Геометрия — обход NFZ при заданных obstacles / air_graph.
+        Ветки гараж и ТО только к ближайшей зарядке А (полёт на эшелонах 4–5; по одной на объект; в пределах max_branch_km, иначе ближайшая без порога).
+        Геометрия — обход NFZ и высоких зданий при заданных obstacles / air_graph.
         """
         if charge_stations is None or len(charge_stations) == 0:
             return []
@@ -3232,8 +3284,8 @@ class StationPlacement:
         no_fly_safety_buffer: float = 0.0,
     ) -> List[Dict[str, Any]]:
         """
-        Локальные связи между станциями типа Б. Каждая Б соединяется с макс. max_neighbors_b ближайшими Б в пределах max_edge_km.
-        При наличии no-fly зон и воздушного графа строит тот же обход, что и магистраль (контур + A*).
+        Локальные связи между станциями типа Б (полёт на эшелонах 4–5). Каждая Б соединяется с макс. max_neighbors_b ближайшими Б в пределах max_edge_km.
+        При наличии препятствий и воздушного графа строит тот же обход, что и магистраль (контур + A*).
         Returns: список GeoJSON-like Feature (LineString, edge_type="local", weight_km).
         """
         if charge_stations is None or len(charge_stations) == 0:
@@ -3693,7 +3745,7 @@ def run_full_pipeline(
     voronoi_intra_component_bridge_max_m: float = 600.0,
 ) -> Dict[str, Any]:
     """
-    Запускает полный пайплайн: данные города → спрос → зарядки → гаражи/ТО → магистраль → ветки → локальные Б↔Б → слой Вороного (как у voronoi-local-paths, с сайтами станций).
+    Запускает полный пайплайн: данные города → спрос → зарядки → гаражи/ТО → магистраль (эшелоны 4–5) → ветки Б→А / гараж и ТО→А (4–5) → локальные Б↔Б (4–5) → слой Вороного (эшелоны 1–3, с сайтами станций).
     """
     logger = logging.getLogger(__name__)
     data = data_service.get_city_data(city_name, network_type=network_type, simplify=simplify, load_no_fly_zones=True)
@@ -4194,7 +4246,20 @@ def run_full_pipeline(
             obstacles_union = None
 
     # Маршрутизация и обходы — по геометрии no-fly из данных, без дополнительного метрического буфера.
+    # Эшелоны 4–5: магистраль А–А, ветки Б→А, локальные Б↔Б, гараж→А, ТО→А — высокие здания как NFZ (см. DataService).
     obstacles_routing = obstacles_union
+    try:
+        from data_service import DataService
+
+        mag_min_h = DataService.high_altitude_station_routing_obstacle_min_height_m(data.get("flight_levels"))
+        tall_union = buildings_footprint_union_min_height_wgs84(buildings, mag_min_h)
+        if tall_union is not None and not getattr(tall_union, "is_empty", True):
+            if obstacles_routing is not None and not getattr(obstacles_routing, "is_empty", True):
+                obstacles_routing = unary_union([obstacles_routing, tall_union])
+            else:
+                obstacles_routing = tall_union
+    except Exception as e:
+        logger.warning("Объединение высоких зданий с NFZ для маршрутизации пропущено: %s", e)
 
     n_a_for_facilities = 0
     if (
@@ -4345,6 +4410,16 @@ def run_full_pipeline(
     metrics["charging_buildings_in_clusters"] = charging_buildings_in_clusters
     vf = list((voronoi_edges or {}).get("features") or [])
     metrics["voronoi_edges_total"] = len(vf)
+    vbe = (voronoi_edges or {}).get("voronoi_by_echelon") or {}
+    if isinstance(vbe, dict) and vbe:
+        metrics["voronoi_edges_by_echelon"] = {
+            str(k): len((sub or {}).get("features") or []) for k, sub in vbe.items()
+        }
+    fe_thr = (voronoi_edges or {}).get("flight_echelon_building_obstacle_min_height_m")
+    if isinstance(fe_thr, dict) and fe_thr:
+        metrics["flight_echelon_building_obstacle_min_height_m"] = {
+            int(k): float(v) for k, v in fe_thr.items()
+        }
     metrics["voronoi_clusters_with_paths"] = int((voronoi_edges or {}).get("clusters_with_paths") or 0)
     metrics["voronoi_clusters_total"] = int((voronoi_edges or {}).get("clusters_total") or 0)
 
@@ -4358,6 +4433,7 @@ def run_full_pipeline(
         "branch_edges": branch_edges,
         "local_edges": local_edges,
         "voronoi_edges": voronoi_edges,
+        "flight_levels": data.get("flight_levels") or [],
         "metrics": metrics,
         "city_boundary": city_boundary,
         "no_fly_zones": no_fly_zones,
@@ -4504,6 +4580,23 @@ def pipeline_result_to_geojson(raw: Dict[str, Any]) -> Dict[str, Any]:
     else:
         voronoi_fc = empty_fc
 
+    voronoi_by_echelon_out: Dict[str, Any] = {}
+    if isinstance(ve, dict):
+        vbe = ve.get("voronoi_by_echelon")
+        if isinstance(vbe, dict):
+            for sk, sub in vbe.items():
+                if not isinstance(sub, dict):
+                    continue
+                voronoi_by_echelon_out[str(sk)] = {
+                    "type": "FeatureCollection",
+                    "features": list(sub.get("features") or []),
+                    "voronoi_echelon_level": sub.get("voronoi_echelon_level"),
+                    "voronoi_echelon_altitude_m": sub.get("voronoi_echelon_altitude_m"),
+                    "voronoi_building_obstacle_min_height_m": sub.get(
+                        "voronoi_building_obstacle_min_height_m"
+                    ),
+                }
+
     out: Dict[str, Any] = {
         "charging_type_a": _gdf_to_fc(charging_a),
         "charging_type_b": _gdf_to_fc(charging_b),
@@ -4513,6 +4606,22 @@ def pipeline_result_to_geojson(raw: Dict[str, Any]) -> Dict[str, Any]:
         "branch_edges": _list_features_to_fc(raw.get("branch_edges")),
         "local_edges": _list_features_to_fc(raw.get("local_edges")),
         "voronoi_edges": voronoi_fc,
+        **(
+            {"voronoi_edges_by_echelon": voronoi_by_echelon_out}
+            if voronoi_by_echelon_out
+            else {}
+        ),
+        **(
+            {
+                "flight_echelon_building_obstacle_min_height_m": ve.get(
+                    "flight_echelon_building_obstacle_min_height_m"
+                )
+            }
+            if isinstance(ve, dict)
+            and isinstance(ve.get("flight_echelon_building_obstacle_min_height_m"), dict)
+            else {}
+        ),
+        "flight_levels": raw.get("flight_levels") or [],
         "metrics": raw.get("metrics") or {},
         "params": raw.get("params") or {},
         "cluster_centroids": _gdf_to_fc(cluster_centroids),

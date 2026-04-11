@@ -205,14 +205,28 @@
                 <span><span class="swatch" style="background:#22c55e"></span> Зарядки (A и B)</span>
                 <span><span class="swatch" style="background:#f97316"></span> Гаражи</span>
                 <span><span class="swatch" style="background:#2563eb"></span> ТО</span>
-                <span><span class="swatch" style="background:#16a34a"></span> Магистраль A</span>
             </div>
+            <p style="font-size:11px; color:#6b7280; margin:6px 0 0; line-height:1.35">
+                Линии маршрутов: эшелоны 1–3 (Вороной) и 4–5 (магистраль/ветки) — цвета в блоке «Просмотр по эшелону» после расчёта.
+            </p>
             <button class="floating-btn btn-secondary" id="loadStationsRulesBtn" style="width:100%; margin-top:8px" onclick="loadStationsRulesPlacement()">
                 Рассчитать зарядки
             </button>
-            <button class="floating-btn btn-secondary" id="toggleVoronoiPathsBtn" style="width:100%; margin-top:6px; display:none" onclick="toggleVoronoiPaths()" title="Включить/выключить отображение рёбер Вороного внутри кластера">
-                <span id="toggleVoronoiPathsLabel">Скрыть Вороного внутри кластера</span>
+            <button class="floating-btn btn-secondary" id="toggleVoronoiPathsBtn" style="width:100%; margin-top:6px; display:none" onclick="toggleVoronoiPaths()" title="Показать или скрыть все слои маршрутов по эшелонам">
+                <span id="toggleVoronoiPathsLabel">Скрыть маршруты по эшелонам</span>
             </button>
+            <div id="routeEchelonPanel" style="display:none; margin-top:10px; padding-top:10px; border-top:1px solid #e5e7eb">
+                <div style="font-size:12px; font-weight:600; color:#374151; margin-bottom:6px">Просмотр по эшелону</div>
+                <select id="routeEchelonSelect" onchange="applyRouteEchelonView()" style="width:100%; padding:8px 10px; border-radius:8px; border:1px solid #d1d5db; font-size:13px" title="Какие маршруты показать">
+                    <option value="all">Все эшелоны (1–5)</option>
+                    <option value="1">Эшелон 1 — Вороной (низкий)</option>
+                    <option value="2">Эшелон 2 — Вороной</option>
+                    <option value="3">Эшелон 3 — Вороной</option>
+                    <option value="4">Эшелон 4 — магистраль и ветки</option>
+                    <option value="5">Эшелон 5 — магистраль и ветки</option>
+                </select>
+                <div id="routeEchelonLegend" class="height-legend" style="margin-top:8px; flex-direction:column; align-items:flex-start; gap:4px"></div>
+            </div>
             <button class="floating-btn btn-secondary" id="toggleTrunkBtn" style="width:100%; margin-top:6px" onclick="toggleTrunkLines()">
                 <span id="toggleTrunkLabel">Скрыть магистраль</span>
             </button>
@@ -250,6 +264,24 @@
         let trunkLinesLayer = null;
         let localLinesLayer = null;
         let voronoiPathsLayer = null;
+        /** Слои маршрутов по эшелонам (Вороной 1–3, магистраль/ветки 4–5). */
+        let routeEchelonContainer = null;
+        let routeLayerVoronoi = {};
+        let routeLayerHigh = {};
+        let routeTrunkSub = {};
+        let routeLocalSub = {};
+        let lastPlacementData = null;
+        const ROUTE_ECHELON_VORONOI_COLORS = { 1: '#7c3aed', 2: '#db2777', 3: '#ea580c' };
+        const ROUTE_ECHELON_HIGH_COLORS = { 4: '#059669', 5: '#4338ca' };
+        const ROUTE_ECHELON_ALT_FALLBACK_M = [40, 67.5, 95, 122.5, 150];
+
+        function echelonAltitudeMFromData(data, level) {
+            const fl = (data && data.flight_levels) || [];
+            const i = level - 1;
+            if (fl[i] != null && fl[i].altitude_m != null) return Number(fl[i].altitude_m);
+            return ROUTE_ECHELON_ALT_FALLBACK_M[i] != null ? ROUTE_ECHELON_ALT_FALLBACK_M[i] : level * 40;
+        }
+
         let clusterHullsVisible = true;
         let clusterPointsVisible = false; // точки кластеров (центроиды/точки спроса) по умолчанию скрыты
         let buildingsVisible = false; // по умолчанию здания не показываем, пока пользователь не включит
@@ -534,6 +566,8 @@
                 }
                 const toggleVoronoiBtn = document.getElementById('toggleVoronoiPathsBtn');
                 if (toggleVoronoiBtn) toggleVoronoiBtn.style.display = 'none';
+                const routeEchelonPanelClear = document.getElementById('routeEchelonPanel');
+                if (routeEchelonPanelClear) routeEchelonPanelClear.style.display = 'none';
                 const srsEl = document.getElementById('stationsRulesStats');
                 if (srsEl) srsEl.textContent = '';
                 const toggleClusterBtn = document.getElementById('toggleClusterHullsBtn');
@@ -659,41 +693,47 @@
         function updateVoronoiPathsButtonLabel() {
             const el = document.getElementById('toggleVoronoiPathsLabel');
             if (!el) return;
-            el.textContent = voronoiPathsVisible ? 'Скрыть Вороного внутри кластера' : 'Показать Вороного внутри кластера';
+            el.textContent = voronoiPathsVisible ? 'Скрыть маршруты по эшелонам' : 'Показать маршруты по эшелонам';
         }
 
         function toggleVoronoiPaths() {
-            if (!stationsRulesLayerGroup || !voronoiPathsLayer) return;
+            if (!stationsRulesLayerGroup || !routeEchelonContainer) return;
             voronoiPathsVisible = !voronoiPathsVisible;
             if (voronoiPathsVisible) {
-                voronoiPathsLayer.addTo(stationsRulesLayerGroup);
+                routeEchelonContainer.addTo(stationsRulesLayerGroup);
             } else {
-                stationsRulesLayerGroup.removeLayer(voronoiPathsLayer);
+                stationsRulesLayerGroup.removeLayer(routeEchelonContainer);
             }
             updateVoronoiPathsButtonLabel();
         }
 
         function toggleTrunkLines() {
             trunkLinesVisible = !trunkLinesVisible;
-            if (stationsRulesLayerGroup && trunkLinesLayer) {
+            [4, 5].forEach(function(k) {
+                const h = routeLayerHigh[k];
+                const t = routeTrunkSub[k];
+                if (!h || !t) return;
                 if (trunkLinesVisible) {
-                    trunkLinesLayer.addTo(stationsRulesLayerGroup);
-                } else {
-                    stationsRulesLayerGroup.removeLayer(trunkLinesLayer);
+                    if (!h.hasLayer(t)) h.addLayer(t);
+                } else if (h.hasLayer(t)) {
+                    h.removeLayer(t);
                 }
-            }
+            });
             updateTrunkButtonLabel();
         }
 
         function toggleLocalLines() {
             localLinesVisible = !localLinesVisible;
-            if (stationsRulesLayerGroup && localLinesLayer) {
+            [4, 5].forEach(function(k) {
+                const h = routeLayerHigh[k];
+                const loc = routeLocalSub[k];
+                if (!h || !loc) return;
                 if (localLinesVisible) {
-                    localLinesLayer.addTo(stationsRulesLayerGroup);
-                } else {
-                    stationsRulesLayerGroup.removeLayer(localLinesLayer);
+                    if (!h.hasLayer(loc)) h.addLayer(loc);
+                } else if (h.hasLayer(loc)) {
+                    h.removeLayer(loc);
                 }
-            }
+            });
             updateLocalButtonLabel();
         }
 
@@ -713,6 +753,51 @@
             return url;
         }
 
+        function fillRouteEchelonLegend(data) {
+            const el = document.getElementById('routeEchelonLegend');
+            if (!el) return;
+            if (!data) {
+                el.innerHTML = '';
+                return;
+            }
+            const rows = [];
+            for (let lv = 1; lv <= 5; lv++) {
+                const col = lv <= 3 ? ROUTE_ECHELON_VORONOI_COLORS[lv] : ROUTE_ECHELON_HIGH_COLORS[lv];
+                const alt = echelonAltitudeMFromData(data, lv);
+                const kind = lv <= 3 ? 'локальный Вороной' : 'магистраль, ветки, Б↔Б';
+                rows.push(
+                    '<span><span class="swatch" style="background:' + col + '"></span> Эшелон ' + lv + ' (~' + alt + ' м) — ' + kind + '</span>'
+                );
+            }
+            el.innerHTML = rows.join('');
+        }
+
+        function applyRouteEchelonView() {
+            if (!routeEchelonContainer) return;
+            routeEchelonContainer.clearLayers();
+            const selEl = document.getElementById('routeEchelonSelect');
+            const sel = (selEl && selEl.value) ? selEl.value : 'all';
+            const addLg = function(lg) {
+                if (!lg || !lg.getLayers) return;
+                try {
+                    if (lg.getLayers().length > 0) routeEchelonContainer.addLayer(lg);
+                } catch (e) {}
+            };
+            if (sel === 'all') {
+                addLg(routeLayerVoronoi['1']);
+                addLg(routeLayerVoronoi['2']);
+                addLg(routeLayerVoronoi['3']);
+                addLg(routeLayerHigh[4]);
+                addLg(routeLayerHigh[5]);
+            } else if (sel === '1' || sel === '2' || sel === '3') {
+                addLg(routeLayerVoronoi[sel]);
+            } else if (sel === '4') {
+                addLg(routeLayerHigh[4]);
+            } else if (sel === '5') {
+                addLg(routeLayerHigh[5]);
+            }
+        }
+
         /** Общая отрисовка слоёв зарядки (ответ API такой же для расчёта и для кэша). */
         function renderStationsRulesPlacement(data) {
             const statsEl = document.getElementById('stationsRulesStats');
@@ -724,6 +809,7 @@
                 if (statsEl) statsEl.textContent = data.error;
                 return;
             }
+            lastPlacementData = data;
             if (stationsRulesLayerGroup) {
                 map.removeLayer(stationsRulesLayerGroup);
                 stationsRulesLayerGroup = null;
@@ -731,8 +817,12 @@
             trunkLinesLayer = null;
             localLinesLayer = null;
             voronoiPathsLayer = null;
+            routeEchelonContainer = null;
+            routeLayerVoronoi = {};
+            routeLayerHigh = {};
+            routeTrunkSub = {};
+            routeLocalSub = {};
             stationsRulesLayerGroup = L.layerGroup();
-            voronoiPathsLayer = L.layerGroup();
 
             /** Устойчивый цвет по id кластера (золотой угол в HSL). */
             function colorForClusterId(cid) {
@@ -761,9 +851,6 @@
                 const STATION_COLOR_GARAGE_STROKE = '#c2410c';
                 const STATION_COLOR_TO = '#2563eb';
                 const STATION_COLOR_TO_STROKE = '#1e40af';
-                /** Ветви к A и локальные B↔B (не магистраль) — голубые, чтобы не сливаться с зелёной магистралью. */
-                const STATION_COLOR_BRANCH = '#0ea5e9';
-                const STATION_COLOR_LOCAL_EDGE = '#38bdf8';
 
                 function addPoints(fc, color, border, r, title, pointStyleResolver, ignoreClusterColor) {
                     if (!fc || !fc.features || !fc.features.length) return;
@@ -802,23 +889,77 @@
                     }).addTo(stationsRulesLayerGroup);
                 }
 
-                trunkLinesLayer = L.layerGroup();
-                localLinesLayer = L.layerGroup();
-                /* Этап 2: сначала Вороной как фоновый слой. */
-                addLines(
-                    data.voronoi_edges,
-                    { color: '#7c3aed', weight: 2, opacity: 0.55, dashArray: '4, 6', lineCap: 'round', lineJoin: 'round' },
-                    'Вороной (локальные пути)',
-                    voronoiPathsLayer
-                );
-                if (voronoiPathsVisible) voronoiPathsLayer.addTo(stationsRulesLayerGroup);
-                /* Этап 3: затем магистраль. */
-                addLines(data.trunk, { color: STATION_COLOR_CHARGING, weight: 3, opacity: 0.95, lineCap: 'round', lineJoin: 'round' }, 'Магистраль', trunkLinesLayer);
-                /* Этап 4: затем Б-А и Б-Б (один переключаемый слой). */
-                addLines(data.branch_edges, { color: STATION_COLOR_BRANCH, weight: 2, opacity: 0.92, lineCap: 'round', lineJoin: 'round' }, 'Ветвь к зарядке A (Б / гараж / ТО)', localLinesLayer);
-                addLines(data.local_edges, { color: STATION_COLOR_LOCAL_EDGE, weight: 3, opacity: 0.9, dashArray: '2, 4', lineCap: 'round', lineJoin: 'round' }, 'Локально B↔B', localLinesLayer);
-                if (trunkLinesVisible) trunkLinesLayer.addTo(stationsRulesLayerGroup);
-                if (localLinesVisible) localLinesLayer.addTo(stationsRulesLayerGroup);
+                routeEchelonContainer = L.layerGroup();
+                voronoiPathsLayer = routeEchelonContainer;
+
+                const vbe = data.voronoi_edges_by_echelon || {};
+                ['1', '2', '3'].forEach(function(k) {
+                    const g = L.layerGroup();
+                    let fc = vbe[k];
+                    if ((!fc || !fc.features || !fc.features.length) && k === '1' && data.voronoi_edges && data.voronoi_edges.features && data.voronoi_edges.features.length) {
+                        fc = data.voronoi_edges;
+                    }
+                    if (fc && fc.features && fc.features.length) {
+                        const altM = fc.voronoi_echelon_altitude_m != null ? fc.voronoi_echelon_altitude_m : echelonAltitudeMFromData(data, parseInt(k, 10));
+                        const style = {
+                            color: ROUTE_ECHELON_VORONOI_COLORS[parseInt(k, 10)] || '#7c3aed',
+                            weight: 2,
+                            opacity: 0.84,
+                            lineCap: 'round',
+                            lineJoin: 'round',
+                        };
+                        if (k === '2') style.dashArray = '6, 4';
+                        if (k === '3') style.dashArray = '2, 3';
+                        addLines(fc, style, 'Вороной, эшелон ' + k + ' (~' + altM + ' м)', g);
+                    }
+                    routeLayerVoronoi[k] = g;
+                });
+
+                [4, 5].forEach(function(k) {
+                    const highG = L.layerGroup();
+                    const trunkG = L.layerGroup();
+                    const localG = L.layerGroup();
+                    const color = ROUTE_ECHELON_HIGH_COLORS[k];
+                    const altM = echelonAltitudeMFromData(data, k);
+                    const stT = {
+                        color: color,
+                        weight: k === 5 ? 5 : 3,
+                        opacity: k === 5 ? 0.42 : 0.93,
+                        lineCap: 'round',
+                        lineJoin: 'round',
+                    };
+                    if (k === 5) stT.dashArray = '14, 7';
+                    addLines(data.trunk, stT, 'Магистраль A–A, эшелон ' + k + ' (~' + altM + ' м)', trunkG);
+                    const stB = {
+                        color: color,
+                        weight: 2,
+                        opacity: k === 5 ? 0.5 : 0.9,
+                        lineCap: 'round',
+                        lineJoin: 'round',
+                    };
+                    if (k === 5) stB.dashArray = '10, 5';
+                    addLines(data.branch_edges, stB, 'Ветвь к A (Б / гараж / ТО), эшелон ' + k, localG);
+                    const stL = {
+                        color: color,
+                        weight: 3,
+                        opacity: k === 5 ? 0.48 : 0.88,
+                        lineCap: 'round',
+                        lineJoin: 'round',
+                        dashArray: k === 5 ? '4, 5' : '2, 4',
+                    };
+                    addLines(data.local_edges, stL, 'Локально B↔B, эшелон ' + k, localG);
+                    if (trunkLinesVisible) highG.addLayer(trunkG);
+                    if (localLinesVisible) highG.addLayer(localG);
+                    routeLayerHigh[k] = highG;
+                    routeTrunkSub[k] = trunkG;
+                    routeLocalSub[k] = localG;
+                });
+
+                fillRouteEchelonLegend(data);
+                applyRouteEchelonView();
+                if (voronoiPathsVisible) routeEchelonContainer.addTo(stationsRulesLayerGroup);
+                const routePanel = document.getElementById('routeEchelonPanel');
+                if (routePanel) routePanel.style.display = 'block';
 
                 // Явные линии "кластер ↔ зарядка" (по cluster_id зарядки и cluster_centroids из API).
                 try {

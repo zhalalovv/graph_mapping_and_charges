@@ -181,7 +181,7 @@ def export_buildings_with_heights(
                     buildings = buildings.copy()
                     buildings["area_m2"] = None
 
-        levels_m = [f["altitude_m"] for f in flight_levels] if flight_levels else [40, 65, 90, 115]
+        levels_m = [f["altitude_m"] for f in flight_levels] if flight_levels else [40, 67.5, 95, 122.5, 150]
         features = []
         for idx, row in buildings.iterrows():
             geom = row.geometry
