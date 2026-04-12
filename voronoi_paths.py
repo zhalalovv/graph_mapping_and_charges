@@ -8,6 +8,8 @@
 не-МКД — по buildings_per_centroid зданий на сайт (по умолчанию 60).
 Сайты (центроиды), попадающие в no-fly, отбрасываются; для эшелонов 1–3 рёбра режутся отдельно:
 на эшелоне k не летаем над зданием, если height_m ≥ (высота_эшелона_k − 5 м) — см. voronoi_by_echelon.
+Станции стоят на крышах: если высота здания под станцией ≥ этому же порогу, все рёбра, касающиеся станции,
+на этом эшелоне удаляются (union по упрощённым контурам мог не содержать точку станции).
 NFZ учитывается на всех эшелонах (как в _filter_voronoi_fc_linestrings_nfz).
 """
 from __future__ import annotations
@@ -47,26 +49,42 @@ def _merge_polygon_unions_wgs84(*parts: Any) -> Any:
 def _voronoi_fc_copy_filter_and_bridges(
     fc_base: dict,
     *,
-    barrier_union: Any,
+    nfz_union: Any,
+    building_clearance_union: Any,
     coords_g: np.ndarray,
     flags_g: np.ndarray,
     all_cluster: list[Any],
     max_bridge_m: float,
+    buildings_wgs: gpd.GeoDataFrame | None = None,
+    voronoi_obstacle_min_building_height_m: float | None = None,
 ) -> dict:
-    """Копия FC → фильтр по NFZ+зданиям → безопасные мосты внутри кластера."""
+    """Копия FC → NFZ (прежняя логика) → строгий фильтр по высотным зданиям → мосты → крыши станций."""
     fc = {
         "type": "FeatureCollection",
         "features": copy.deepcopy(list(fc_base.get("features") or [])),
     }
-    fc = _filter_voronoi_fc_linestrings_nfz(fc, barrier_union)
+    fc = _filter_voronoi_fc_linestrings_nfz(fc, nfz_union)
+    fc = _filter_voronoi_fc_building_clearance(fc, building_clearance_union)
     fc = _add_intra_cluster_nfz_safe_bridges(
         fc,
         coords_g,
         flags_g,
         all_cluster,
-        barrier_union,
+        nfz_union,
+        building_clearance_union=building_clearance_union,
         max_bridge_m=float(max_bridge_m),
     )
+    if (
+        buildings_wgs is not None
+        and len(buildings_wgs) > 0
+        and voronoi_obstacle_min_building_height_m is not None
+    ):
+        try:
+            thr = float(voronoi_obstacle_min_building_height_m)
+        except (TypeError, ValueError):
+            thr = None
+        if thr is not None:
+            fc = _filter_voronoi_fc_station_roof_echelon(fc, buildings_wgs, thr)
     return fc
 
 
@@ -375,6 +393,230 @@ def _filter_xy_rows_outside_nfz(
     out_pts = pts_arr[idx]
     out_st = is_station[idx] if is_station is not None and len(is_station) == len(pts_arr) else is_station
     return out_pts, out_st
+
+
+def _line_violates_building_clearance(line: LineString, building_union: Any, *, interior_samples: int = 7) -> bool:
+    """
+    Строгая проверка для «зданий под эшелон»: нельзя заканчивать ребро внутри контура,
+    нельзя пересекать контур по дуге ненулевой длины, проверяются точки вдоль отрезка
+    (устраняет баг, когда пересечение деградирует в Point и ребро ошибочно оставляли).
+    """
+    if building_union is None or getattr(building_union, "is_empty", True):
+        return False
+    eps = 1e-7
+    try:
+        prepared = prep(building_union)
+    except Exception:
+        prepared = None
+    try:
+        for xy in (line.coords[0], line.coords[-1]):
+            pt = Point(float(xy[0]), float(xy[1]))
+            try:
+                if building_union.covers(pt):
+                    return True
+            except Exception:
+                if prepared is not None and prepared.contains(pt):
+                    return True
+        n = max(2, int(interior_samples))
+        for k in range(1, n):
+            pt = line.interpolate(k / float(n), normalized=True)
+            try:
+                if building_union.contains(pt) or building_union.covers(pt):
+                    return True
+            except Exception:
+                if prepared is not None and prepared.contains(pt):
+                    return True
+        inter = building_union.intersection(line)
+        if inter.is_empty:
+            return False
+        if inter.geom_type == "LineString" and float(inter.length) > eps:
+            return True
+        if inter.geom_type == "MultiLineString":
+            return any(float(g.length) > eps for g in inter.geoms)
+        if inter.geom_type == "GeometryCollection":
+            for g in getattr(inter, "geoms", []):
+                gt = getattr(g, "geom_type", "")
+                if gt == "LineString" and float(g.length) > eps:
+                    return True
+                if gt == "MultiLineString":
+                    if any(float(gg.length) > eps for gg in g.geoms):
+                        return True
+        return False
+    except Exception:
+        return True
+
+
+def _filter_voronoi_fc_building_clearance(fc: dict, building_union: Any) -> dict:
+    """Удаляет рёбра LineString, нарушающие ограничение по высотным зданиям (см. _line_violates_building_clearance)."""
+    if building_union is None or getattr(building_union, "is_empty", True):
+        return fc
+    feats = list(fc.get("features", []) or [])
+    kept: list[dict] = []
+    for feat in feats:
+        if not isinstance(feat, dict):
+            kept.append(feat)
+            continue
+        geom = feat.get("geometry") or {}
+        if geom.get("type") != "LineString":
+            kept.append(feat)
+            continue
+        coords = geom.get("coordinates") or []
+        if len(coords) < 2:
+            continue
+        try:
+            line_coords = [(float(c[0]), float(c[1])) for c in coords if len(c) >= 2]
+            if len(line_coords) < 2:
+                continue
+            line = LineString(line_coords)
+        except Exception:
+            kept.append(feat)
+            continue
+        if _line_violates_building_clearance(line, building_union):
+            continue
+        kept.append(feat)
+    out = dict(fc)
+    out["features"] = kept
+    return out
+
+
+def _batch_max_building_heights_m_at_lonlat(
+    lonlats: list[tuple[float, float]],
+    buildings_wgs: gpd.GeoDataFrame,
+) -> dict[tuple[float, float], float]:
+    """
+    Для каждой уникальной точки (lon, lat) в WGS84 — max height_m среди зданий, с которыми пересекается точка.
+    Используется intersects (не только within), чтобы точки на границе контура крыши не терялись.
+    """
+    out: dict[tuple[float, float], float] = {}
+    if not lonlats or buildings_wgs is None or len(buildings_wgs) == 0:
+        return out
+    try:
+        b = buildings_wgs
+        if "height_m" not in b.columns:
+            return out
+        bg = b[["geometry", "height_m"]].copy()
+        bg = bg[bg.geometry.notna() & (~bg.geometry.is_empty)]
+        if len(bg) == 0:
+            return out
+    except Exception:
+        return out
+
+    uniq: dict[tuple[float, float], tuple[float, float]] = {}
+    for lo, la in lonlats:
+        k = (round(float(lo), 6), round(float(la), 6))
+        uniq.setdefault(k, (float(lo), float(la)))
+    keys_list = list(uniq.keys())
+    try:
+        pts = gpd.GeoDataFrame(
+            {"qid": range(len(keys_list))},
+            geometry=[
+                Point(float(uniq[k][0]), float(uniq[k][1])) for k in keys_list
+            ],
+            crs="EPSG:4326",
+        )
+        try:
+            j = pts.sjoin(bg, how="left", predicate="intersects")
+        except TypeError:
+            j = pts.sjoin(bg, how="left", op="intersects")
+    except Exception:
+        return out
+
+    if "height_m" not in j.columns:
+        for k in keys_list:
+            out[k] = 0.0
+        return out
+
+    j["height_m"] = pd.to_numeric(j["height_m"], errors="coerce")
+    for qid, grp in j.groupby("qid"):
+        qi = int(qid)
+        if qi < 0 or qi >= len(keys_list):
+            continue
+        rk = keys_list[qi]
+        hs = grp["height_m"].dropna()
+        out[rk] = float(np.nanmax(hs.to_numpy(dtype=float))) if len(hs) > 0 else 0.0
+    for i, k in enumerate(keys_list):
+        if k not in out:
+            out[k] = 0.0
+    return out
+
+
+def _filter_voronoi_fc_station_roof_echelon(
+    fc: dict,
+    buildings_wgs: gpd.GeoDataFrame,
+    min_obstacle_height_m: float,
+) -> dict:
+    """
+    Удаляет рёбра, инцидентные зарядной станции на крыше здания высотой ≥ min_obstacle_height_m
+    (тот же порог, что и для препятствий на эшелоне: высота_эшелона − 5 м).
+    """
+    try:
+        mh = float(min_obstacle_height_m)
+    except (TypeError, ValueError):
+        return fc
+    feats = list(fc.get("features") or [])
+    if not feats or buildings_wgs is None or len(buildings_wgs) == 0:
+        return fc
+
+    need_pts: list[tuple[float, float]] = []
+    for feat in feats:
+        if not isinstance(feat, dict):
+            continue
+        p = feat.get("properties") or {}
+        if not p.get("connects_station"):
+            continue
+        geom = feat.get("geometry") or {}
+        if geom.get("type") != "LineString":
+            continue
+        cr = geom.get("coordinates") or []
+        if len(cr) < 2:
+            continue
+        try:
+            if p.get("source_is_station"):
+                need_pts.append((float(cr[0][0]), float(cr[0][1])))
+            if p.get("target_is_station"):
+                need_pts.append((float(cr[-1][0]), float(cr[-1][1])))
+        except (TypeError, ValueError, IndexError):
+            continue
+
+    hmap = _batch_max_building_heights_m_at_lonlat(need_pts, buildings_wgs)
+
+    def _h(lo: float, la: float) -> float:
+        return float(hmap.get((round(float(lo), 6), round(float(la), 6)), 0.0))
+
+    kept: list[dict] = []
+    for feat in feats:
+        if not isinstance(feat, dict):
+            kept.append(feat)
+            continue
+        p = feat.get("properties") or {}
+        if not p.get("connects_station"):
+            kept.append(feat)
+            continue
+        geom = feat.get("geometry") or {}
+        if geom.get("type") != "LineString":
+            kept.append(feat)
+            continue
+        cr = geom.get("coordinates") or []
+        if len(cr) < 2:
+            continue
+        try:
+            drop = False
+            if p.get("source_is_station"):
+                if _h(float(cr[0][0]), float(cr[0][1])) >= mh:
+                    drop = True
+            if not drop and p.get("target_is_station"):
+                if _h(float(cr[-1][0]), float(cr[-1][1])) >= mh:
+                    drop = True
+        except (TypeError, ValueError, IndexError):
+            kept.append(feat)
+            continue
+        if drop:
+            continue
+        kept.append(feat)
+
+    out = dict(fc)
+    out["features"] = kept
+    return out
 
 
 def _filter_voronoi_fc_linestrings_nfz(fc: dict, nfz_union: Any) -> dict:
@@ -979,17 +1221,20 @@ def _add_intra_cluster_nfz_safe_bridges(
     cluster_per_point: list[Any],
     nfz_union: Any,
     *,
+    building_clearance_union: Any = None,
     max_bridge_m: float,
 ) -> dict:
     """
-    Если после _filter_voronoi_fc_linestrings_nfz внутри одного кластера граф распался на компоненты,
-    добавляет между компонентами кратчайшие отрезки, не пересекающие NFZ (как is_edge_blocked).
+    Если после фильтров внутри одного кластера граф распался на компоненты,
+    добавляет кратчайшие отрезки, не пересекающие NFZ (is_edge_blocked) и не нарушающие высотные здания.
     """
     if max_bridge_m <= 0:
         out = dict(fc)
         out["voronoi_intra_component_bridges_added"] = 0
         return out
-    if nfz_union is None or getattr(nfz_union, "is_empty", True):
+    nfz_empty = nfz_union is None or getattr(nfz_union, "is_empty", True)
+    bld_empty = building_clearance_union is None or getattr(building_clearance_union, "is_empty", True)
+    if nfz_empty and bld_empty:
         out = dict(fc)
         out.setdefault("voronoi_intra_component_bridges_added", 0)
         return out
@@ -1076,7 +1321,9 @@ def _add_intra_cluster_nfz_safe_bridges(
                                 (float(pj[0]), float(pj[1])),
                             ]
                         )
-                        if is_edge_blocked(line, nfz_union, safety_buffer=0.0):
+                        if not nfz_empty and is_edge_blocked(line, nfz_union, safety_buffer=0.0):
+                            continue
+                        if not bld_empty and _line_violates_building_clearance(line, building_clearance_union):
                             continue
                         if best is None or d < best[0]:
                             best = (d, i, j, ci, cj)
@@ -1885,14 +2132,16 @@ def build_voronoi_local_paths_fc(
         level = int(echelon_levels[idx]) if idx < len(echelon_levels) else idx + 1
         min_h_b = float(DataService.echelon_altitude_to_building_obstacle_min_m(float(alt)))
         tall_i = buildings_footprint_union_min_height_wgs84(buildings_wgs, min_h_b)
-        barrier_i = _merge_polygon_unions_wgs84(nfz_union_f, tall_i)
         fc_i = _voronoi_fc_copy_filter_and_bridges(
             deduped_pre_barrier,
-            barrier_union=barrier_i,
+            nfz_union=nfz_union_f,
+            building_clearance_union=tall_i,
             coords_g=coords_g,
             flags_g=flags_g,
             all_cluster=all_cluster,
             max_bridge_m=bridge_m,
+            buildings_wgs=buildings_wgs,
+            voronoi_obstacle_min_building_height_m=min_h_b,
         )
         voronoi_by_echelon[str(level)] = {
             "type": "FeatureCollection",
@@ -2212,12 +2461,13 @@ def build_voronoi_edges_from_pipeline_raw(
                 level = int(levels[idx]) if idx < len(levels) else idx + 1
                 min_h_b = float(DataService.echelon_altitude_to_building_obstacle_min_m(float(alt)))
                 tall_u = buildings_footprint_union_min_height_wgs84(b_w, min_h_b)
-                barrier_u = _merge_polygon_unions_wgs84(nfz_union_f, tall_u)
                 fc_i = {
                     "type": "FeatureCollection",
                     "features": copy.deepcopy(list(fc_pre.get("features") or [])),
                 }
-                fc_i = _filter_voronoi_fc_linestrings_nfz(fc_i, barrier_u)
+                fc_i = _filter_voronoi_fc_linestrings_nfz(fc_i, nfz_union_f)
+                fc_i = _filter_voronoi_fc_building_clearance(fc_i, tall_u)
+                fc_i = _filter_voronoi_fc_station_roof_echelon(fc_i, b_w, min_h_b)
                 vbe[str(level)] = {
                     "type": "FeatureCollection",
                     "features": list(fc_i.get("features") or []),

@@ -4526,6 +4526,23 @@ def trunk_graph_to_geojson_features(trunk_graph: Optional[nx.Graph]) -> List[Dic
     return feats
 
 
+def _annotate_station_fc_vertical_echelon_links(fc: Dict[str, Any]) -> None:
+    """Для карты/клиента: зарядки A/B — узлы стыковки маршрутов по разным эшелонам."""
+    if not fc or not isinstance(fc, dict):
+        return
+    for f in fc.get("features") or []:
+        if not isinstance(f, dict):
+            continue
+        p = f.setdefault("properties", {})
+        if not isinstance(p, dict):
+            continue
+        p["vertical_echelons_connected"] = [1, 2, 3, 4, 5]
+        p["vertical_planning_note"] = (
+            "Стыковка эшелонов 1–5: на станции можно планировать плавный вертикальный спуск/подъём между "
+            "локальными маршрутами (эшелоны 1–3) и магистралью с ветками (4–5)."
+        )
+
+
 def pipeline_result_to_geojson(raw: Dict[str, Any]) -> Dict[str, Any]:
     """Ответ API `/api/stations/placement`: слои для карты + метрики и параметры."""
     err = raw.get("error")
@@ -4626,6 +4643,8 @@ def pipeline_result_to_geojson(raw: Dict[str, Any]) -> Dict[str, Any]:
         "params": raw.get("params") or {},
         "cluster_centroids": _gdf_to_fc(cluster_centroids),
     }
+    _annotate_station_fc_vertical_echelon_links(out["charging_type_a"])
+    _annotate_station_fc_vertical_echelon_links(out["charging_type_b"])
     if err:
         out["error"] = err
     return out

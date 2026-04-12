@@ -271,6 +271,11 @@
         let routeTrunkSub = {};
         let routeLocalSub = {};
         let lastPlacementData = null;
+        let routeLayerVoronoiMerged = null;
+        let routeLayerHighMerged = null;
+        let routeLayerEchelonHubs = null;
+        /** Как на карте до разбиения по эшелонам: один фиолетовый Вороной + зелёная магистраль и голубые ветки. */
+        const ROUTE_LEGACY_VORONOI_STYLE = { color: '#7c3aed', weight: 2, opacity: 0.55, dashArray: '4, 6', lineCap: 'round', lineJoin: 'round' };
         const ROUTE_ECHELON_VORONOI_COLORS = { 1: '#7c3aed', 2: '#db2777', 3: '#ea580c' };
         const ROUTE_ECHELON_HIGH_COLORS = { 4: '#059669', 5: '#4338ca' };
         const ROUTE_ECHELON_ALT_FALLBACK_M = [40, 67.5, 95, 122.5, 150];
@@ -701,7 +706,11 @@
             voronoiPathsVisible = !voronoiPathsVisible;
             if (voronoiPathsVisible) {
                 routeEchelonContainer.addTo(stationsRulesLayerGroup);
+                if (routeLayerEchelonHubs && routeLayerEchelonHubs.getLayers().length > 0) {
+                    routeLayerEchelonHubs.addTo(stationsRulesLayerGroup);
+                }
             } else {
+                if (routeLayerEchelonHubs) stationsRulesLayerGroup.removeLayer(routeLayerEchelonHubs);
                 stationsRulesLayerGroup.removeLayer(routeEchelonContainer);
             }
             updateVoronoiPathsButtonLabel();
@@ -719,6 +728,15 @@
                     h.removeLayer(t);
                 }
             });
+            const hm = routeLayerHighMerged;
+            const tm = routeTrunkSub['merged'];
+            if (hm && tm) {
+                if (trunkLinesVisible) {
+                    if (!hm.hasLayer(tm)) hm.addLayer(tm);
+                } else if (hm.hasLayer(tm)) {
+                    hm.removeLayer(tm);
+                }
+            }
             updateTrunkButtonLabel();
         }
 
@@ -734,6 +752,15 @@
                     h.removeLayer(loc);
                 }
             });
+            const hm = routeLayerHighMerged;
+            const lm = routeLocalSub['merged'];
+            if (hm && lm) {
+                if (localLinesVisible) {
+                    if (!hm.hasLayer(lm)) hm.addLayer(lm);
+                } else if (hm.hasLayer(lm)) {
+                    hm.removeLayer(lm);
+                }
+            }
             updateLocalButtonLabel();
         }
 
@@ -761,6 +788,9 @@
                 return;
             }
             const rows = [];
+            rows.push(
+                '<span style="font-size:12px;color:#475569">Если в списке выбрано «Все эшелоны», на карте как раньше: Вороной — фиолетовый (#7c3aed), магистраль — зелёная (#22c55e), ветки — #0ea5e9, локально B↔B — #38bdf8.</span>'
+            );
             for (let lv = 1; lv <= 5; lv++) {
                 const col = lv <= 3 ? ROUTE_ECHELON_VORONOI_COLORS[lv] : ROUTE_ECHELON_HIGH_COLORS[lv];
                 const alt = echelonAltitudeMFromData(data, lv);
@@ -784,11 +814,8 @@
                 } catch (e) {}
             };
             if (sel === 'all') {
-                addLg(routeLayerVoronoi['1']);
-                addLg(routeLayerVoronoi['2']);
-                addLg(routeLayerVoronoi['3']);
-                addLg(routeLayerHigh[4]);
-                addLg(routeLayerHigh[5]);
+                addLg(routeLayerVoronoiMerged);
+                addLg(routeLayerHighMerged);
             } else if (sel === '1' || sel === '2' || sel === '3') {
                 addLg(routeLayerVoronoi[sel]);
             } else if (sel === '4') {
@@ -822,6 +849,9 @@
             routeLayerHigh = {};
             routeTrunkSub = {};
             routeLocalSub = {};
+            routeLayerVoronoiMerged = null;
+            routeLayerHighMerged = null;
+            routeLayerEchelonHubs = null;
             stationsRulesLayerGroup = L.layerGroup();
 
             /** Устойчивый цвет по id кластера (золотой угол в HSL). */
@@ -884,13 +914,78 @@
                         onEachFeature: function(feature, layer) {
                             const p = feature.properties || {};
                             const cid = p.cluster_id != null ? p.cluster_id : '—';
-                            layer.bindPopup(title + '<br>Кластер №' + cid);
+                            const vnote = p.vertical_planning_note;
+                            layer.bindPopup(
+                                title + '<br>Кластер №' + cid
+                                + (vnote ? '<br><small style="color:#475569">' + vnote + '</small>' : '')
+                            );
                         },
                     }).addTo(stationsRulesLayerGroup);
                 }
 
                 routeEchelonContainer = L.layerGroup();
                 voronoiPathsLayer = routeEchelonContainer;
+
+                routeLayerVoronoiMerged = L.layerGroup();
+                if (data.voronoi_edges && data.voronoi_edges.features && data.voronoi_edges.features.length) {
+                    addLines(
+                        data.voronoi_edges,
+                        ROUTE_LEGACY_VORONOI_STYLE,
+                        'Вороной (все эшелоны, отображение как раньше)',
+                        routeLayerVoronoiMerged
+                    );
+                }
+                routeLayerHighMerged = L.layerGroup();
+                const trunkMerged = L.layerGroup();
+                const localMerged = L.layerGroup();
+                const STATION_COLOR_BRANCH_LEGACY = '#0ea5e9';
+                const STATION_COLOR_LOCAL_LEGACY = '#38bdf8';
+                addLines(
+                    data.trunk,
+                    { color: STATION_COLOR_CHARGING, weight: 3, opacity: 0.95, lineCap: 'round', lineJoin: 'round' },
+                    'Магистраль A–A',
+                    trunkMerged
+                );
+                addLines(
+                    data.branch_edges,
+                    { color: STATION_COLOR_BRANCH_LEGACY, weight: 2, opacity: 0.92, lineCap: 'round', lineJoin: 'round' },
+                    'Ветвь к зарядке A (Б / гараж / ТО)',
+                    localMerged
+                );
+                addLines(
+                    data.local_edges,
+                    { color: STATION_COLOR_LOCAL_LEGACY, weight: 3, opacity: 0.9, dashArray: '2, 4', lineCap: 'round', lineJoin: 'round' },
+                    'Локально B↔B',
+                    localMerged
+                );
+                if (trunkLinesVisible) routeLayerHighMerged.addLayer(trunkMerged);
+                if (localLinesVisible) routeLayerHighMerged.addLayer(localMerged);
+                routeTrunkSub['merged'] = trunkMerged;
+                routeLocalSub['merged'] = localMerged;
+
+                routeLayerEchelonHubs = L.layerGroup();
+                function addEchelonHubRings(fc) {
+                    if (!fc || !fc.features || !fc.features.length) return;
+                    L.geoJSON(fc, {
+                        pointToLayer: function(_feature, latlng) {
+                            return L.circleMarker(latlng, {
+                                radius: 14,
+                                color: '#64748b',
+                                weight: 2,
+                                opacity: 0.88,
+                                fill: false,
+                                dashArray: '3, 4',
+                            });
+                        },
+                        onEachFeature: function(feature, layer) {
+                            layer.bindPopup(
+                                '<strong>Узел связи эшелонов 1–5</strong><br><small>Плановый вертикальный переход между маршрутами на станции</small>'
+                            );
+                        },
+                    }).addTo(routeLayerEchelonHubs);
+                }
+                addEchelonHubRings(data.charging_type_a);
+                addEchelonHubRings(data.charging_type_b);
 
                 const vbe = data.voronoi_edges_by_echelon || {};
                 ['1', '2', '3'].forEach(function(k) {
@@ -957,7 +1052,12 @@
 
                 fillRouteEchelonLegend(data);
                 applyRouteEchelonView();
-                if (voronoiPathsVisible) routeEchelonContainer.addTo(stationsRulesLayerGroup);
+                if (voronoiPathsVisible) {
+                    routeEchelonContainer.addTo(stationsRulesLayerGroup);
+                    if (routeLayerEchelonHubs && routeLayerEchelonHubs.getLayers().length > 0) {
+                        routeLayerEchelonHubs.addTo(stationsRulesLayerGroup);
+                    }
+                }
                 const routePanel = document.getElementById('routeEchelonPanel');
                 if (routePanel) routePanel.style.display = 'block';
 
