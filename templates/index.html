@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Graph Service UI</title>
+    <title>Карта города — границы и здания</title>
     <link rel="stylesheet" href="/static/styles.css" />
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
@@ -40,6 +40,8 @@
             left: 16px;
             z-index: 1200;
             width: 320px;
+            max-height: calc(100vh - 100px);
+            overflow-y: auto;
             background: #fff;
             border-radius: 12px;
             box-shadow: 0 20px 60px rgba(0, 0, 0, .35);
@@ -158,7 +160,7 @@
     <div id="map"></div>
     
     <div class="sidebar">
-        <h2 style="margin:0 0 12px">Параметры графа</h2>
+        <h2 style="margin:0 0 12px">Карта города</h2>
         <div style="display:flex; flex-direction:column; gap:12px">
             <label style="display:flex; flex-direction:column; gap:4px">
                 Город
@@ -171,53 +173,126 @@
                 />
                 <datalist id="cityList"></datalist>
             </label>
-            
-            <label style="display:flex; flex-direction:column; gap:4px">
-                Тип графа
-                <select id="graphType" style="width:100%">
-                    <option value="road">Дороги (OSM)</option>
-                    <option value="delaunay">Delaunay триангуляция</option>
-                </select>
-            </label>
-            
-            <label id="flightLevelFilterLabel" style="display:none; flex-direction:column; gap:4px">
-                Эшелон (маршруты)
-                <select id="flightLevelFilter" style="width:100%" onchange="applyFlightLevelFilter()">
-                    <option value="">Все</option>
-                    <option value="1">Эшелон 1</option>
-                    <option value="2">Эшелон 2</option>
-                    <option value="3">Эшелон 3</option>
-                    <option value="4">Эшелон 4</option>
-                </select>
-            </label>
         </div>
-        
-        <div class="modal-footer">
+        <div class="modal-footer" style="margin-top:12px">
             <div style="font-size:14px">
                 <div id="status"></div>
                 <div id="statsInfo" style="margin-top:4px; color:#6b7280; font-size:12px"></div>
             </div>
             <div>
-                <button class="floating-btn" style="position:static" onclick="buildGraph()">Построить</button>
+                <button class="floating-btn" style="position:static" onclick="loadCityMap()">Загрузить</button>
             </div>
         </div>
-        
-        <div id="flightLevelsPanel" class="flight-levels-panel" style="display:none">
-            <h3>Эшелоны полётов</h3>
-            <div id="flightLevelsList"></div>
+        <div class="flight-levels-panel" style="margin-top:12px">
+            <h3 style="margin:0 0 8px">Кластеры</h3>
+            <p style="font-size:12px; color:#6b7280; margin:0 0 8px; line-height:1.4">
+                Цвета соответствуют `cluster_id`. Клик по области/точке показывает номер кластера и агрегированный вес.
+            </p>
+            <button class="floating-btn btn-secondary" id="toggleClusterHullsBtn" style="width:100%; margin-top:6px; display:none" onclick="toggleClusterHulls()" title="Включить/выключить отображение областей кластеров">
+                <span id="clusterHullsLabel">Скрыть область кластера</span>
+            </button>
+            <button class="floating-btn btn-secondary" id="toggleClusterPointsBtn" style="width:100%; margin-top:6px; display:none" onclick="toggleClusterPoints()" title="Включить/выключить отображение точек кластеров">
+                <span id="clusterPointsLabel">Показать точки кластеров</span>
+            </button>
+        </div>
+        <div class="flight-levels-panel" style="margin-top:12px">
+            <h3 style="margin:0 0 8px">Зарядка (кластерная привязка)</h3>
+            <p style="font-size:11px; color:#6b7280; margin:0 0 8px; line-height:1.4">
+                Покрытие demand считаем по `cluster_id`: каждая станция привязана к кластеру спроса,
+                поэтому радиусы в ответе API не используются.
+            </p>
+            <div class="height-legend" style="flex-wrap:wrap; gap:4px 8px">
+                <span><span class="swatch" style="background:#22c55e"></span> Зарядки (A и B)</span>
+                <span><span class="swatch" style="background:#f97316"></span> Гаражи</span>
+                <span><span class="swatch" style="background:#2563eb"></span> ТО</span>
+            </div>
+            <p style="font-size:11px; color:#6b7280; margin:6px 0 0; line-height:1.35">
+                Линии маршрутов: эшелоны 1–3 (Вороной) и 4–5 (магистраль/ветки) — цвета в блоке «Просмотр по эшелону» после расчёта.
+            </p>
+            <button class="floating-btn btn-secondary" id="loadStationsRulesBtn" style="width:100%; margin-top:8px" onclick="loadStationsRulesPlacement()">
+                Рассчитать зарядки
+            </button>
+            <button class="floating-btn btn-secondary" id="toggleVoronoiPathsBtn" style="width:100%; margin-top:6px; display:none" onclick="toggleVoronoiPaths()" title="Показать или скрыть все слои маршрутов по эшелонам">
+                <span id="toggleVoronoiPathsLabel">Скрыть маршруты по эшелонам</span>
+            </button>
+            <div id="routeEchelonPanel" style="display:none; margin-top:10px; padding-top:10px; border-top:1px solid #e5e7eb">
+                <div style="font-size:12px; font-weight:600; color:#374151; margin-bottom:6px">Просмотр по эшелону</div>
+                <select id="routeEchelonSelect" onchange="applyRouteEchelonView()" style="width:100%; padding:8px 10px; border-radius:8px; border:1px solid #d1d5db; font-size:13px" title="Какие маршруты показать">
+                    <option value="all">Все эшелоны (1–5)</option>
+                    <option value="1">Эшелон 1 — Вороной (низкий)</option>
+                    <option value="2">Эшелон 2 — Вороной</option>
+                    <option value="3">Эшелон 3 — Вороной</option>
+                    <option value="4">Эшелон 4 — магистраль и ветки</option>
+                    <option value="5">Эшелон 5 — магистраль и ветки</option>
+                </select>
+                <div id="routeEchelonLegend" class="height-legend" style="margin-top:8px; flex-direction:column; align-items:flex-start; gap:4px"></div>
+            </div>
+            <button class="floating-btn btn-secondary" id="toggleTrunkBtn" style="width:100%; margin-top:6px" onclick="toggleTrunkLines()">
+                <span id="toggleTrunkLabel">Скрыть магистраль</span>
+            </button>
+            <button class="floating-btn btn-secondary" id="toggleLocalBtn" style="width:100%; margin-top:6px" onclick="toggleLocalLines()" title="Ветви Б/гараж/ТО к зарядке A и локальные B↔B (магистраль A не трогаем)">
+                <span id="toggleLocalLabel">Скрыть локальные пути</span>
+            </button>
+            <button class="floating-btn btn-secondary" id="loadSavedStationsBtn" style="width:100%; margin-top:6px" onclick="loadSavedStationsToMap()" title="Показать последнюю сохранённую расстановку из Redis на карте (без пересчёта)">
+                Показать сохранённые станции на карте
+            </button>
+            <div id="stationsRulesStats" style="font-size:12px; color:#6b7280; margin-top:8px"></div>
+        </div>
+        <div class="flight-levels-panel" style="margin-top:12px">
+            <h3 style="margin:0 0 8px">Высота зданий</h3>
             <div class="height-legend">
                 <span><span class="swatch" style="background:#22c55e"></span> &lt;15 м</span>
                 <span><span class="swatch" style="background:#eab308"></span> 15–30 м</span>
                 <span><span class="swatch" style="background:#f97316"></span> 30–50 м</span>
                 <span><span class="swatch" style="background:#ef4444"></span> &gt;50 м</span>
             </div>
+            <button
+                class="floating-btn btn-secondary"
+                id="toggleBuildingsBtn"
+                style="width:100%; margin-top:8px"
+                onclick="toggleBuildings()"
+                title="Включить/выключить отображение зданий по высоте"
+            >
+                <span id="buildingsLabel">Показать здания</span>
+            </button>
         </div>
     </div>
 
     <script>
-        let map, edgesLayer, boundaryLayer, noFlyZonesLayer, buildingsLayer;
-        let lastGraphData = null;
-        let lastGraphType = null;
+        let map, boundaryLayer, noFlyZonesLayer, buildingsLayer, clustersLayer, clusterHullsLayer, clusterPointsLayer;
+        let stationsRulesLayerGroup = null;
+        let trunkLinesLayer = null;
+        let localLinesLayer = null;
+        let voronoiPathsLayer = null;
+        /** Слои маршрутов по эшелонам (Вороной 1–3, магистраль/ветки 4–5). */
+        let routeEchelonContainer = null;
+        let routeLayerVoronoi = {};
+        let routeLayerHigh = {};
+        let routeTrunkSub = {};
+        let routeLocalSub = {};
+        let lastPlacementData = null;
+        let routeLayerVoronoiMerged = null;
+        let routeLayerHighMerged = null;
+        let routeLayerEchelonHubs = null;
+        /** Как на карте до разбиения по эшелонам: один фиолетовый Вороной + зелёная магистраль и голубые ветки. */
+        const ROUTE_LEGACY_VORONOI_STYLE = { color: '#7c3aed', weight: 2, opacity: 0.55, dashArray: '4, 6', lineCap: 'round', lineJoin: 'round' };
+        const ROUTE_ECHELON_VORONOI_COLORS = { 1: '#7c3aed', 2: '#db2777', 3: '#ea580c' };
+        const ROUTE_ECHELON_HIGH_COLORS = { 4: '#059669', 5: '#4338ca' };
+        const ROUTE_ECHELON_ALT_FALLBACK_M = [40, 67.5, 95, 122.5, 150];
+
+        function echelonAltitudeMFromData(data, level) {
+            const fl = (data && data.flight_levels) || [];
+            const i = level - 1;
+            if (fl[i] != null && fl[i].altitude_m != null) return Number(fl[i].altitude_m);
+            return ROUTE_ECHELON_ALT_FALLBACK_M[i] != null ? ROUTE_ECHELON_ALT_FALLBACK_M[i] : level * 40;
+        }
+
+        let clusterHullsVisible = true;
+        let clusterPointsVisible = false; // точки кластеров (центроиды/точки спроса) по умолчанию скрыты
+        let buildingsVisible = false; // по умолчанию здания не показываем, пока пользователь не включит
+        let trunkLinesVisible = true;
+        let localLinesVisible = true;
+        let voronoiPathsVisible = true;
         
         // Список популярных городов
         const CITIES = [
@@ -259,48 +334,10 @@
         function getCityQuery() {
             const input = document.getElementById('cityInput');
             const value = input.value.trim();
-            
             if (!value) return null;
-            
-            // Проверяем, выбран ли город из списка
             const selectedCity = CITIES.find(c => c.name === value);
-            if (selectedCity) {
-                return selectedCity.query;
-            }
-            
-            // Иначе используем введенное значение как есть
+            if (selectedCity) return selectedCity.query;
             return value;
-        }
-
-        function getEdgeColor(edgeType) {
-            switch(edgeType) {
-                case 'road': return '#2563eb';      // синий для дорог
-                case 'free': return '#10b981';      // зеленый для свободного пространства
-                case 'connection': return '#f59e0b'; // оранжевый для соединений
-                default: return '#6b7280';          // серый по умолчанию
-            }
-        }
-
-        function getEdgeWeight(edgeType) {
-            switch(edgeType) {
-                case 'road': return 2.5;
-                case 'free': return 1.5;
-                case 'connection': return 2;
-                default: return 2;
-            }
-        }
-
-        function getBuildingColor(buildingType) {
-            const colors = {
-                'apartment': '#ef4444',    // красный - многоквартирные
-                'house': '#10b981',        // зеленый - частные дома
-                'industrial': '#f59e0b',   // оранжевый - промышленные
-                'commercial': '#3b82f6',   // синий - коммерческие
-                'office': '#8b5cf6',       // фиолетовый - офисные
-                'public': '#ec4899',       // розовый - общественные
-                'other': '#6b7280'         // серый - прочие
-            };
-            return colors[buildingType] || colors['other'];
         }
 
         /** Цвет здания по высоте: низкие — зелёный, высокие — красный */
@@ -310,82 +347,6 @@
             if (h < 30) return '#eab308';   // жёлтый
             if (h < 50) return '#f97316';   // оранжевый
             return '#ef4444';               // красный
-        }
-
-        /** Цвет точки эшелона на легенде */
-        function getFlightLevelColor(level) {
-            const colors = ['#22c55e', '#3b82f6', '#f59e0b', '#ef4444'];
-            return colors[(level - 1) % colors.length] || '#6b7280';
-        }
-
-        function getFilteredEdges(graphData, flightLevelFilter) {
-            const features = graphData?.edges?.features || [];
-            if (!flightLevelFilter || graphData?.graph_type !== 'delaunay') return features;
-            const level = parseInt(flightLevelFilter, 10);
-            if (isNaN(level)) return features;
-            return features.filter(f => {
-                const allowed = f.properties?.allowed_flight_levels;
-                return Array.isArray(allowed) && allowed.includes(level);
-            });
-        }
-
-        function applyFlightLevelFilter() {
-            if (!lastGraphData || !map || !edgesLayer) return;
-            const sel = document.getElementById('flightLevelFilter');
-            const filter = sel ? sel.value : '';
-            const features = getFilteredEdges(lastGraphData, filter);
-            map.removeLayer(edgesLayer);
-            edgesLayer = createEdgesLayer(lastGraphData, features);
-            edgesLayer.addTo(map);
-            const statsEl = document.getElementById('statsInfo');
-            if (statsEl && lastGraphData.graph_type === 'delaunay') {
-                const total = lastGraphData.edges?.features?.length || 0;
-                const shown = features.length;
-                const base = `Узлов: ${lastGraphData.stats?.nodes || 0}, Рёбер: ${lastGraphData.stats?.edges || 0}`;
-                statsEl.textContent = filter ? `${base} (показано: ${shown} для эшелона ${filter})` : base;
-            }
-        }
-
-        function createEdgesLayer(graphData, features) {
-            const geojson = { type: 'FeatureCollection', features };
-            return L.geoJSON(geojson, {
-                style: function(feature) {
-                    const edgeType = feature.properties?.edge_type || 'unknown';
-                    return {
-                        color: getEdgeColor(edgeType),
-                        weight: getEdgeWeight(edgeType),
-                        opacity: 0.7
-                    };
-                },
-                onEachFeature: function(feature, layer) {
-                    if (feature.properties) {
-                        const p = feature.properties;
-                        const allowed = p.allowed_flight_levels;
-                        const allowedStr = Array.isArray(allowed) ? allowed.join(', ') : '—';
-                        layer.bindPopup(`
-                            Тип: ${p.edge_type || 'unknown'}<br>
-                            Длина: ${(p.length || 0).toFixed(4)} км<br>
-                            Эшелоны: ${allowedStr}
-                        `);
-                    }
-                }
-            });
-        }
-
-        function updateFlightLevelsPanel(flightLevels) {
-            const panel = document.getElementById('flightLevelsPanel');
-            const list = document.getElementById('flightLevelsList');
-            if (!flightLevels || flightLevels.length === 0) {
-                panel.style.display = 'none';
-                return;
-            }
-            list.innerHTML = flightLevels.map(fl => `
-                <div class="flight-level-item">
-                    <span class="flight-level-dot" style="background:${getFlightLevelColor(fl.level)}"></span>
-                    <span>${fl.label || 'Эшелон ' + fl.level + ' (' + fl.altitude_m + ' м)'}</span>
-                </div>
-            `).join('');
-            panel.style.display = 'block';
         }
 
         async function loadBuildingsWithHeights(city, network, simplify) {
@@ -404,9 +365,6 @@
                     console.log('Нет зданий для отображения');
                     return;
                 }
-                
-                updateFlightLevelsPanel(data.flight_levels || []);
-                
                 const geojson = { type: 'FeatureCollection', features: data.features };
                 const layerOptions = {
                     style: function(feature) {
@@ -424,15 +382,26 @@
                         const p = feature.properties || {};
                         const h = p.height_m || '—';
                         const fl = p.flight_level || '—';
+                        let areaText = '—';
+                        if (p.area_m2 !== undefined && p.area_m2 !== null) {
+                            const areaVal = Number(p.area_m2);
+                            if (!Number.isNaN(areaVal)) {
+                                areaText = areaVal.toLocaleString('ru-RU', { maximumFractionDigits: 0 }) + ' м²';
+                            }
+                        }
                         layer.bindPopup(`
                             <strong>Высота:</strong> ${h} м<br>
+                            <strong>Площадь:</strong> ${areaText}<br>
                             <strong>Рекомендуемый эшелон:</strong> ${fl}
                         `);
                     }
                 };
                 
                 buildingsLayer = L.geoJSON(geojson, layerOptions);
-                buildingsLayer.addTo(map);
+                if (buildingsVisible) {
+                    buildingsLayer.addTo(map);
+                }
+                updateBuildingsButtonLabel();
                 console.log('✓ Здания по высоте: ' + data.features.length);
             } catch (error) {
                 console.error('Ошибка загрузки зданий с высотами:', error);
@@ -440,120 +409,191 @@
             }
         }
 
-        function getBuildingTypeName(buildingType) {
-            const names = {
-                'apartment': 'Многоквартирный дом',
-                'house': 'Частный дом',
-                'industrial': 'Промышленное здание',
-                'commercial': 'Коммерческое здание',
-                'office': 'Офисное здание',
-                'public': 'Общественное здание',
-                'other': 'Прочее'
-            };
-            return names[buildingType] || buildingType;
+        async function loadDbscanClusters(city, network, simplify) {
+            try {
+                const url = new URL('/api/buildings/clusters', window.location.origin);
+                url.searchParams.set('city', city);
+                url.searchParams.set('network_type', network);
+                url.searchParams.set('simplify', simplify);
+                url.searchParams.set('method', 'dbscan');
+                const resp = await fetch(url);
+                if (!resp.ok) return;
+                const data = await resp.json();
+                const fc = data.clusters || data.buildings;
+                if (!fc || !fc.features || fc.features.length === 0) return;
+                if (clustersLayer) {
+                    map.removeLayer(clustersLayer);
+                    clustersLayer = null;
+                }
+                if (clusterHullsLayer) {
+                    map.removeLayer(clusterHullsLayer);
+                    clusterHullsLayer = null;
+                }
+                if (clusterPointsLayer) {
+                    map.removeLayer(clusterPointsLayer);
+                    clusterPointsLayer = null;
+                }
+                const epsM = data.dbscan_eps_m != null ? Number(data.dbscan_eps_m) : 180;
+                const hullsFc = data.cluster_hulls || { type: 'FeatureCollection', features: [] };
+                /** Устойчивый отличающийся цвет по id кластера (золотой угол в HSL). */
+                function colorForClusterId(cid) {
+                    const n = Math.max(0, parseInt(cid, 10) || 0);
+                    const h = (n * 137.508) % 360;
+                    return {
+                        fill: 'hsl(' + h + ', 70%, 50%)',
+                        stroke: 'hsl(' + h + ', 70%, 28%)',
+                    };
+                }
+                clustersLayer = L.layerGroup();
+                if (hullsFc.features && hullsFc.features.length > 0) {
+                    clusterHullsLayer = L.geoJSON(hullsFc, {
+                        style: function(feature) {
+                            const cid = feature.properties && feature.properties.cluster_id != null
+                                ? feature.properties.cluster_id
+                                : 0;
+                            const c = colorForClusterId(cid);
+                            return {
+                                color: c.stroke,
+                                weight: 2,
+                                opacity: 1,
+                                fillColor: c.fill,
+                                fillOpacity: 0.18,
+                                lineCap: 'round',
+                                lineJoin: 'round',
+                            };
+                        },
+                        onEachFeature: function(feature, layer) {
+                            const p = feature.properties || {};
+                            const w = p.weight != null ? p.weight : '—';
+                            const cid = p.cluster_id != null ? p.cluster_id : '—';
+                            const nb = p.n_buildings != null ? p.n_buildings : '—';
+                            layer.bindPopup(
+                                '<strong>Область спроса</strong>'
+                                + '<br>Кластер №' + cid
+                                + '<br>Вес (агр. точек): ' + w
+                                + '<br>Зданий: ' + nb
+                            );
+                        }
+                    });
+                    if (clusterHullsVisible) clusterHullsLayer.addTo(map);
+                } else {
+                    clusterHullsLayer = null;
+                }
+                clusterPointsLayer = L.geoJSON(fc, {
+                    pointToLayer: function(feature, latlng) {
+                        const p = feature.properties || {};
+                        const w = p.weight != null ? p.weight : 1;
+                        const cid = p.cluster_id != null ? p.cluster_id : 0;
+                        const r = Math.min(10, Math.max(3, 3 + Math.log2(w)));
+                        const c = colorForClusterId(cid);
+                        return L.circleMarker(latlng, {
+                            radius: r,
+                            fillColor: c.fill,
+                            color: c.stroke,
+                            weight: 2,
+                            fillOpacity: 0.92,
+                            opacity: 1,
+                        });
+                    },
+                    onEachFeature: function(feature, layer) {
+                        const p = feature.properties || {};
+                        const w = p.weight != null ? p.weight : '—';
+                        const cid = p.cluster_id != null ? p.cluster_id : '—';
+                        const nb = p.n_buildings != null ? p.n_buildings : '—';
+                        layer.bindPopup(
+                            '<strong>Точка спроса</strong>'
+                            + '<br>Кластер №' + cid
+                            + '<br>Вес (агр. точек): ' + w
+                            + '<br>Зданий: ' + nb
+                        );
+                    }
+                });
+                if (clusterPointsVisible) clusterPointsLayer.addTo(clustersLayer);
+                clustersLayer.addTo(map);
+                document.getElementById('toggleClusterHullsBtn').style.display = 'block';
+                updateClusterHullsButtonLabel();
+                const pointsBtn = document.getElementById('toggleClusterPointsBtn');
+                if (pointsBtn) pointsBtn.style.display = 'block';
+                updateClusterPointsButtonLabel();
+                console.log('✓ Кластеры DBSCAN: ' + fc.features.length + ', областей (hulls): ' + (hullsFc.features ? hullsFc.features.length : 0));
+            } catch (e) {
+                console.warn('Кластеры DBSCAN не загружены:', e);
+            }
         }
 
-        async function buildGraph() {
+        async function loadCityMap() {
             const city = getCityQuery();
-            const graphType = document.getElementById('graphType').value;
-            
-            // Фиксированные параметры (оптимальные)
-            const network = 'all';           // всегда все типы дорог
-            const simplify = true;           // всегда упрощаем
-            
+            const network = 'drive';
+            const simplify = true;
             const statusEl = document.getElementById('status');
             const statsEl = document.getElementById('statsInfo');
-            
             if (!city) {
                 alert('Выберите или введите город');
                 return;
             }
-            
-            statusEl.textContent = 'Загрузка данных города...';
+            statusEl.textContent = 'Загрузка границ и зданий...';
             statsEl.textContent = '';
-            
             try {
-                // Сначала загружаем данные города
-                const cityUrl = new URL('/api/city', window.location.origin);
-                cityUrl.searchParams.set('city', city);
-                cityUrl.searchParams.set('network_type', network);
-                cityUrl.searchParams.set('simplify', simplify);
-                const cityResp = await fetch(cityUrl);
-                const cityData = await cityResp.json();
-                if (!cityResp.ok) throw new Error(cityData.detail || 'Ошибка загрузки данных');
-
-                statusEl.textContent = 'Генерация графа...';
-
-                // Затем загружаем граф нужного типа
-                const graphUrl = new URL('/api/graph', window.location.origin);
-                graphUrl.searchParams.set('city', city);
-                graphUrl.searchParams.set('network_type', network);
-                graphUrl.searchParams.set('simplify', simplify);
-                graphUrl.searchParams.set('graph_type', graphType);
-                
-                const graphResp = await fetch(graphUrl);
-                if (!graphResp.ok) {
-                    const errorData = await graphResp.json().catch(() => ({ detail: 'Неизвестная ошибка' }));
-                    throw new Error(errorData.detail || 'Ошибка генерации графа');
+                const mapUrl = new URL('/api/city/map', window.location.origin);
+                mapUrl.searchParams.set('city', city);
+                mapUrl.searchParams.set('network_type', network);
+                mapUrl.searchParams.set('simplify', simplify);
+                const mapResp = await fetch(mapUrl);
+                if (!mapResp.ok) {
+                    const err = await mapResp.json().catch(() => ({}));
+                    throw new Error(err.detail || 'Ошибка загрузки карты');
                 }
-                
-                const graphData = await graphResp.json();
-
-                statusEl.textContent = 'Отрисовка...';
-                lastGraphData = graphData;
-                lastGraphType = graphType;
-                updateFlightLevelsPanel(graphData.flight_levels || []);
-
-                const flLabel = document.getElementById('flightLevelFilterLabel');
-                const flSel = document.getElementById('flightLevelFilter');
-                if (graphType === 'delaunay' && graphData.flight_levels?.length) {
-                    if (flLabel) flLabel.style.display = 'flex';
-                    if (flSel) {
-                        flSel.innerHTML = '<option value="">Все</option>' + graphData.flight_levels.map(fl =>
-                            `<option value="${fl.level}">${fl.label || 'Эшелон ' + fl.level}</option>`
-                        ).join('');
-                        flSel.value = '';
-                    }
-                } else {
-                    if (flLabel) flLabel.style.display = 'none';
-                }
-
-                ensureMap([graphData.center.lat, graphData.center.lon]);
-                
-                // Удаляем старые слои
-                if (edgesLayer) {
-                    map.removeLayer(edgesLayer);
-                }
+                const mapData = await mapResp.json();
+                ensureMap([mapData.center.lat, mapData.center.lon]);
                 if (boundaryLayer) {
                     map.removeLayer(boundaryLayer);
+                    boundaryLayer = null;
                 }
                 if (noFlyZonesLayer) {
                     map.removeLayer(noFlyZonesLayer);
+                    noFlyZonesLayer = null;
                 }
                 if (buildingsLayer) {
                     map.removeLayer(buildingsLayer);
+                    buildingsLayer = null;
                 }
-
-                // Добавляем беспилотные зоны (если есть) - ПЕРВЫМИ, чтобы они были под графом
-                if (graphData.no_fly_zones) {
-                    noFlyZonesLayer = L.geoJSON(graphData.no_fly_zones, {
+                if (clustersLayer) {
+                    map.removeLayer(clustersLayer);
+                    clustersLayer = null;
+                }
+                if (clusterHullsLayer) {
+                    map.removeLayer(clusterHullsLayer);
+                    clusterHullsLayer = null;
+                }
+                if (stationsRulesLayerGroup) {
+                    map.removeLayer(stationsRulesLayerGroup);
+                    stationsRulesLayerGroup = null;
+                }
+                const toggleVoronoiBtn = document.getElementById('toggleVoronoiPathsBtn');
+                if (toggleVoronoiBtn) toggleVoronoiBtn.style.display = 'none';
+                const routeEchelonPanelClear = document.getElementById('routeEchelonPanel');
+                if (routeEchelonPanelClear) routeEchelonPanelClear.style.display = 'none';
+                const srsEl = document.getElementById('stationsRulesStats');
+                if (srsEl) srsEl.textContent = '';
+                const toggleClusterBtn = document.getElementById('toggleClusterHullsBtn');
+                if (toggleClusterBtn) toggleClusterBtn.style.display = 'none';
+                if (mapData.no_fly_zones) {
+                    noFlyZonesLayer = L.geoJSON(mapData.no_fly_zones, {
                         style: {
-                            color: '#dc2626',  // Красный цвет границы
+                            color: '#dc2626',
                             weight: 2,
                             opacity: 0.9,
-                            fillColor: '#dc2626',  // Красная заливка
-                            fillOpacity: 0.3,  // Полупрозрачная заливка
-                            dashArray: '5, 5'  // Пунктирная линия
+                            fillColor: '#dc2626',
+                            fillOpacity: 0.3,
+                            dashArray: '5, 5'
                         },
                         onEachFeature: function(feature, layer) {
-                            layer.bindPopup('🚫 Беспилотная зона<br>Полет запрещен');
+                            layer.bindPopup('Беспилотная зона<br>Полет запрещен');
                         }
                     }).addTo(map);
                 }
-
-                // Добавляем границы города (если есть)
-                if (graphData.city_boundary) {
-                    boundaryLayer = L.geoJSON(graphData.city_boundary, {
+                if (mapData.city_boundary) {
+                    boundaryLayer = L.geoJSON(mapData.city_boundary, {
                         style: {
                             color: '#ef4444',
                             weight: 3,
@@ -564,56 +604,609 @@
                         }
                     }).addTo(map);
                 }
-
-                // Загружаем здания с высотами (полигоны, окраска по высоте)
-                try {
-                    console.log('Начало загрузки зданий с высотами...');
-                    await loadBuildingsWithHeights(city, network, simplify);
-                    console.log('✓ Здания по высоте загружены');
-                } catch (err) {
-                    console.error('ОШИБКА загрузки зданий:', err);
-                    console.error('Детали ошибки:', {
-                        name: err.name,
-                        message: err.message,
-                        stack: err.stack
-                    });
-                    statusEl.textContent = '✓ Готово (ошибка загрузки зданий: ' + err.message + ')';
+                await loadBuildingsWithHeights(city, network, simplify);
+                await loadDbscanClusters(city, network, simplify);
+                const bbox = mapData.bbox;
+                if (bbox && bbox.length >= 4) {
+                    const [minLon, minLat, maxLon, maxLat] = bbox;
+                    map.fitBounds(L.latLngBounds([[minLat, minLon], [maxLat, maxLon]]), { padding: [20, 20] });
                 }
-                
-                const flightFilter = document.getElementById('flightLevelFilter')?.value || '';
-                const featuresToShow = getFilteredEdges(graphData, flightFilter);
-                console.log(`Отрисовка графа: ${featuresToShow.length} рёбер (всего ${graphData.edges?.features?.length || 0})`);
-                try {
-                    edgesLayer = createEdgesLayer(graphData, featuresToShow);
-                    edgesLayer.addTo(map);
-                } catch (edgeError) {
-                    console.error('ОШИБКА при создании слоя рёбер:', edgeError);
-                    throw edgeError;
-                }
-                
-                // Подгоняем карту под границы
-                const [minLon, minLat, maxLon, maxLat] = graphData.bbox;
-                const bounds = L.latLngBounds([
-                    [minLat, minLon],
-                    [maxLat, maxLon]
-                ]);
-                map.fitBounds(bounds, { padding: [20, 20] });
-                
                 statusEl.textContent = '✓ Готово';
-                const stats = graphData.stats || {};
-                let statsText = `Узлов: ${stats.nodes || 0}, Рёбер: ${stats.edges || 0}`;
-                if (graphType === 'delaunay' && flightFilter && graphData.edges?.features) {
-                    statsText += ` (показано: ${featuresToShow.length} для эшелона ${flightFilter})`;
-                }
-                if (stats.road_nodes) {
-                    statsText += `\nДороги: ${stats.road_nodes}, Свободные: ${stats.free_nodes}`;
-                }
-                statsEl.textContent = statsText;
-                
+                const n = (buildingsLayer && buildingsLayer.getLayers) ? buildingsLayer.getLayers().length : 0;
+                const nc = (clustersLayer && clustersLayer.getLayers) ? clustersLayer.getLayers().length : 0;
+                statsEl.textContent = n ? (nc ? `Зданий: ${n}, кластеров DBSCAN: ${nc}` : `Зданий: ${n}`) : 'Границы города и здания загружены';
             } catch (e) {
                 console.error(e);
                 statusEl.textContent = '✗ Ошибка: ' + e.message;
                 statsEl.textContent = '';
+            }
+        }
+
+        function updateBuildingsButtonLabel() {
+            const el = document.getElementById('buildingsLabel');
+            if (!el) return;
+            el.textContent = buildingsVisible ? 'Скрыть здания' : 'Показать здания';
+        }
+
+        function toggleBuildings() {
+            if (!map || !buildingsLayer) return;
+            buildingsVisible = !buildingsVisible;
+            if (buildingsVisible) {
+                buildingsLayer.addTo(map);
+            } else {
+                map.removeLayer(buildingsLayer);
+            }
+            updateBuildingsButtonLabel();
+        }
+
+        function updateClusterHullsButtonLabel() {
+            const el = document.getElementById('clusterHullsLabel');
+            if (!el) return;
+            el.textContent = clusterHullsVisible ? 'Скрыть область кластера' : 'Показать область кластера';
+        }
+
+        function updateClusterPointsButtonLabel() {
+            const el = document.getElementById('clusterPointsLabel');
+            if (!el) return;
+            el.textContent = clusterPointsVisible ? 'Скрыть точки кластеров' : 'Показать точки кластеров';
+        }
+
+        function toggleClusterHulls() {
+            if (!map) return;
+            clusterHullsVisible = !clusterHullsVisible;
+            if (clusterHullsVisible) {
+                if (clusterHullsLayer) {
+                    clusterHullsLayer.addTo(map);
+                }
+                if (clustersLayer) {
+                    clustersLayer.addTo(map);
+                }
+            } else {
+                if (clusterHullsLayer) {
+                    map.removeLayer(clusterHullsLayer);
+                }
+                if (clustersLayer) {
+                    map.removeLayer(clustersLayer);
+                }
+            }
+            updateClusterHullsButtonLabel();
+        }
+
+        function toggleClusterPoints() {
+            if (!clustersLayer) return;
+            clusterPointsVisible = !clusterPointsVisible;
+            if (clusterPointsVisible) {
+                if (clusterPointsLayer) clusterPointsLayer.addTo(clustersLayer);
+            } else {
+                if (clusterPointsLayer) clustersLayer.removeLayer(clusterPointsLayer);
+            }
+            updateClusterPointsButtonLabel();
+        }
+
+        function updateTrunkButtonLabel() {
+            const el = document.getElementById('toggleTrunkLabel');
+            if (!el) return;
+            el.textContent = trunkLinesVisible ? 'Скрыть магистраль' : 'Показать магистраль';
+        }
+
+        function updateLocalButtonLabel() {
+            const el = document.getElementById('toggleLocalLabel');
+            if (!el) return;
+            el.textContent = localLinesVisible ? 'Скрыть локальные пути' : 'Показать локальные пути';
+        }
+
+        function updateVoronoiPathsButtonLabel() {
+            const el = document.getElementById('toggleVoronoiPathsLabel');
+            if (!el) return;
+            el.textContent = voronoiPathsVisible ? 'Скрыть маршруты по эшелонам' : 'Показать маршруты по эшелонам';
+        }
+
+        function toggleVoronoiPaths() {
+            if (!stationsRulesLayerGroup || !routeEchelonContainer) return;
+            voronoiPathsVisible = !voronoiPathsVisible;
+            if (voronoiPathsVisible) {
+                routeEchelonContainer.addTo(stationsRulesLayerGroup);
+                if (routeLayerEchelonHubs && routeLayerEchelonHubs.getLayers().length > 0) {
+                    routeLayerEchelonHubs.addTo(stationsRulesLayerGroup);
+                }
+            } else {
+                if (routeLayerEchelonHubs) stationsRulesLayerGroup.removeLayer(routeLayerEchelonHubs);
+                stationsRulesLayerGroup.removeLayer(routeEchelonContainer);
+            }
+            updateVoronoiPathsButtonLabel();
+        }
+
+        function toggleTrunkLines() {
+            trunkLinesVisible = !trunkLinesVisible;
+            [4, 5].forEach(function(k) {
+                const h = routeLayerHigh[k];
+                const t = routeTrunkSub[k];
+                if (!h || !t) return;
+                if (trunkLinesVisible) {
+                    if (!h.hasLayer(t)) h.addLayer(t);
+                } else if (h.hasLayer(t)) {
+                    h.removeLayer(t);
+                }
+            });
+            const hm = routeLayerHighMerged;
+            const tm = routeTrunkSub['merged'];
+            if (hm && tm) {
+                if (trunkLinesVisible) {
+                    if (!hm.hasLayer(tm)) hm.addLayer(tm);
+                } else if (hm.hasLayer(tm)) {
+                    hm.removeLayer(tm);
+                }
+            }
+            updateTrunkButtonLabel();
+        }
+
+        function toggleLocalLines() {
+            localLinesVisible = !localLinesVisible;
+            [4, 5].forEach(function(k) {
+                const h = routeLayerHigh[k];
+                const loc = routeLocalSub[k];
+                if (!h || !loc) return;
+                if (localLinesVisible) {
+                    if (!h.hasLayer(loc)) h.addLayer(loc);
+                } else if (h.hasLayer(loc)) {
+                    h.removeLayer(loc);
+                }
+            });
+            const hm = routeLayerHighMerged;
+            const lm = routeLocalSub['merged'];
+            if (hm && lm) {
+                if (localLinesVisible) {
+                    if (!hm.hasLayer(lm)) hm.addLayer(lm);
+                } else if (hm.hasLayer(lm)) {
+                    hm.removeLayer(lm);
+                }
+            }
+            updateLocalButtonLabel();
+        }
+
+        function buildStationsPlacementUrl(useSaved, onlySaved) {
+            const city = getCityQuery();
+            const url = new URL('/api/stations/placement', window.location.origin);
+            url.searchParams.set('city', city);
+            url.searchParams.set('network_type', 'drive');
+            url.searchParams.set('simplify', 'true');
+            url.searchParams.set('demand_method', 'dbscan');
+            url.searchParams.set('dbscan_eps_m', '180');
+            url.searchParams.set('dbscan_min_samples', '15');
+            url.searchParams.set('a_by_admin_districts', 'true');
+            url.searchParams.set('candidates_per_cluster', '30');
+            url.searchParams.set('use_saved', useSaved ? 'true' : 'false');
+            url.searchParams.set('only_saved', onlySaved ? 'true' : 'false');
+            return url;
+        }
+
+        function fillRouteEchelonLegend(data) {
+            const el = document.getElementById('routeEchelonLegend');
+            if (!el) return;
+            if (!data) {
+                el.innerHTML = '';
+                return;
+            }
+            const rows = [];
+            rows.push(
+                '<span style="font-size:12px;color:#475569">Если в списке выбрано «Все эшелоны», на карте как раньше: Вороной — фиолетовый (#7c3aed), магистраль — зелёная (#22c55e), ветки — #0ea5e9, локально B↔B — #38bdf8.</span>'
+            );
+            for (let lv = 1; lv <= 5; lv++) {
+                const col = lv <= 3 ? ROUTE_ECHELON_VORONOI_COLORS[lv] : ROUTE_ECHELON_HIGH_COLORS[lv];
+                const alt = echelonAltitudeMFromData(data, lv);
+                const kind = lv <= 3 ? 'локальный Вороной' : 'магистраль, ветки, Б↔Б';
+                rows.push(
+                    '<span><span class="swatch" style="background:' + col + '"></span> Эшелон ' + lv + ' (~' + alt + ' м) — ' + kind + '</span>'
+                );
+            }
+            el.innerHTML = rows.join('');
+        }
+
+        function applyRouteEchelonView() {
+            if (!routeEchelonContainer) return;
+            routeEchelonContainer.clearLayers();
+            const selEl = document.getElementById('routeEchelonSelect');
+            const sel = (selEl && selEl.value) ? selEl.value : 'all';
+            const addLg = function(lg) {
+                if (!lg || !lg.getLayers) return;
+                try {
+                    if (lg.getLayers().length > 0) routeEchelonContainer.addLayer(lg);
+                } catch (e) {}
+            };
+            if (sel === 'all') {
+                addLg(routeLayerVoronoiMerged);
+                addLg(routeLayerHighMerged);
+            } else if (sel === '1' || sel === '2' || sel === '3') {
+                addLg(routeLayerVoronoi[sel]);
+            } else if (sel === '4') {
+                addLg(routeLayerHigh[4]);
+            } else if (sel === '5') {
+                addLg(routeLayerHigh[5]);
+            }
+        }
+
+        /** Общая отрисовка слоёв зарядки (ответ API такой же для расчёта и для кэша). */
+        function renderStationsRulesPlacement(data) {
+            const statsEl = document.getElementById('stationsRulesStats');
+            if (!data) {
+                if (statsEl) statsEl.textContent = 'Нет данных';
+                return;
+            }
+            if (data.error) {
+                if (statsEl) statsEl.textContent = data.error;
+                return;
+            }
+            lastPlacementData = data;
+            if (stationsRulesLayerGroup) {
+                map.removeLayer(stationsRulesLayerGroup);
+                stationsRulesLayerGroup = null;
+            }
+            trunkLinesLayer = null;
+            localLinesLayer = null;
+            voronoiPathsLayer = null;
+            routeEchelonContainer = null;
+            routeLayerVoronoi = {};
+            routeLayerHigh = {};
+            routeTrunkSub = {};
+            routeLocalSub = {};
+            routeLayerVoronoiMerged = null;
+            routeLayerHighMerged = null;
+            routeLayerEchelonHubs = null;
+            stationsRulesLayerGroup = L.layerGroup();
+
+            /** Устойчивый цвет по id кластера (золотой угол в HSL). */
+            function colorForClusterId(cid) {
+                    const n = Math.max(0, parseInt(cid, 10) || 0);
+                    const h = (n * 137.508) % 360;
+                    return {
+                        fill: 'hsl(' + h + ', 70%, 50%)',
+                        stroke: 'hsl(' + h + ', 70%, 28%)',
+                    };
+                }
+
+                function addLines(fc, style, popupTitle, targetLayer) {
+                    if (!fc || !fc.features || !fc.features.length) return;
+                    L.geoJSON(fc, {
+                        style: style,
+                        onEachFeature: function(feature, layer) {
+                            const p = feature.properties || {};
+                            layer.bindPopup(popupTitle + '<br>' + JSON.stringify(p).slice(0, 200));
+                        },
+                    }).addTo(targetLayer || stationsRulesLayerGroup);
+                }
+                /** Цвета станций: зарядки — зелёный, гаражи — оранжевый, ТО — синий (не по кластеру). */
+                const STATION_COLOR_CHARGING = '#22c55e';
+                const STATION_COLOR_CHARGING_STROKE = '#166534';
+                const STATION_COLOR_GARAGE = '#f97316';
+                const STATION_COLOR_GARAGE_STROKE = '#c2410c';
+                const STATION_COLOR_TO = '#2563eb';
+                const STATION_COLOR_TO_STROKE = '#1e40af';
+
+                function addPoints(fc, color, border, r, title, pointStyleResolver, ignoreClusterColor) {
+                    if (!fc || !fc.features || !fc.features.length) return;
+                    L.geoJSON(fc, {
+                        pointToLayer: function(feature, latlng) {
+                            const p = feature.properties || {};
+                            const cid = p.cluster_id != null ? p.cluster_id : null;
+                            const st = p.station_type;
+                            /* Гараж/ТО всегда своей палитрой: иначе при cluster_id и loose-true срабатывает colorForClusterId (оттенки сине-зелёные). */
+                            const fixedByType = st === 'garage' || st === 'to';
+                            const useFixed =
+                                fixedByType || ignoreClusterColor === true || cid == null;
+                            let c = useFixed ? { fill: color, stroke: border } : colorForClusterId(cid);
+                            let rr = r;
+                            let ww = 2;
+                            if (typeof pointStyleResolver === 'function') {
+                                const custom = pointStyleResolver(p, c) || {};
+                                if (custom.fillColor) c.fill = custom.fillColor;
+                                if (custom.strokeColor) c.stroke = custom.strokeColor;
+                                if (custom.radius != null) rr = custom.radius;
+                                if (custom.weight != null) ww = custom.weight;
+                            }
+                            return L.circleMarker(latlng, {
+                                radius: rr,
+                                fillColor: c.fill,
+                                color: c.stroke,
+                                weight: ww,
+                                fillOpacity: 0.92,
+                            });
+                        },
+                        onEachFeature: function(feature, layer) {
+                            const p = feature.properties || {};
+                            const cid = p.cluster_id != null ? p.cluster_id : '—';
+                            const vnote = p.vertical_planning_note;
+                            layer.bindPopup(
+                                title + '<br>Кластер №' + cid
+                                + (vnote ? '<br><small style="color:#475569">' + vnote + '</small>' : '')
+                            );
+                        },
+                    }).addTo(stationsRulesLayerGroup);
+                }
+
+                routeEchelonContainer = L.layerGroup();
+                voronoiPathsLayer = routeEchelonContainer;
+
+                routeLayerVoronoiMerged = L.layerGroup();
+                if (data.voronoi_edges && data.voronoi_edges.features && data.voronoi_edges.features.length) {
+                    addLines(
+                        data.voronoi_edges,
+                        ROUTE_LEGACY_VORONOI_STYLE,
+                        'Вороной (все эшелоны, отображение как раньше)',
+                        routeLayerVoronoiMerged
+                    );
+                }
+                routeLayerHighMerged = L.layerGroup();
+                const trunkMerged = L.layerGroup();
+                const localMerged = L.layerGroup();
+                const STATION_COLOR_BRANCH_LEGACY = '#0ea5e9';
+                const STATION_COLOR_LOCAL_LEGACY = '#38bdf8';
+                addLines(
+                    data.trunk,
+                    { color: STATION_COLOR_CHARGING, weight: 3, opacity: 0.95, lineCap: 'round', lineJoin: 'round' },
+                    'Магистраль A–A',
+                    trunkMerged
+                );
+                addLines(
+                    data.branch_edges,
+                    { color: STATION_COLOR_BRANCH_LEGACY, weight: 2, opacity: 0.92, lineCap: 'round', lineJoin: 'round' },
+                    'Ветвь к зарядке A (Б / гараж / ТО)',
+                    localMerged
+                );
+                addLines(
+                    data.local_edges,
+                    { color: STATION_COLOR_LOCAL_LEGACY, weight: 3, opacity: 0.9, dashArray: '2, 4', lineCap: 'round', lineJoin: 'round' },
+                    'Локально B↔B',
+                    localMerged
+                );
+                if (trunkLinesVisible) routeLayerHighMerged.addLayer(trunkMerged);
+                if (localLinesVisible) routeLayerHighMerged.addLayer(localMerged);
+                routeTrunkSub['merged'] = trunkMerged;
+                routeLocalSub['merged'] = localMerged;
+
+                routeLayerEchelonHubs = L.layerGroup();
+                function addEchelonHubRings(fc) {
+                    if (!fc || !fc.features || !fc.features.length) return;
+                    L.geoJSON(fc, {
+                        pointToLayer: function(_feature, latlng) {
+                            return L.circleMarker(latlng, {
+                                radius: 14,
+                                color: '#64748b',
+                                weight: 2,
+                                opacity: 0.88,
+                                fill: false,
+                                dashArray: '3, 4',
+                            });
+                        },
+                        onEachFeature: function(feature, layer) {
+                            layer.bindPopup(
+                                '<strong>Узел связи эшелонов 1–5</strong><br><small>Плановый вертикальный переход между маршрутами на станции</small>'
+                            );
+                        },
+                    }).addTo(routeLayerEchelonHubs);
+                }
+                addEchelonHubRings(data.charging_type_a);
+                addEchelonHubRings(data.charging_type_b);
+
+                const vbe = data.voronoi_edges_by_echelon || {};
+                ['1', '2', '3'].forEach(function(k) {
+                    const g = L.layerGroup();
+                    let fc = vbe[k];
+                    if ((!fc || !fc.features || !fc.features.length) && k === '1' && data.voronoi_edges && data.voronoi_edges.features && data.voronoi_edges.features.length) {
+                        fc = data.voronoi_edges;
+                    }
+                    if (fc && fc.features && fc.features.length) {
+                        const altM = fc.voronoi_echelon_altitude_m != null ? fc.voronoi_echelon_altitude_m : echelonAltitudeMFromData(data, parseInt(k, 10));
+                        const style = {
+                            color: ROUTE_ECHELON_VORONOI_COLORS[parseInt(k, 10)] || '#7c3aed',
+                            weight: 2,
+                            opacity: 0.84,
+                            lineCap: 'round',
+                            lineJoin: 'round',
+                        };
+                        if (k === '2') style.dashArray = '6, 4';
+                        if (k === '3') style.dashArray = '2, 3';
+                        addLines(fc, style, 'Вороной, эшелон ' + k + ' (~' + altM + ' м)', g);
+                    }
+                    routeLayerVoronoi[k] = g;
+                });
+
+                [4, 5].forEach(function(k) {
+                    const highG = L.layerGroup();
+                    const trunkG = L.layerGroup();
+                    const localG = L.layerGroup();
+                    const color = ROUTE_ECHELON_HIGH_COLORS[k];
+                    const altM = echelonAltitudeMFromData(data, k);
+                    const stT = {
+                        color: color,
+                        weight: k === 5 ? 5 : 3,
+                        opacity: k === 5 ? 0.42 : 0.93,
+                        lineCap: 'round',
+                        lineJoin: 'round',
+                    };
+                    if (k === 5) stT.dashArray = '14, 7';
+                    addLines(data.trunk, stT, 'Магистраль A–A, эшелон ' + k + ' (~' + altM + ' м)', trunkG);
+                    const stB = {
+                        color: color,
+                        weight: 2,
+                        opacity: k === 5 ? 0.5 : 0.9,
+                        lineCap: 'round',
+                        lineJoin: 'round',
+                    };
+                    if (k === 5) stB.dashArray = '10, 5';
+                    addLines(data.branch_edges, stB, 'Ветвь к A (Б / гараж / ТО), эшелон ' + k, localG);
+                    const stL = {
+                        color: color,
+                        weight: 3,
+                        opacity: k === 5 ? 0.48 : 0.88,
+                        lineCap: 'round',
+                        lineJoin: 'round',
+                        dashArray: k === 5 ? '4, 5' : '2, 4',
+                    };
+                    addLines(data.local_edges, stL, 'Локально B↔B, эшелон ' + k, localG);
+                    if (trunkLinesVisible) highG.addLayer(trunkG);
+                    if (localLinesVisible) highG.addLayer(localG);
+                    routeLayerHigh[k] = highG;
+                    routeTrunkSub[k] = trunkG;
+                    routeLocalSub[k] = localG;
+                });
+
+                fillRouteEchelonLegend(data);
+                applyRouteEchelonView();
+                if (voronoiPathsVisible) {
+                    routeEchelonContainer.addTo(stationsRulesLayerGroup);
+                    if (routeLayerEchelonHubs && routeLayerEchelonHubs.getLayers().length > 0) {
+                        routeLayerEchelonHubs.addTo(stationsRulesLayerGroup);
+                    }
+                }
+                const routePanel = document.getElementById('routeEchelonPanel');
+                if (routePanel) routePanel.style.display = 'block';
+
+                // Явные линии "кластер ↔ зарядка" (по cluster_id зарядки и cluster_centroids из API).
+                try {
+                    if (data.cluster_centroids && data.cluster_centroids.features && data.cluster_centroids.features.length > 0) {
+                        const centroidByCid = new Map();
+                        data.cluster_centroids.features.forEach(f => {
+                            const p = f.properties || {};
+                            const cid = p.cluster_id;
+                            if (cid == null) return;
+                            const coords = f.geometry && f.geometry.coordinates;
+                            if (!coords || coords.length < 2) return;
+                            centroidByCid.set(String(cid), coords);
+                        });
+
+                        const links = [];
+                        function addLinksForFc(fc, stationKind) {
+                            if (!fc || !fc.features || !fc.features.length) return;
+                            fc.features.forEach(f => {
+                                const p = f.properties || {};
+                                const cid = p.cluster_id;
+                                if (cid == null) return;
+                                const centroid = centroidByCid.get(String(cid));
+                                const stationCoords = f.geometry && f.geometry.coordinates;
+                                if (!centroid || !stationCoords) return;
+                                links.push({
+                                    type: 'Feature',
+                                    geometry: {
+                                        type: 'LineString',
+                                        coordinates: [stationCoords, centroid]
+                                    },
+                                    properties: { cluster_id: cid, station_kind: stationKind }
+                                });
+                            });
+                        }
+
+                        addLinksForFc(data.charging_type_a, 'charge_a');
+                        addLinksForFc(data.charging_type_b, 'charge_b');
+
+                        if (links.length > 0) {
+                            const linksFc = { type: 'FeatureCollection', features: links };
+                            L.geoJSON(linksFc, {
+                                style: function(feature) {
+                                    const cid = feature.properties && feature.properties.cluster_id != null ? feature.properties.cluster_id : 0;
+                                    const c = colorForClusterId(cid);
+                                    return { color: c.stroke, weight: 1, opacity: 0.55, dashArray: '4, 4' };
+                                }
+                            }).addTo(stationsRulesLayerGroup);
+                        }
+                    }
+                } catch (e) {
+                    console.warn('Линии "кластер ↔ зарядка" не построены:', e);
+                }
+
+                /* Точки станций поверх линий — иначе магистраль/ветви перекрывают гаражи и ТО. */
+                addPoints(
+                    data.charging_type_a,
+                    STATION_COLOR_CHARGING,
+                    STATION_COLOR_CHARGING_STROKE,
+                    10,
+                    'Зарядка + ожидание (тип A)',
+                    function(props) {
+                        const degree = Number(props.trunk_degree || 0);
+                        const radius = Math.max(9, Math.min(14, 9 + degree));
+                        return {
+                            fillColor: STATION_COLOR_CHARGING,
+                            strokeColor: STATION_COLOR_CHARGING_STROKE,
+                            radius: radius,
+                            weight: 3
+                        };
+                    },
+                    true
+                );
+                addPoints(
+                    data.charging_type_b,
+                    STATION_COLOR_CHARGING,
+                    STATION_COLOR_CHARGING_STROKE,
+                    7,
+                    'Зарядка + ожидание (тип B)',
+                    undefined,
+                    true
+                );
+                /* Сначала ТО, потом гаражи — если координаты близки, оранжевый маркер сверху без «синей каймы» от ТО. */
+                addPoints(data.to_stations, STATION_COLOR_TO, STATION_COLOR_TO_STROKE, 10, 'Станция ТО', undefined, true);
+                addPoints(data.garages, STATION_COLOR_GARAGE, STATION_COLOR_GARAGE_STROKE, 11, 'Гараж', undefined, true);
+
+                stationsRulesLayerGroup.addTo(map);
+                updateTrunkButtonLabel();
+                updateLocalButtonLabel();
+                const toggleVoronoiBtn2 = document.getElementById('toggleVoronoiPathsBtn');
+                if (toggleVoronoiBtn2) toggleVoronoiBtn2.style.display = 'block';
+                updateVoronoiPathsButtonLabel();
+                const m = data.metrics || {};
+                if (statsEl) {
+                    const nGar = (data.garages && data.garages.features) ? data.garages.features.length : 0;
+                    const nTo = (data.to_stations && data.to_stations.features) ? data.to_stations.features.length : 0;
+                    statsEl.textContent =
+                        'покрытие зарядками: ' + (m.coverage_ratio != null ? (100 * m.coverage_ratio).toFixed(0) + '%' : '—')
+                        + ' | кластеров: ' + (m.cluster_count != null ? m.cluster_count : '—')
+                        + ', зданий в кластерах: ' + (m.charging_buildings_in_clusters != null ? m.charging_buildings_in_clusters : '—')
+                        + ' | гаражей: ' + nGar + ', ТО: ' + nTo
+                        + (data.from_saved ? ' | загружено из сохранённой расстановки' : ' | сохранено');
+            }
+        }
+
+        async function loadStationsRulesPlacement() {
+            const city = getCityQuery();
+            const statsEl = document.getElementById('stationsRulesStats');
+            if (!city) {
+                alert('Сначала выберите город');
+                return;
+            }
+            if (statsEl) statsEl.textContent = 'Расчёт зарядок / гаражей / ТО…';
+            try {
+                const url = buildStationsPlacementUrl(false, false);
+                const resp = await fetch(url);
+                if (!resp.ok) {
+                    const err = await resp.json().catch(() => ({}));
+                    throw new Error(err.detail || ('Ошибка ' + resp.status));
+                }
+                const data = await resp.json();
+                renderStationsRulesPlacement(data);
+            } catch (e) {
+                console.error(e);
+                if (statsEl) statsEl.textContent = 'Ошибка: ' + e.message;
+            }
+        }
+
+        async function loadSavedStationsToMap() {
+            const city = getCityQuery();
+            const statsEl = document.getElementById('stationsRulesStats');
+            if (!city) {
+                alert('Сначала выберите город');
+                return;
+            }
+            if (statsEl) statsEl.textContent = 'Загрузка сохранённой расстановки…';
+            try {
+                const url = buildStationsPlacementUrl(true, true);
+                const resp = await fetch(url);
+                if (!resp.ok) {
+                    const err = await resp.json().catch(() => ({}));
+                    throw new Error(err.detail || ('Ошибка ' + resp.status));
+                }
+                const data = await resp.json();
+                renderStationsRulesPlacement(data);
+            } catch (e) {
+                console.error(e);
+                if (statsEl) statsEl.textContent = 'Ошибка: ' + e.message;
             }
         }
 

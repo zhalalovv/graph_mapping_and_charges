@@ -89,3 +89,4 @@ dmypy.json
 *.pickle
 cache/
 cache_data/
+data/placement_cache/

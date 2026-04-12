@@ -1,24 +1,22 @@
-import os
-from typing import Optional
-import pickle
+import json
 import logging
+import os
+import hashlib
 
+import geopandas as gpd
+import numpy as np
+import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from data_service import DataService
-from graph_service import GraphService
-import json
-import osmnx as ox
-import geopandas as gpd
-import networkx as nx
+from station_placement import pipeline_result_to_geojson, run_full_pipeline
+from voronoi_paths import build_voronoi_local_paths_fc
 
 
-app = FastAPI(title="Graph Service UI", version="0.1.0")
+app = FastAPI(title="Clustering", version="0.2.0")
 
-# CORS (на случай локального фронтенда)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -28,8 +26,49 @@ app.add_middleware(
 )
 
 data_service = DataService()
-graph_service = GraphService()
 logger = logging.getLogger(__name__)
+
+
+def _round_geojson_coords(obj, precision: int = 6):
+    if isinstance(obj, dict):
+        return {k: _round_geojson_coords(v, precision) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_round_geojson_coords(item, precision) for item in obj]
+    if isinstance(obj, float):
+        return round(obj, precision)
+    return obj
+
+
+def _placement_cache_key(
+    city: str,
+    network_type: str,
+    simplify: bool,
+    dbscan_eps_m: float,
+    dbscan_min_samples: int,
+    buildings_per_centroid: int,
+    inter_cluster_max_hull_gap_m: float,
+    inter_cluster_max_edge_length_m: float,
+    use_all_buildings: bool,
+    voronoi_intra_bridge_max_m: float,
+) -> str:
+    payload = {
+        "city": city.strip(),
+        "network_type": network_type,
+        "simplify": bool(simplify),
+        "dbscan_eps_m": float(dbscan_eps_m),
+        "dbscan_min_samples": int(dbscan_min_samples),
+        "buildings_per_centroid": int(buildings_per_centroid),
+        "inter_cluster_max_hull_gap_m": float(inter_cluster_max_hull_gap_m),
+        "inter_cluster_max_edge_length_m": float(inter_cluster_max_edge_length_m),
+        "use_all_buildings": bool(use_all_buildings),
+        "voronoi_intra_bridge_max_m": float(voronoi_intra_bridge_max_m),
+        # Смена версии сбрасывает устаревший Redis-кэш (иначе после правок пайплайна
+        # клиент может бесконечно получать пустой сохранённый ответ).
+        "placement_schema": 41,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()
+    return f"drone_planner:placement:{digest}"
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -38,7 +77,7 @@ def index():
         with open(os.path.join("templates", "index.html"), "r", encoding="utf-8") as f:
             return HTMLResponse(content=f.read())
     except FileNotFoundError:
-        return HTMLResponse("<h1>UI не найден. Создайте templates/index.html</h1>", status_code=200)
+        return HTMLResponse("<h1>Нет templates/index.html</h1>", status_code=404)
 
 
 @app.get("/api/ping")
@@ -46,118 +85,114 @@ def ping():
     return {"status": "ok"}
 
 
-@app.get("/api/buildings/clusters")
-def get_building_clusters(
-    city: str = Query(..., description="Название города, как в /api/city"),
-    network_type: str = Query('drive', description="Тип сети OSM"),
-    simplify: bool = Query(True, description="Упрощение графа"),
+@app.get("/api/city/map")
+def get_city_map(
+    city: str = Query(..., description="Название города"),
+    network_type: str = Query("drive", description="Тип сети OSM"),
+    simplify: bool = Query(True, description="Упрощение"),
 ):
-    """
-    Возвращает точки на зданиях (центроиды) и точку высадки у дороги для каждого здания.
-    """
-    import logging
-    logger = logging.getLogger(__name__)
-    
+    """Границы города, no_fly_zones, bbox/center для карты."""
     try:
-        data = data_service.get_city_data(city, network_type=network_type, simplify=simplify)
-        buildings = data.get("buildings")
-        road_graph = data.get("road_graph")
+        data = data_service.get_city_data(
+            city, network_type=network_type, simplify=simplify, load_no_fly_zones=True
+        )
         city_boundary = data.get("city_boundary")
-        if buildings is None or len(buildings) == 0:
-            logger.warning("Нет зданий")
-            return JSONResponse({
-                "buildings": {"type": "FeatureCollection", "features": []},
-                "total": 0,
-                "message": "Нет зданий"
-            })
-        if road_graph is None or len(road_graph.nodes) == 0:
-            logger.warning("Нет дорожного графа для расчёта точек высадки")
-        
-        # Точки высадки — рядом с домами на дороге
-        delivery_gdf = data_service.get_delivery_points(buildings, road_graph, city_boundary)
-        if len(delivery_gdf) == 0:
-            return JSONResponse({
-                "buildings": {"type": "FeatureCollection", "features": []},
-                "total": 0,
-                "message": "Нет зданий в границах города"
-            })
-        
-        # GeoJSON: geometry = точка у дороги (высадка), не центроид здания
-        features = []
-        for idx, row in delivery_gdf.iterrows():
-            lon_d = row["delivery_lon"]
-            lat_d = row["delivery_lat"]
-            feat = {
-                "type": "Feature",
-                "geometry": {"type": "Point", "coordinates": [lon_d, lat_d]},
-                "properties": {
-                    "delivery_lon": round(lon_d, 6),
-                    "delivery_lat": round(lat_d, 6),
-                },
+        road_graph = data.get("road_graph")
+        no_fly_zones = data.get("no_fly_zones")
+        no_fly_zones_geojson = None
+        if no_fly_zones is not None:
+            try:
+                if isinstance(no_fly_zones, gpd.GeoDataFrame) and len(no_fly_zones) > 0:
+                    no_fly_zones_geojson = json.loads(no_fly_zones.to_json())
+                elif isinstance(no_fly_zones, list) and len(no_fly_zones) > 0:
+                    zones_gdf = gpd.GeoDataFrame([{"geometry": z} for z in no_fly_zones], crs="EPSG:4326")
+                    no_fly_zones_geojson = json.loads(zones_gdf.to_json())
+            except Exception as e:
+                logger.warning("Ошибка сериализации no_fly_zones: %s", e)
+        if city_boundary is not None:
+            boundary_gdf = gpd.GeoDataFrame([{"geometry": city_boundary}], crs="EPSG:4326")
+            city_boundary_geojson = json.loads(boundary_gdf.to_json())
+            bbox = list(city_boundary.bounds)
+            center_lon = (bbox[0] + bbox[2]) / 2.0
+            center_lat = (bbox[1] + bbox[3]) / 2.0
+        elif road_graph is not None and len(road_graph.nodes) > 0:
+            import osmnx as ox
+
+            gdf_nodes, _ = ox.graph_to_gdfs(road_graph)
+            xmin, ymin, xmax, ymax = gdf_nodes.total_bounds
+            bbox = [xmin, ymin, xmax, ymax]
+            center_lat = (ymin + ymax) / 2.0
+            center_lon = (xmin + xmax) / 2.0
+            city_boundary_geojson = None
+        else:
+            raise HTTPException(status_code=404, detail="Нет данных по городу")
+        return JSONResponse(
+            {
+                "city_boundary": city_boundary_geojson,
+                "no_fly_zones": no_fly_zones_geojson,
+                "bbox": bbox,
+                "center": {"lat": center_lat, "lon": center_lon},
             }
-            features.append(feat)
-        
-        def round_coords(obj, precision=6):
-            if isinstance(obj, dict):
-                return {k: round_coords(v, precision) for k, v in obj.items()}
-            elif isinstance(obj, list):
-                return [round_coords(item, precision) for item in obj]
-            elif isinstance(obj, float):
-                return round(obj, precision)
-            return obj
-        
-        geojson_data = round_coords({
-            "type": "FeatureCollection",
-            "features": features,
-        }, precision=6)
-        n_features = len(features)
-        # Один слой для фронта (clusters ожидается кодом карты)
-        clusters = {"buildings": geojson_data}
-        logger.info(f"Точек на зданиях (высадка у дороги): {n_features}")
-        
-        return JSONResponse({
-            "buildings": geojson_data,
-            "clusters": clusters,
-            "total": n_features
-        })
+        )
+    except HTTPException:
+        raise
     except Exception as e:
-        import traceback
-        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/buildings/export")
 def export_buildings_with_heights(
-    city: str = Query(..., description="Название города, как в /api/city"),
-    network_type: str = Query('drive', description="Тип сети OSM"),
+    city: str = Query(..., description="Название города"),
+    network_type: str = Query("drive", description="Тип сети OSM"),
     simplify: bool = Query(True, description="Упрощение"),
 ):
-    """
-    Выгрузка зданий с высотами и эшелонами полётов.
-    GeoJSON с полигонами зданий и properties: height_m, flight_level (рекомендуемый эшелон).
-    """
+    """Здания с высотами для подложки карты."""
     try:
         data = data_service.get_city_data(city, network_type=network_type, simplify=simplify)
         buildings = data.get("buildings")
         flight_levels = data.get("flight_levels", [])
         if buildings is None or len(buildings) == 0:
-            return JSONResponse({
-                "type": "FeatureCollection",
-                "features": [],
-                "flight_levels": flight_levels,
-                "building_height_stats": data.get("building_height_stats", {}),
-            })
+            return JSONResponse(
+                {
+                    "type": "FeatureCollection",
+                    "features": [],
+                    "flight_levels": flight_levels,
+                    "building_height_stats": data.get("building_height_stats", {}),
+                }
+            )
+
         if "height_m" not in buildings.columns:
             buildings = data_service._compute_building_heights(buildings)
-        # GeoJSON: полигоны зданий + height_m, рекомендованный flight_level
-        levels_m = [f["altitude_m"] for f in flight_levels] if flight_levels else [40, 65, 90, 115]
+
+        if "area_m2" not in buildings.columns:
+            try:
+                b_proj = buildings
+                if b_proj.crs is None:
+                    b_proj = b_proj.set_crs("EPSG:4326", allow_override=True)
+                if b_proj.crs and b_proj.crs.is_geographic:
+                    b_proj = b_proj.to_crs(epsg=3857)
+                buildings = buildings.copy()
+                buildings["area_m2"] = b_proj.geometry.area.astype(float)
+            except Exception:
+                try:
+                    buildings = buildings.copy()
+                    buildings["area_m2"] = buildings.geometry.area.astype(float)
+                except Exception:
+                    buildings = buildings.copy()
+                    buildings["area_m2"] = None
+
+        levels_m = [f["altitude_m"] for f in flight_levels] if flight_levels else [40, 67.5, 95, 122.5, 150]
         features = []
         for idx, row in buildings.iterrows():
             geom = row.geometry
             if geom is None or not getattr(geom, "is_valid", True):
                 continue
             h = float(row.get("height_m", 10))
-            # Рекомендуемый эшелон: первый, где altitude > h + 10м
+            a_raw = row.get("area_m2", None)
+            try:
+                a = float(a_raw) if a_raw is not None else None
+            except (TypeError, ValueError):
+                a = None
             rec_level = 1
             for i, alt in enumerate(levels_m):
                 if alt >= h + 10:
@@ -166,280 +201,406 @@ def export_buildings_with_heights(
             feat = {
                 "type": "Feature",
                 "geometry": json.loads(gpd.GeoSeries([geom]).to_json())["features"][0]["geometry"],
-                "properties": {"height_m": round(h, 1), "flight_level": rec_level},
+                "properties": {
+                    "height_m": round(h, 1),
+                    "area_m2": round(a, 1) if a is not None else None,
+                    "flight_level": rec_level,
+                },
             }
             features.append(feat)
-        return JSONResponse({
-            "type": "FeatureCollection",
-            "features": features,
-            "flight_levels": flight_levels,
-            "building_height_stats": data.get("building_height_stats", {}),
-        })
+        return JSONResponse(
+            {
+                "type": "FeatureCollection",
+                "features": features,
+                "flight_levels": flight_levels,
+                "building_height_stats": data.get("building_height_stats", {}),
+            }
+        )
     except Exception as e:
         import traceback
+
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/city")
-def get_city(
-    city: str = Query(..., description="Название города, например 'Volgograd, Russia'"),
-    network_type: str = Query('drive', description="Тип сети OSM: drive, walk, bike, all, all_private"),
-    simplify: bool = Query(True, description="Упрощать ли граф"),
+@app.get("/api/buildings/clusters")
+def get_building_clusters(
+    city: str = Query(..., description="Название города"),
+    network_type: str = Query("drive", description="Тип сети OSM"),
+    simplify: bool = Query(True, description="Упрощение графа"),
+    method: str = Query("dbscan", description="Только dbscan (кластеризация по зданиям)"),
+    dbscan_eps_m: float = Query(180.0, description="Радиус локального уровня (м)"),
+    dbscan_min_samples: int = Query(15, description="min_samples DBSCAN локального уровня"),
+    use_all_buildings: bool = Query(False, description="Все здания вне no-fly"),
 ):
+    """Кластеры спроса (двухуровневая кластеризация в data_service) + полигоны hull."""
+
+    def round_coords(obj, precision=6):
+        if isinstance(obj, dict):
+            return {k: round_coords(v, precision) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [round_coords(item, precision) for item in obj]
+        if isinstance(obj, float):
+            return round(obj, precision)
+        return obj
+
+    if method != "dbscan":
+        raise HTTPException(status_code=400, detail="Поддерживается только method=dbscan")
+
     try:
-        progress_events = []
-
-        def _progress(stage: str, percentage: int, message: str = ""):
-            progress_events.append({
-                "stage": stage,
-                "percentage": percentage,
-                "message": message,
-            })
-
-        data_service.add_progress_callback(_progress)
         data = data_service.get_city_data(city, network_type=network_type, simplify=simplify)
+        buildings = data.get("buildings")
+        road_graph = data.get("road_graph")
+        city_boundary = data.get("city_boundary")
+        if buildings is None or len(buildings) == 0:
+            return JSONResponse(
+                {
+                    "buildings": {"type": "FeatureCollection", "features": []},
+                    "clusters": {"type": "FeatureCollection", "features": []},
+                    "cluster_hulls": {"type": "FeatureCollection", "features": []},
+                    "total": 0,
+                    "message": "Нет зданий",
+                }
+            )
 
-        # Для передачи в JSON: убираем тяжёлые объекты и возвращаем краткую сводку
-        stats = data.get("stats", {})
-        result = {
-            "city_name": data.get("city_name"),
-            "stats": stats,
-            "params": data.get("params", {}),
-            "flight_levels": data.get("flight_levels", []),
-            "building_height_stats": data.get("building_height_stats", {}),
-            "progress": progress_events,
-        }
-        return JSONResponse(result)
+        demand_gdf = data.get("demand_points")
+        hulls_gdf = data.get("demand_hulls")
+        if demand_gdf is None or len(demand_gdf) == 0:
+            no_fly_zones = data.get("no_fly_zones")
+            result = data_service.get_demand_points_weighted(
+                buildings,
+                road_graph,
+                city_boundary,
+                method="dbscan",
+                dbscan_eps_m=dbscan_eps_m,
+                dbscan_min_samples=dbscan_min_samples,
+                return_hulls=True,
+                use_all_buildings=use_all_buildings,
+                no_fly_zones=no_fly_zones,
+            )
+            demand_gdf, hulls_gdf = result if isinstance(result, tuple) else (result, None)
+
+        if demand_gdf is None or len(demand_gdf) == 0:
+            clusters_fc = {"type": "FeatureCollection", "features": []}
+            cluster_hulls_fc = {"type": "FeatureCollection", "features": []}
+        else:
+            features = []
+            source_gdf = hulls_gdf if (hulls_gdf is not None and len(hulls_gdf) > 0) else demand_gdf
+            for idx, row in source_gdf.iterrows():
+                geom = row.get("geometry")
+                if geom is None or geom.is_empty:
+                    continue
+                try:
+                    c = getattr(geom, "centroid", None) or geom
+                    lon, lat = float(c.x), float(c.y)
+                except Exception:
+                    continue
+                weight = int(row.get("weight", 1))
+                cid = row.get("cluster_id")
+                if cid is None or (isinstance(cid, float) and pd.isna(cid)):
+                    cid = idx
+                try:
+                    cid = int(cid)
+                except (TypeError, ValueError):
+                    cid = hash(str(idx)) % 10_000_000
+                props = {"weight": weight, "cluster_id": cid}
+                nb = row.get("n_buildings")
+                if nb is None or (isinstance(nb, float) and pd.isna(nb)):
+                    nb = 1
+                props["n_buildings"] = int(nb)
+                features.append(
+                    {
+                        "type": "Feature",
+                        "geometry": {"type": "Point", "coordinates": [round(lon, 6), round(lat, 6)]},
+                        "properties": props,
+                    }
+                )
+            clusters_fc = round_coords({"type": "FeatureCollection", "features": features}, precision=6)
+            cluster_hulls_fc = {"type": "FeatureCollection", "features": []}
+            if hulls_gdf is not None and len(hulls_gdf) > 0:
+                hull_features = []
+                for idx, row in hulls_gdf.iterrows():
+                    g = row["geometry"]
+                    if g is None or g.is_empty:
+                        continue
+                    try:
+                        geom_json = json.loads(gpd.GeoSeries([g], crs="EPSG:4326").to_json())
+                        geom_j = geom_json.get("features", [{}])[0].get("geometry")
+                        if geom_j:
+                            w = int(row.get("weight", 1))
+                            _cid = row.get("cluster_id")
+                            if _cid is None or (isinstance(_cid, float) and pd.isna(_cid)):
+                                _cid = idx
+                            try:
+                                _cid = int(_cid)
+                            except (TypeError, ValueError):
+                                _cid = hash(str(idx)) % 10_000_000
+                            props = {"weight": w, "cluster_id": _cid}
+                            nb = row.get("n_buildings")
+                            if nb is None or (isinstance(nb, float) and pd.isna(nb)):
+                                nb = 1
+                            props["n_buildings"] = int(nb)
+                            hull_features.append(
+                                {
+                                    "type": "Feature",
+                                    "geometry": round_coords(geom_j, precision=6),
+                                    "properties": props,
+                                }
+                            )
+                    except Exception:
+                        pass
+                cluster_hulls_fc = {"type": "FeatureCollection", "features": hull_features}
+
+        buildings_fc = clusters_fc
+        total = len(clusters_fc.get("features", []))
+        logger.info("Кластеры: %s, hulls: %s", total, len(cluster_hulls_fc.get("features", [])))
+
+        return JSONResponse(
+            {
+                "buildings": buildings_fc,
+                "clusters": clusters_fc,
+                "total": total,
+                "method": method,
+                "cluster_hulls": cluster_hulls_fc,
+                "dbscan_eps_m": dbscan_eps_m,
+            }
+        )
     except Exception as e:
+        import traceback
+
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/graph")
-def graph_geojson(
-    city: str = Query(..., description="Название города, как в /api/city"),
-    network_type: str = Query('drive', description="Тип сети OSM"),
+@app.get("/api/buildings/voronoi-local-paths")
+def get_voronoi_local_paths(
+    city: str = Query(..., description="Название города"),
+    network_type: str = Query("drive", description="Тип сети OSM"),
     simplify: bool = Query(True, description="Упрощение графа"),
-    graph_type: str = Query('road', description="Тип графа: road, delaunay"),
-    grid_spacing: float = Query(0.001, description="Размер ячейки сетки для Delaunay (в градусах)"),
+    dbscan_eps_m: float = Query(180.0, description="Радиус локального уровня (м)"),
+    dbscan_min_samples: int = Query(15, description="min_samples DBSCAN локального уровня"),
+    use_all_buildings: bool = Query(False, description="Все здания вне no-fly"),
+    buildings_per_centroid: int = Query(
+        60,
+        description="Для кластера с hull > 3 000 000 м² — зданий на 1 сайт Вороного (по умолчанию 60); при hull ≤ 3 000 000 м² — «малый» режим агрегации (см. voronoi_paths). Сайты в no-fly не включаются; рёбра с пересечением внутренности no-fly вырезаются.",
+    ),
+    inter_cluster_max_hull_gap_m: float = Query(
+        2000.0,
+        description="Макс. зазор между hull кластеров (м), при котором разрешены межкластерные связи (дорога, пустырь)",
+    ),
+    inter_cluster_max_edge_length_m: float = Query(
+        2000.0,
+        description="Макс. длина одного межкластерного отрезка (м); защита от длинных перебросов",
+    ),
+    voronoi_intra_bridge_max_m: float = Query(
+        600.0,
+        description="После вырезания рёбер через NFZ: макс. длина моста внутри кластера между компонентами (м); 0 — не добавлять",
+    ),
 ):
-    import logging
-    logger = logging.getLogger(__name__)
-    
+    """
+    Локальные пути внутри кластера на основе соседства ячеек Вороного.
+    Считается на сервере по cluster-данным из кэша DataService.
+    """
+
     try:
-        # Загружаем (или берём из кэша) данные города
-        data = data_service.get_city_data(city, network_type=network_type, simplify=simplify)
-        road_graph = data.get("road_graph")
-        if road_graph is None:
-            raise HTTPException(status_code=404, detail="Граф не найден")
-
-        buildings = data.get("buildings")
-        no_fly_zones = data.get("no_fly_zones", [])
-        city_boundary = data.get("city_boundary")
-
-        # ОПТИМИЗАЦИЯ: получаем границы только если нужно
-        gdf_nodes, gdf_edges = ox.graph_to_gdfs(road_graph)
-        xmin, ymin, xmax, ymax = gdf_nodes.total_bounds
-        center_lat = (ymin + ymax) / 2.0
-        center_lon = (xmin + xmax) / 2.0
-        
-        # Если есть границы города, используем их для bounds и центра (только для не-road графов)
-        if graph_type != 'road' and city_boundary is not None:
-            try:
-                boundary_bounds = city_boundary.bounds
-                # Используем границы города вместо bounding box дорожного графа
-                xmin, ymin, xmax, ymax = boundary_bounds[0], boundary_bounds[1], boundary_bounds[2], boundary_bounds[3]
-                center_lon = (xmin + xmax) / 2.0
-                center_lat = (ymin + ymax) / 2.0
-                logger.info(f"✓ Используются границы города для bounds: {city_boundary.geom_type}")
-                logger.info(f"  Границы: lon=[{xmin:.6f}, {xmax:.6f}], lat=[{ymin:.6f}, {ymax:.6f}]")
-            except Exception as e:
-                import logging
-                logging.getLogger(__name__).warning(f"Ошибка использования границ города: {e}")
-        elif graph_type != 'road':
-            import logging
-            logging.getLogger(__name__).warning("⚠ Границы города не найдены! Используется bounding box")
-        
-        bounds = (xmin, ymin, xmax, ymax)
-
-        # ОПТИМИЗАЦИЯ: Проверяем кэш графа в Redis
-        redis_client = data_service.get_redis_client()
-        cache_key = data_service.generate_graph_cache_key(
-            city, network_type, simplify, graph_type, grid_spacing, False
+        raw_fc = build_voronoi_local_paths_fc(
+            data_service,
+            city=city,
+            network_type=network_type,
+            simplify=simplify,
+            dbscan_eps_m=dbscan_eps_m,
+            dbscan_min_samples=dbscan_min_samples,
+            use_all_buildings=use_all_buildings,
+            buildings_per_centroid=buildings_per_centroid,
+            inter_cluster_max_hull_gap_m=inter_cluster_max_hull_gap_m,
+            inter_cluster_max_edge_length_m=inter_cluster_max_edge_length_m,
+            voronoi_intra_component_bridge_max_m=float(voronoi_intra_bridge_max_m),
         )
-        
-        # Пытаемся загрузить из кэша
-        cached_graph_data = None
-        if redis_client is not None:
-            try:
-                cached_blob = redis_client.get(cache_key)
-                if cached_blob:
-                    cached_graph_data = pickle.loads(cached_blob)
-                    logger.info(f"✓ Граф загружен из Redis кэша: {cache_key}")
-            except Exception as e:
-                logger.warning(f"Ошибка чтения графа из Redis: {e}")
-
-        # Генерируем нужный тип графа
-        if graph_type == 'road':
-            # Только дорожный граф
-            # Для road графа используем данные из кэша города (не кэшируем отдельно)
-            # ОПТИМИЗАЦИЯ: фильтруем рёбра дорожного графа, которые пересекают беспилотные зоны
-            if no_fly_zones is not None:
-                try:
-                    # Создаем объединенную геометрию беспилотных зон
-                    if isinstance(no_fly_zones, gpd.GeoDataFrame) and len(no_fly_zones) > 0:
-                        no_fly_union = no_fly_zones.geometry.unary_union
-                    elif isinstance(no_fly_zones, list) and len(no_fly_zones) > 0:
-                        from shapely.ops import unary_union
-                        no_fly_union = unary_union(no_fly_zones)
-                    else:
-                        no_fly_union = None
-                    
-                    if no_fly_union is not None:
-                        # Фильтруем рёбра, которые пересекают беспилотные зоны
-                        original_count = len(gdf_edges)
-                        # Проверяем пересечение каждого ребра с беспилотными зонами
-                        mask = ~gdf_edges.geometry.intersects(no_fly_union)
-                        gdf_edges_filtered = gdf_edges[mask]
-                        filtered_count = len(gdf_edges_filtered)
-                        logger.info(f"Фильтрация дорожного графа: {original_count} -> {filtered_count} рёбер (удалено {original_count - filtered_count} в беспилотных зонах)")
-                        gdf_edges = gdf_edges_filtered
-                    else:
-                        pass  # Используем gdf_edges как есть
-                except Exception as e:
-                    logger.warning(f"Ошибка фильтрации дорожного графа по беспилотным зонам: {e}")
-                    # Продолжаем с исходными рёбрами
-                
-                # Отправляем ВСЕ рёбра без ограничений
-                try:
-                    edges_geojson = json.loads(gdf_edges.to_json())
-                    logger.info(f"Отправлено {len(gdf_edges)} рёбер дорожного графа")
-                except Exception as e:
-                    logger.error(f"Ошибка конвертации рёбер в GeoJSON: {e}")
-                    raise
-            else:
-                # Отправляем ВСЕ рёбра без ограничений
-                try:
-                    edges_geojson = json.loads(gdf_edges.to_json())
-                    logger.info(f"Отправлено {len(gdf_edges)} рёбер дорожного графа")
-                except Exception as e:
-                    logger.error(f"Ошибка конвертации рёбер в GeoJSON: {e}")
-                    raise
-            stats = data.get("stats", {})
-            
-        elif graph_type == 'delaunay':
-            if cached_graph_data is not None:
-                edges_geojson = cached_graph_data.get('edges_geojson')
-                stats = cached_graph_data.get('stats')
-                logger.info("✓ Использован кэшированный delaunay граф")
-            else:
-                delivery_gdf = data_service.get_delivery_points(buildings, road_graph, city_boundary)
-                delivery_points = []
-                if len(delivery_gdf) > 0:
-                    delivery_points = [(float(row["delivery_lon"]), float(row["delivery_lat"])) for _, row in delivery_gdf.iterrows()]
-                delaunay_graph = graph_service.create_delaunay_graph(
-                    bounds=bounds,
-                    num_points=0,
-                    buildings=buildings if len(delivery_points) < 3 else None,
-                    no_fly_zones=no_fly_zones,
-                    city_boundary=city_boundary,
-                    points=delivery_points if len(delivery_points) >= 3 else None,
-                )
-                edges_geojson = graph_service.graph_to_geojson(delaunay_graph)
-                stats = {
-                    "nodes": len(delaunay_graph.nodes),
-                    "edges": len(delaunay_graph.edges),
-                    "type": "delaunay"
-                }
-                if redis_client is not None:
-                    try:
-                        cache_data = {
-                            'edges_geojson': edges_geojson,
-                            'stats': stats,
-                            'graph_type': graph_type
-                        }
-                        redis_client.set(cache_key, pickle.dumps(cache_data), ex=86400 * 7)
-                        logger.info(f"✓ Delaunay граф сохранен в Redis: {cache_key}")
-                    except Exception as e:
-                        logger.warning(f"Ошибка сохранения delaunay графа в Redis: {e}")
-            # Аннотируем рёбра допустимыми эшелонами (выполняется всегда)
-            flight_levels = data.get("flight_levels", [])
-            buildings_with_heights = data.get("buildings")
-            if buildings_with_heights is not None and "height_m" not in buildings_with_heights.columns:
-                buildings_with_heights = data_service._compute_building_heights(buildings_with_heights)
-            edges_geojson = graph_service.assign_flight_levels_to_edges(
-                edges_geojson,
-                buildings_with_heights if buildings_with_heights is not None and len(buildings_with_heights) > 0 else gpd.GeoDataFrame(),
-                flight_levels
-            )
-        else:
-            raise HTTPException(status_code=400, detail=f"Неизвестный тип графа: {graph_type}")
-
-        # Используем границы города для bbox, если они есть
-        if city_boundary is not None:
-            try:
-                boundary_bounds = city_boundary.bounds
-                bbox = [boundary_bounds[0], boundary_bounds[1], boundary_bounds[2], boundary_bounds[3]]
-            except Exception:
-                bbox = [xmin, ymin, xmax, ymax]
-        else:
-            bbox = [xmin, ymin, xmax, ymax]
-        
-        # Добавляем границы города в ответ для визуализации
-        city_boundary_geojson = None
-        if city_boundary is not None:
-            try:
-                boundary_gdf = gpd.GeoDataFrame([{'geometry': city_boundary}], crs='EPSG:4326')
-                city_boundary_geojson = json.loads(boundary_gdf.to_json())
-            except Exception as e:
-                import logging
-                logging.getLogger(__name__).warning(f"Ошибка создания GeoJSON границ: {e}")
-        
-        # Добавляем беспилотные зоны в ответ для визуализации
-        no_fly_zones_geojson = None
-        if no_fly_zones is not None:
-            try:
-                # Преобразуем беспилотные зоны в GeoJSON
-                if isinstance(no_fly_zones, gpd.GeoDataFrame):
-                    if len(no_fly_zones) > 0:
-                        no_fly_zones_geojson = json.loads(no_fly_zones.to_json())
-                        logger.info(f"Добавлено {len(no_fly_zones)} беспилотных зон для визуализации")
-                elif isinstance(no_fly_zones, list) and len(no_fly_zones) > 0:
-                    # Если это список геометрий, создаем GeoDataFrame
-                    zones_gdf = gpd.GeoDataFrame([{'geometry': zone} for zone in no_fly_zones], crs='EPSG:4326')
-                    no_fly_zones_geojson = json.loads(zones_gdf.to_json())
-                    logger.info(f"Добавлено {len(no_fly_zones)} беспилотных зон для визуализации")
-            except Exception as e:
-                import logging
-                logging.getLogger(__name__).warning(f"Ошибка создания GeoJSON беспилотных зон: {e}")
-        
-        return JSONResponse({
-            "bbox": bbox,
-            "center": {"lat": center_lat, "lon": center_lon},
-            "edges": edges_geojson,
-            "stats": stats,
-            "graph_type": graph_type,
-            "city_boundary": city_boundary_geojson,  # Границы города для визуализации
-            "no_fly_zones": no_fly_zones_geojson,  # Беспилотные зоны для визуализации
-            "flight_levels": data.get("flight_levels", []),  # Эшелоны полётов
-            "building_height_stats": data.get("building_height_stats", {}),
-        })
+        fc = _round_geojson_coords(raw_fc, precision=6)
+        return JSONResponse(
+            fc
+        )
     except HTTPException:
         raise
     except Exception as e:
-        import traceback
-        traceback.print_exc()
+        logger.exception("voronoi local paths")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/stations/placement")
+def get_stations_placement(
+    city: str = Query(..., description="Название города"),
+    network_type: str = Query("drive", description="Тип сети OSM"),
+    simplify: bool = Query(True, description="Упрощение графа"),
+    demand_method: str = Query("dbscan", description="dbscan или grid"),
+    dbscan_eps_m: float = Query(180.0, description="eps DBSCAN (м)"),
+    dbscan_min_samples: int = Query(15, description="min_samples DBSCAN"),
+    a_by_admin_districts: bool = Query(True, description="Ставить станции A по административным районам"),
+    candidates_per_cluster: int = Query(25, description="Кандидатов на кластер при выборе точек зарядки"),
+    use_saved: bool = Query(True, description="Использовать сохранённую расстановку, если есть"),
+    only_saved: bool = Query(False, description="Только кэш Redis: при промахе 404, без пересчёта пайплайна"),
+    save_result: bool = Query(True, description="Сохранять новую расстановку в Redis"),
+    buildings_per_centroid: int = Query(
+        60,
+        description="Плотность агрегации сайтов Вороного; используется и в placement, и в /api/buildings/voronoi-local-paths.",
+    ),
+    inter_cluster_max_hull_gap_m: float = Query(
+        2000.0,
+        description="Макс. зазор между hull кластеров (м) для межкластерных рёбер",
+    ),
+    inter_cluster_max_edge_length_m: float = Query(
+        2000.0,
+        description="Макс. длина межкластерного отрезка (м)",
+    ),
+    use_all_buildings: bool = Query(
+        False,
+        description="Учитывать все здания вне no-fly (как у /api/buildings/voronoi-local-paths)",
+    ),
+    voronoi_intra_bridge_max_m: float = Query(
+        600.0,
+        description="Мосты внутри компоненты Вороного после вырезания NFZ; placement и /api/buildings/voronoi-local-paths.",
+    ),
+):
+    """
+    Полный пайплайн: зарядки A/B, гаражи/ТО, магистраль A–A, ветки B→A и гараж/ТО→A, локальные Б↔Б, слой Вороного (как у GET /api/buildings/voronoi-local-paths, с учётом точек станций в кластерах).
+    Кэш в Redis — JSON ответа для карты.
+    """
+    cache_key = _placement_cache_key(
+        city=city,
+        network_type=network_type,
+        simplify=simplify,
+        dbscan_eps_m=dbscan_eps_m,
+        dbscan_min_samples=dbscan_min_samples,
+        buildings_per_centroid=buildings_per_centroid,
+        inter_cluster_max_hull_gap_m=inter_cluster_max_hull_gap_m,
+        inter_cluster_max_edge_length_m=inter_cluster_max_edge_length_m,
+        use_all_buildings=use_all_buildings,
+        voronoi_intra_bridge_max_m=float(voronoi_intra_bridge_max_m),
+    )
+    redis_client = data_service.get_redis_client()
+
+    if only_saved:
+        if redis_client is None:
+            raise HTTPException(status_code=503, detail="Redis недоступен")
+        cached = redis_client.get(cache_key)
+        if not cached:
+            raise HTTPException(status_code=404, detail="Нет сохранённой расстановки")
+        return JSONResponse(json.loads(cached.decode("utf-8")))
+
+    if use_saved and redis_client is not None:
+        cached = redis_client.get(cache_key)
+        if cached:
+            data = json.loads(cached.decode("utf-8"))
+            data["from_saved"] = True
+            return JSONResponse(data)
+
+    try:
+        logger.info("Пайплайн placement: run_full_pipeline")
+        raw = run_full_pipeline(
+            data_service,
+            city.strip(),
+            network_type=network_type,
+            simplify=simplify,
+            demand_method=demand_method,
+            demand_cell_m=250.0,
+            dbscan_eps_m=dbscan_eps_m,
+            dbscan_min_samples=dbscan_min_samples,
+            candidates_per_cluster=candidates_per_cluster,
+            use_all_buildings=use_all_buildings,
+            a_by_admin_districts=a_by_admin_districts,
+            voronoi_buildings_per_centroid=buildings_per_centroid,
+            inter_cluster_max_hull_gap_m=inter_cluster_max_hull_gap_m,
+            inter_cluster_max_edge_length_m=inter_cluster_max_edge_length_m,
+            voronoi_intra_component_bridge_max_m=float(voronoi_intra_bridge_max_m),
+        )
+        geo = pipeline_result_to_geojson(raw)
+        geo = _round_geojson_coords(geo, precision=6)
+        geo["from_saved"] = False
+        n_vor = len((geo.get("voronoi_edges") or {}).get("features", []) or [])
+        n_a = len((geo.get("charging_type_a") or {}).get("features", []) or [])
+        n_b = len((geo.get("charging_type_b") or {}).get("features", []) or [])
+        logger.info("Пайплайн завершён: зарядки A=%s B=%s (voronoi_edges в placement: %s)", n_a, n_b, n_vor)
+        if save_result and redis_client is not None:
+            try:
+                redis_client.set(
+                    cache_key,
+                    json.dumps(geo, ensure_ascii=False).encode("utf-8"),
+                )
+            except Exception as e:
+                logger.warning("Не удалось сохранить расстановку в Redis: %s", e)
+        return JSONResponse(geo)
+    except Exception as e:
+        logger.exception("stations placement")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/stations/export_saved")
+def export_saved_stations(
+    city: str = Query(..., description="Название города"),
+    network_type: str = Query("drive", description="Тип сети OSM"),
+    simplify: bool = Query(True, description="Упрощение графа"),
+    dbscan_eps_m: float = Query(180.0, description="eps DBSCAN (м)"),
+    dbscan_min_samples: int = Query(15, description="min_samples DBSCAN"),
+    buildings_per_centroid: int = Query(60, description="Должен совпадать с параметром при сохранении"),
+    inter_cluster_max_hull_gap_m: float = Query(
+        2000.0,
+        description="Должен совпадать с параметром при сохранении",
+    ),
+    inter_cluster_max_edge_length_m: float = Query(
+        2000.0,
+        description="Должен совпадать с параметром при сохранении",
+    ),
+    use_all_buildings: bool = Query(False, description="Должен совпадать с параметром при сохранении"),
+    voronoi_intra_bridge_max_m: float = Query(
+        600.0,
+        description="Должен совпадать с параметром при сохранении",
+    ),
+):
+    """Выгрузка сохранённого JSON карты из Redis (полный пайплайн)."""
+    redis_client = data_service.get_redis_client()
+    if redis_client is None:
+        raise HTTPException(status_code=503, detail="Redis недоступен")
+    cache_key = _placement_cache_key(
+        city=city,
+        network_type=network_type,
+        simplify=simplify,
+        dbscan_eps_m=dbscan_eps_m,
+        dbscan_min_samples=dbscan_min_samples,
+        buildings_per_centroid=buildings_per_centroid,
+        inter_cluster_max_hull_gap_m=inter_cluster_max_hull_gap_m,
+        inter_cluster_max_edge_length_m=inter_cluster_max_edge_length_m,
+        use_all_buildings=use_all_buildings,
+        voronoi_intra_bridge_max_m=float(voronoi_intra_bridge_max_m),
+    )
+    try:
+        cached = redis_client.get(cache_key)
+        if not cached:
+            raise HTTPException(status_code=404, detail="Сохраненная расстановка не найдена")
+        data = json.loads(cached.decode("utf-8"))
+        safe_city = city.replace(" ", "_").replace(",", "").replace("/", "_")
+        filename = f"stations_{safe_city}.json"
+        return JSONResponse(
+            data,
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Cache-Control": "no-store",
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка выгрузки: {e}")
 
 
 def _ensure_static_mount():
     static_dir = os.path.join(os.getcwd(), "static")
     if os.path.isdir(static_dir):
+        from fastapi.staticfiles import StaticFiles
+
         app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 
 _ensure_static_mount()
-
 
 if __name__ == "__main__":
     import uvicorn
