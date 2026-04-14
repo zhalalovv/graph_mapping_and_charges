@@ -1085,6 +1085,7 @@ class DataService:
         hull_rows = [] if (method == "dbscan" and return_hulls) else None
         if method == "dbscan" and use_utm and crs_utm is not None:
             try:
+                # Этап 3 (DBSCAN): основной алгоритм кластеризации спроса по координатам зданий.
                 from sklearn.cluster import DBSCAN
                 from pyproj import Transformer
                 eps_m = dbscan_eps_m
@@ -1102,6 +1103,7 @@ class DataService:
                     fill_step_m = max(400.0, float(eps_m) * 2.0)
                 from shapely.ops import transform as sh_transform
 
+                # Этап 4 (KMeans): детализация крупных DBSCAN-кластеров на подгруппы.
                 from sklearn.cluster import KMeans, MiniBatchKMeans
                 MAX_WEIGHT_PER_HULL = 10000.0
                 # За один вызов KMeans не дробим на тысячи кластеров — только порциями, иначе 80k+ точек «висит» часами.
@@ -1137,9 +1139,11 @@ class DataService:
                             max_iter=200,
                             reassignment_ratio=0.02,
                         )
+                        # Этап 4 (KMeans): запуск MiniBatchKMeans для больших выборок.
                         return np.asarray(mb.fit(sub_pts).labels_, dtype=int)
                     n_init = 5 if n < 8000 else 3
                     km = KMeans(n_clusters=k, random_state=42, n_init=n_init, max_iter=300)
+                    # Этап 4 (KMeans): запуск классического KMeans для умеренных размеров кластера.
                     return np.asarray(km.fit(sub_pts).labels_, dtype=int)
 
                 def _partition_by_target_weight(indices):
@@ -1358,9 +1362,11 @@ class DataService:
                 _dbscan_kw = {"eps": REGION_EPS_M, "min_samples": REGION_MIN_SAMPLES, "metric": "euclidean"}
                 _dbscan_kw["n_jobs"] = -1
                 try:
+                    # Этап 3 (DBSCAN): первичный fit по всем точкам спроса в UTM.
                     region_labels = np.array(DBSCAN(**_dbscan_kw).fit(pts_utm).labels_, dtype=int)
                 except TypeError:
                     _dbscan_kw.pop("n_jobs", None)
+                    # Этап 3 (DBSCAN): fallback fit без n_jobs для совместимости версий sklearn.
                     region_labels = np.array(DBSCAN(**_dbscan_kw).fit(pts_utm).labels_, dtype=int)
                 self.logger.info("DBSCAN районов завершён, разбиение по весу %.0f…", MAX_WEIGHT_PER_HULL)
                 region_ids = sorted(set(region_labels) - {-1})

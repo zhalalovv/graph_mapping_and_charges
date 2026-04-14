@@ -162,6 +162,7 @@ def _aggregate_points_to_centroids(pts_arr: np.ndarray, target_group_size: int) 
     n_groups = int(np.ceil(len(pts_arr) / float(tg)))
     n_groups = max(2, min(n_groups, len(pts_arr)))
     try:
+        # Этап 4 (KMeans): агрегация зданий в сайты (центроиды) для локальной сети.
         from sklearn.cluster import MiniBatchKMeans
 
         km = MiniBatchKMeans(
@@ -171,6 +172,7 @@ def _aggregate_points_to_centroids(pts_arr: np.ndarray, target_group_size: int) 
             n_init=3,
             max_iter=200,
         )
+        # Этап 4 (KMeans): непосредственный запуск кластеризации и получение меток групп.
         labels = km.fit_predict(pts_arr)
         centers = []
         for k in range(n_groups):

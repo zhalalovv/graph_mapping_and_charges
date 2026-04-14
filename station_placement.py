@@ -951,6 +951,76 @@ def route_coords_clear_of_nfz(
         return False
 
 
+def remove_self_intersections_lonlat(
+    coords_lonlat: Optional[List[Tuple[float, float]]],
+    *,
+    max_passes: int = 16,
+    eps: float = 1e-9,
+) -> Optional[List[Tuple[float, float]]]:
+    """
+    Удаляет «петли» (самопересечения) из ломаной, сохраняя непрерывный путь start->end.
+    Идём слева направо и при первом не-соседнем пересечении вырезаем внутренний цикл.
+    """
+    if coords_lonlat is None:
+        return None
+    pts: List[Tuple[float, float]] = [(float(lo), float(la)) for lo, la in coords_lonlat]
+    if len(pts) < 4:
+        return pts
+
+    def _dedup_consecutive(seq: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+        if not seq:
+            return seq
+        out = [seq[0]]
+        for p in seq[1:]:
+            if abs(p[0] - out[-1][0]) > eps or abs(p[1] - out[-1][1]) > eps:
+                out.append(p)
+        return out
+
+    pts = _dedup_consecutive(pts)
+    if len(pts) < 4:
+        return pts
+
+    for _ in range(max(1, int(max_passes))):
+        changed = False
+        n = len(pts)
+        for i in range(n - 1):
+            seg_a = LineString([pts[i], pts[i + 1]])
+            for j in range(i + 2, n - 1):
+                # Соседние сегменты и общий endpoint конечного ребра не считаем петлёй.
+                if j == i + 1:
+                    continue
+                if i == 0 and j == n - 2:
+                    continue
+                seg_b = LineString([pts[j], pts[j + 1]])
+                inter = seg_a.intersection(seg_b)
+                if inter.is_empty:
+                    continue
+                if getattr(inter, "geom_type", "") in ("Point", "MultiPoint"):
+                    if inter.geom_type == "Point":
+                        ip = (float(inter.x), float(inter.y))
+                    else:
+                        geoms = list(getattr(inter, "geoms", []))
+                        if not geoms:
+                            continue
+                        ip = (float(geoms[0].x), float(geoms[0].y))
+                    pts = pts[: i + 1] + [ip] + pts[j + 1 :]
+                    pts = _dedup_consecutive(pts)
+                    changed = True
+                    break
+                # Коллинеарное наложение (LineString/GeometryCollection): тоже вырезаем цикл.
+                pts = pts[: i + 1] + pts[j + 1 :]
+                pts = _dedup_consecutive(pts)
+                changed = True
+                break
+            if changed:
+                break
+        if not changed:
+            break
+        if len(pts) < 2:
+            return None
+    return pts
+
+
 def polish_detour_polyline(
     coords_lonlat: List[Tuple[float, float]],
     nfz_union: Any,
@@ -1772,6 +1842,7 @@ def route_lonlat_segment_with_nfz_detours(
     )
     detour_len, detour_coords, how = candidates[0]
     detour_coords = _tighten_detour_route(detour_coords)
+    detour_coords = remove_self_intersections_lonlat(detour_coords) or detour_coords
     if detour_coords is not None:
         rl0 = _route_length_km(detour_coords)
         if rl0 is not None:
@@ -1794,6 +1865,7 @@ def route_lonlat_segment_with_nfz_detours(
             utm_anchor_lonlat=utm_anchor_lonlat,
             no_fly_safety_buffer=no_fly_safety_buffer,
         )
+        detour_coords = remove_self_intersections_lonlat(detour_coords) or detour_coords
         # После Chaikin не делаем Douglas–Peucker simplify: он срезает точки и снова даёт острые углы.
         rl = _route_length_km(detour_coords)
         if rl is not None:
@@ -1805,6 +1877,7 @@ def route_lonlat_segment_with_nfz_detours(
             utm_anchor_lonlat=utm_anchor_lonlat,
             no_fly_safety_buffer=no_fly_safety_buffer,
         )
+        detour_coords = remove_self_intersections_lonlat(detour_coords) or detour_coords
         rl2 = _route_length_km(detour_coords)
         if rl2 is not None:
             detour_len = float(rl2)
