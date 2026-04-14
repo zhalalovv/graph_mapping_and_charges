@@ -885,7 +885,7 @@ def apply_nfz_detours_to_voronoi_fc(
             feat["properties"] = props
             continue
         path_ll, _len_km, how = routed
-        if how != "straight" and path_ll and len(path_ll) >= 2:
+        if path_ll and len(path_ll) >= 2:
             feat["geometry"] = {
                 "type": "LineString",
                 "coordinates": [[float(lon), float(lat)] for lon, lat in path_ll],

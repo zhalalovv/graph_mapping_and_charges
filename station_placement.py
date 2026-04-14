@@ -854,6 +854,51 @@ def smooth_lonlat_polyline_chaikin(
     return out
 
 
+def densify_lonlat_polyline_metric(
+    coords_lonlat: List[Tuple[float, float]],
+    anchor_lon: float,
+    anchor_lat: float,
+    *,
+    max_step_m: float = 180.0,
+    max_output_points: int = 48,
+) -> List[Tuple[float, float]]:
+    """
+    Уплотняет ломаную в UTM: на длинных сегментах добавляет промежуточные точки
+    с шагом не больше max_step_m. Концы сохраняются.
+    """
+    if len(coords_lonlat) < 2:
+        return list(coords_lonlat)
+    step_m = max(20.0, float(max_step_m))
+    utm_epsg = _utm_epsg_from_lonlat(float(anchor_lon), float(anchor_lat))
+    src_crs = CRS.from_epsg(4326)
+    dst_crs = CRS.from_epsg(utm_epsg)
+    fwd = Transformer.from_crs(src_crs, dst_crs, always_xy=True)
+    inv = Transformer.from_crs(dst_crs, src_crs, always_xy=True)
+    xy = [fwd.transform(float(lo), float(la)) for lo, la in coords_lonlat]
+    out_xy: List[Tuple[float, float]] = [tuple(xy[0])]
+    for i in range(len(xy) - 1):
+        x0, y0 = xy[i]
+        x1, y1 = xy[i + 1]
+        dx = float(x1) - float(x0)
+        dy = float(y1) - float(y0)
+        seg_len = float(np.hypot(dx, dy))
+        n_parts = max(1, int(np.ceil(seg_len / step_m)))
+        for k in range(1, n_parts + 1):
+            t = float(k) / float(n_parts)
+            out_xy.append((float(x0 + t * dx), float(y0 + t * dy)))
+            if len(out_xy) >= max(8, int(max_output_points)):
+                break
+        if len(out_xy) >= max(8, int(max_output_points)):
+            break
+    if out_xy[-1] != tuple(xy[-1]):
+        out_xy.append(tuple(xy[-1]))
+    out: List[Tuple[float, float]] = []
+    for x, y in out_xy:
+        lo, la = inv.transform(float(x), float(y))
+        out.append((float(lo), float(la)))
+    return out
+
+
 def route_coords_clear_of_nfz(
     route_coords: Optional[List[Tuple[float, float]]],
     nfz_union: Any,
@@ -914,6 +959,7 @@ def polish_detour_polyline(
     alon = float(utm_anchor_lonlat[0]) if utm_anchor_lonlat is not None else float(coords_lonlat[0][0])
     alat = float(utm_anchor_lonlat[1]) if utm_anchor_lonlat is not None else float(coords_lonlat[0][1])
     best = list(coords_lonlat)
+    best_changed = False
     for frac, iters in DETOUR_SMOOTH_SCHEDULE:
         cand = smooth_lonlat_polyline_chaikin(
             coords_lonlat, alon, alat, int(iters), edge_frac=float(frac)
@@ -925,6 +971,22 @@ def polish_detour_polyline(
             no_fly_safety_buffer=no_fly_safety_buffer,
         ):
             best = cand
+            best_changed = True
+    # Fallback для коротких/плотных обходов у границы NFZ:
+    # очень мягкое Chaikin сглаживание, чтобы не оставлять исходные 3–4 точки.
+    if not best_changed:
+        for frac, iters in ((0.08, 1), (0.06, 1)):
+            cand = smooth_lonlat_polyline_chaikin(
+                coords_lonlat, alon, alat, int(iters), edge_frac=float(frac)
+            )
+            if route_coords_clear_of_nfz(
+                cand,
+                nfz_union,
+                nfz_metric=nfz_metric,
+                no_fly_safety_buffer=no_fly_safety_buffer,
+            ):
+                best = cand
+                break
     return best
 
 
@@ -941,7 +1003,7 @@ def light_extra_smoothing_lonlat(
         return list(coords_lonlat)
     alon = float(utm_anchor_lonlat[0]) if utm_anchor_lonlat is not None else float(coords_lonlat[0][0])
     alat = float(utm_anchor_lonlat[1]) if utm_anchor_lonlat is not None else float(coords_lonlat[0][1])
-    for it, ef in ((2, 0.17), (1, 0.14)):
+    for it, ef in ((2, 0.18), (1, 0.14)):
         cand = smooth_lonlat_polyline_chaikin(coords_lonlat, alon, alat, int(it), edge_frac=float(ef))
         if len(cand) < 3:
             continue
@@ -1691,6 +1753,7 @@ def route_lonlat_segment_with_nfz_detours(
         return None
 
     chord_ref = max(float(d_km), 1e-9)
+
     candidates.sort(
         key=lambda t: (
             (t[0] / chord_ref) + float(DETOUR_SCORE_EXCESS_PER_KM) * max(0.0, t[0] - chord_ref),
@@ -1704,6 +1767,16 @@ def route_lonlat_segment_with_nfz_detours(
         if rl0 is not None:
             detour_len = float(rl0)
     if how != "straight" and len(detour_coords) >= 3:
+        if len(detour_coords) <= 6:
+            # Для коротких A*/boundary обходов сначала уплотняем вершины, затем скругляем:
+            # иначе Chaikin даёт недостаточно «мягкую» линию (мало контрольных точек).
+            detour_coords = densify_lonlat_polyline_metric(
+                detour_coords,
+                float(utm_anchor_lonlat[0]) if utm_anchor_lonlat is not None else float(detour_coords[0][0]),
+                float(utm_anchor_lonlat[1]) if utm_anchor_lonlat is not None else float(detour_coords[0][1]),
+                max_step_m=320.0,
+                max_output_points=36,
+            )
         detour_coords = polish_detour_polyline(
             detour_coords,
             nfz_union,
