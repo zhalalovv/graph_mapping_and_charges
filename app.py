@@ -14,6 +14,38 @@ from data_service import DataService
 from station_placement import pipeline_result_to_geojson, run_full_pipeline
 from voronoi_paths import build_voronoi_local_paths_fc
 
+"""
+API-слой пайплайна городской инфраструктуры БПЛА.
+
+
+Этап 1. Загрузка геопространственных данных OSM:
+    `get_city_map()` -> `DataService.get_city_data()` / `DataService._download_city_data()`.
+Этап 2. Обработка и нормализация геоданных:
+    `DataService._compute_building_heights()`, `DataService.ensure_flight_levels()`.
+Этап 3. Кластеризация зданий алгоритмом DBSCAN:
+    `get_building_clusters()` -> `DataService.get_demand_points_weighted(method="dbscan")`.
+Этап 4. Детализация структуры кластеров (KMeans):
+    `voronoi_paths._aggregate_points_to_centroids()` (вызывается внутри построения Voronoi-слоя).
+Этап 5. Автоматическое размещение инфраструктуры (A/B/ТО/гаражи):
+    `get_stations_placement()` -> `run_full_pipeline()` / `StationPlacement`.
+Этап 6. Построение транспортного графа инфраструктуры БПЛА:
+    `run_full_pipeline()` (формирование trunk/branch/local графов).
+Этап 7. Формирование магистральных связей между опорными станциями:
+    `run_full_pipeline()` + `trunk_graph_to_geojson_features()`.
+Этап 8. Формирование локальной маршрутной сети внутри кластеров:
+    `get_voronoi_local_paths()` -> `build_voronoi_local_paths_fc()`.
+Этап 9. Построение маршрутов БПЛА алгоритмом A*:
+    `station_placement.astar_path_safe()` и detour-маршрутизация в `station_placement.py`.
+Этап 10. Учет no-fly зон и городских препятствий:
+    `DataService._get_no_fly_zones()`, фильтры `voronoi_paths._filter_voronoi_fc_*`.
+Этап 11. Учет эшелонирования воздушного пространства:
+    `DataService` (методы эшелонов) + разделение на эшелоны в `run_full_pipeline()`.
+Этап 12. Визуализация результатов на интерактивной карте:
+    `index()` + JSON-эндпоинты `get_stations_placement()` / `get_voronoi_local_paths()`.
+Этап 13. Отображение зданий, кластеров, инфраструктуры и маршрутов:
+    `export_buildings_with_heights()`, `get_building_clusters()`, `pipeline_result_to_geojson()`.
+"""
+
 
 app = FastAPI(title="Clustering", version="0.2.0")
 
@@ -30,6 +62,7 @@ logger = logging.getLogger(__name__)
 
 
 def _round_geojson_coords(obj, precision: int = 6):
+    """Округляет float-координаты в GeoJSON-структуре для стабильной сериализации."""
     if isinstance(obj, dict):
         return {k: _round_geojson_coords(v, precision) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -51,6 +84,7 @@ def _placement_cache_key(
     use_all_buildings: bool,
     voronoi_intra_bridge_max_m: float,
 ) -> str:
+    """Формирует детерминированный Redis-ключ для кэша результата размещения."""
     payload = {
         "city": city.strip(),
         "network_type": network_type,
@@ -73,6 +107,7 @@ def _placement_cache_key(
 
 @app.get("/", response_class=HTMLResponse)
 def index():
+    """Возвращает HTML интерфейс интерактивной карты."""
     try:
         with open(os.path.join("templates", "index.html"), "r", encoding="utf-8") as f:
             return HTMLResponse(content=f.read())
@@ -82,9 +117,11 @@ def index():
 
 @app.get("/api/ping")
 def ping():
+    """Проверка доступности API."""
     return {"status": "ok"}
 
 
+# Этап 1: загрузка геопространственных данных (OSM + границы + no-fly).
 @app.get("/api/city/map")
 def get_city_map(
     city: str = Query(..., description="Название города"),
@@ -140,6 +177,7 @@ def get_city_map(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# Этап 2: обработка и нормализация исходных геоданных (высоты/площади зданий).
 @app.get("/api/buildings/export")
 def export_buildings_with_heights(
     city: str = Query(..., description="Название города"),
@@ -223,6 +261,7 @@ def export_buildings_with_heights(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# Этап 3: кластеризация зданий алгоритмом DBSCAN.
 @app.get("/api/buildings/clusters")
 def get_building_clusters(
     city: str = Query(..., description="Название города"),
@@ -372,6 +411,7 @@ def get_building_clusters(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# Этап 4 + Этап 8: детализация кластеров (KMeans-агрегация) и локальная сеть маршрутов.
 @app.get("/api/buildings/voronoi-local-paths")
 def get_voronoi_local_paths(
     city: str = Query(..., description="Название города"),
@@ -427,6 +467,7 @@ def get_voronoi_local_paths(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# Этап 5-11: размещение инфраструктуры, граф, магистрали, A*, no-fly и эшелоны.
 @app.get("/api/stations/placement")
 def get_stations_placement(
     city: str = Query(..., description="Название города"),
@@ -534,6 +575,7 @@ def get_stations_placement(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# Этап 12-13: выдача результата для визуализации и отображения всех слоёв карты.
 @app.get("/api/stations/export_saved")
 def export_saved_stations(
     city: str = Query(..., description="Название города"),
@@ -593,6 +635,7 @@ def export_saved_stations(
 
 
 def _ensure_static_mount():
+    """Подключает каталог `static` в FastAPI при его наличии."""
     static_dir = os.path.join(os.getcwd(), "static")
     if os.path.isdir(static_dir):
         from fastapi.staticfiles import StaticFiles

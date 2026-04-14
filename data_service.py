@@ -49,6 +49,15 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"osmnx\.f
 
 class DataService:
     def __init__(self, cache_dir="cache_data"):
+        """
+        Сервис доступа к геоданным и подготовке данных для пайплайна БПЛА.
+
+        - Загрузка OSM/границ/зданий: `get_city_data()`, `_download_city_data()`.
+        - Обработка и нормализация геоданных: `_compute_building_heights()`, `ensure_flight_levels()`.
+        - Кластеризация зданий DBSCAN: `get_demand_points_weighted()`.
+        - Кандидаты под инфраструктуру: `get_station_candidates()`.
+        - Запретные зоны и препятствия: `_get_no_fly_zones()`, высотные методы эшелонов.
+        """
         # Локальный кэш на диске больше не используется как хранилище данных.
         # Параметр оставлен для совместимости, но директории мы не создаём и файлы не пишем.
         self.cache_dir = cache_dir
@@ -70,12 +79,15 @@ class DataService:
             self.logger.info("Redis not available for DataService cache; диск как кэш не используется")
     
     def add_progress_callback(self, callback):
+        """Регистрирует callback для статуса этапов загрузки/обработки."""
         self.progress_callbacks.append(callback)
     
     def _update_progress(self, stage, percentage, message=""):
+        """Публикует прогресс во все зарегистрированные callbacks."""
         for callback in self.progress_callbacks:
             callback(stage, percentage, message)
     
+    # Этап 1: вход в загрузку данных города из кэша/OSM.
     def get_city_data(self, city_name: str, network_type: str = 'drive', simplify: bool = True, load_no_fly_zones: bool = True):
         """Получение данных города (универсально для любой страны). load_no_fly_zones=False — только дороги, без загрузки беспилотных зон."""
         normalized_name = city_name.strip()
@@ -168,7 +180,9 @@ class DataService:
             load_no_fly_zones=load_no_fly_zones,
         )
     
+    # Этап 1: фактическая загрузка дорог/границ/зданий и no-fly из OSM.
     def _download_city_data(self, city_name, redis_key: str | None = None, clusters_redis_key: str | None = None, *, network_type: str = 'drive', simplify: bool = True, load_no_fly_zones: bool = True):
+        """Загружает геоданные из OSM и формирует нормализованный пакет данных города."""
         self._update_progress("download", 0, "Начало загрузки данных")
         
         try:
@@ -807,6 +821,7 @@ class DataService:
             out["area_m2"] = 0.0
             return out
 
+    # Этап 3: формирование кластеров спроса (DBSCAN) и их hull.
     def get_demand_points_weighted(
         self,
         buildings: gpd.GeoDataFrame,
@@ -1618,6 +1633,7 @@ class DataService:
         return tag in cls._PRIVATE_BUILDING_TAGS
     
     def _sanitize_name(self, name):
+        """Нормализует строку для безопасного использования в ключах кэша."""
         import re
         name = re.sub(r'[^\w\s-]', '', name)
         return re.sub(r'[-\s]+', '_', name).strip('_')[:100]
@@ -1656,6 +1672,7 @@ class DataService:
             return num
         return None
 
+    # Этап 2: нормализация высот зданий из OSM-тегов.
     def _compute_building_heights(self, buildings: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         """
         Добавляет колонку height_m к зданиям на основе OSM-тегов.
@@ -1809,6 +1826,7 @@ class DataService:
         """Синоним порога для всех маршрутов станций на эшелонах 4–5 (см. magistral_building_obstacle_min_height_m)."""
         return DataService.magistral_building_obstacle_min_height_m(flight_levels)
 
+    # Этап 11: расчет/проверка эшелонов воздушного пространства в пакете данных.
     def ensure_flight_levels(self, data: dict, num_levels: int | None = None) -> dict:
         """
         Добавляет в data поля buildings (с height_m), building_height_stats, flight_levels.

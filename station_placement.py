@@ -1,15 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-Размещение станций зарядки, гаражей и ТО по правилам:
-- Зарядка+ожидание (туда-обратно): R_charge = 0.4 * D_max = 6.4 км (FlyCart 30, D_max=16 км).
-- Гаражи/ТО (в одну сторону): R_garage/TO = 0.8 * D_max = 12.8 км.
-
 Шаги:
-  1) Точки спроса (кластеры/сетка 250×250 м с весом).
-  2) Зарядки: weighted maximum coverage / set cover (жадный).
+  1) Зоны спроса
+  2) Зарядки
   3) Гаражи и ТО: по ceil(N_A/3) каждого, промзона; разнос между точками и от зарядок (см. MIN_FACILITY_SEPARATION_KM); ветви только к ближайшей зарядке A.
   4) Магистраль: только между станциями Charge_A (MST по A); станции Б — по одной ветке к A (глобальный min-cost при квоте MAX_TYPE_B_BRANCHES_PER_TYPE_A Б на A), плюс до двух локальных связей Б↔Б; гараж/ТО — только к A.
   5) Локальная сеть Б↔Б, метрики; в ответе placement — полный слой Вороного (сайты зданий + станции с cluster_id).
+
+Тут реализовано:
+Этап 5: размещение инфраструктурных объектов -> `StationPlacement` и жадные функции покрытия.
+Этап 6-7: транспортный граф и магистраль -> `run_full_pipeline()` + trunk/branch сборка.
+Этап 8: локальная внутрикластерная сеть -> слой Voronoi подключается в финале пайплайна.
+Этап 9-10: маршруты A* и обход препятствий/no-fly -> `astar_path_safe()` и detour-функции.
+Этап 11: эшелонирование -> эшелоны 4-5 для магистралей/ветвей, 1-3 для Voronoi (через соседний модуль).
 """
 
 from __future__ import annotations
@@ -94,6 +97,7 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def _coords_from_geom(g) -> Tuple[float, float]:
+    """Извлекает координаты (lon, lat) из Point/геометрии (через centroid как fallback)."""
     if g is None:
         return (0.0, 0.0)
     if hasattr(g, "x") and hasattr(g, "y"):
@@ -105,6 +109,7 @@ def _coords_from_geom(g) -> Tuple[float, float]:
 
 
 def _points_array(gdf: gpd.GeoDataFrame) -> np.ndarray:
+    """Преобразует GeoDataFrame геометрий в массив координат Nx2."""
     if gdf is None or len(gdf) == 0:
         return np.empty((0, 2))
     coords = []
@@ -129,6 +134,7 @@ def _respect_min_separation(
     exclude_lonlat: List[Tuple[float, float]],
     min_sep_km: float,
 ) -> bool:
+    """Проверяет, что кандидат не ближе `min_sep_km` к выбранным и исключённым точкам."""
     if min_sep_km <= 0:
         return True
     for elon, elat in exclude_lonlat:
@@ -304,6 +310,7 @@ def _iter_no_fly_geoms(no_fly_zones: Any) -> List[Any]:
 
 
 def is_point_in_no_fly_zone(point: Tuple[float, float], no_fly_zones: Any, safety_buffer: float = 0.0) -> bool:
+    """Проверяет, находится ли точка внутри no-fly зоны (граница считается допустимой)."""
     if no_fly_zones is None:
         return False
     lon, lat = float(point[0]), float(point[1])
@@ -458,6 +465,7 @@ def build_safe_graph(graph: nx.Graph, no_fly_zones: Any, safety_buffer: float = 
 
 
 def _node_lon_lat_from_graph(graph: nx.Graph, nid: Any) -> Optional[Tuple[float, float]]:
+    """Читает координаты узла графа из полей lon/lat или x/y."""
     d = graph.nodes[nid]
     lon = d.get("lon") if isinstance(d, dict) else None
     lat = d.get("lat") if isinstance(d, dict) else None
@@ -470,6 +478,7 @@ def _node_lon_lat_from_graph(graph: nx.Graph, nid: Any) -> Optional[Tuple[float,
     return float(lon), float(lat)
 
 
+# Этап 9: построение маршрута A* с учетом no-fly ограничений.
 def astar_path_safe(
     graph: nx.Graph,
     start_node: Any,
@@ -1169,6 +1178,7 @@ def _build_boundary_arcs_metric(
 
 
 def _calculate_metric_path_length_m(path_xy: List[Tuple[float, float]]) -> float:
+    """Считает длину метрической полилинии как сумму длин сегментов."""
     if not path_xy or len(path_xy) < 2:
         return 0.0
     total = 0.0
@@ -1885,6 +1895,7 @@ def prepare_air_detour_auxiliary(
 
 class StationPlacement:
     def __init__(self, data_service, logger=None):
+        """Инициализирует сервис размещения станций поверх подготовленных городских данных."""
         self.data_service = data_service
         self.logger = logger or logging.getLogger(__name__)
 
@@ -1903,6 +1914,7 @@ class StationPlacement:
         fill_clusters: bool = False,
         cluster_fill_step_m: Optional[float] = None,
     ) -> gpd.GeoDataFrame:
+        """Строит точки спроса для размещения станций (DBSCAN/сетка) через DataService."""
         return self.data_service.get_demand_points_weighted(
             buildings,
             road_graph,
@@ -3587,6 +3599,7 @@ class StationPlacement:
         min_distance_factor: float = 2.0,
         max_to_stations: int = 100,
     ) -> gpd.GeoDataFrame:
+        """Размещает станции ТО рядом с магистралью и покрывает спрос в заданном радиусе."""
         if to_candidates is None or len(to_candidates) == 0:
             return gpd.GeoDataFrame()
         if trunk_graph is None:
@@ -3796,6 +3809,7 @@ class StationPlacement:
         return metrics
 
 
+# Этап 5-11: полный конвейер размещения, графов, маршрутов и эшелонов.
 def run_full_pipeline(
     data_service,
     city_name: str,
@@ -4523,6 +4537,7 @@ def run_full_pipeline(
 
 
 def _empty_fc() -> Dict[str, Any]:
+    """Пустой GeoJSON FeatureCollection."""
     return {"type": "FeatureCollection", "features": []}
 
 
@@ -4556,6 +4571,7 @@ def _gdf_to_fc(gdf: Optional[gpd.GeoDataFrame]) -> Dict[str, Any]:
 
 
 def _list_features_to_fc(features: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
+    """Оборачивает список GeoJSON-фич в FeatureCollection."""
     if not features:
         return _empty_fc()
     return {"type": "FeatureCollection", "features": list(features)}
@@ -4616,6 +4632,7 @@ def _annotate_station_fc_vertical_echelon_links(fc: Dict[str, Any]) -> None:
         )
 
 
+# Этап 12-13: упаковка результата в GeoJSON-слои для карты.
 def pipeline_result_to_geojson(raw: Dict[str, Any]) -> Dict[str, Any]:
     """Ответ API `/api/stations/placement`: слои для карты + метрики и параметры."""
     err = raw.get("error")

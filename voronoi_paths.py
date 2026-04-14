@@ -1,17 +1,9 @@
 """
-Локальные рёбра диаграммы Вороного по кластерам спроса.
-Сайты — центроиды зданий (возможно агрегированные) и точки зарядных станций в кластере.
-Площадь hull (м²) до порога 3_000_000: для не-МКД в однородном малом кластере — 3 здания на сайт;
-МКД в малом кластере (только МКД или в смеси с другими) — 2 здания на сайт.
-Если хотя бы у одного кластера площадь hull строго больше 3_000_000 м², для всех кластеров МКД — 5:1 (5 зданий на сайт);
-не-МКД по-прежнему по локальной площади hull этого кластера (малый — 3 или смешанный режим; крупный локальный — buildings_per_centroid / 60).
-Если ни один hull не превышает порог и в кластере одновременно есть МКД и прочие типы зданий,
-не-МКД — по buildings_per_centroid зданий на сайт (по умолчанию 60).
-Сайты (центроиды), попадающие в no-fly, отбрасываются; для эшелонов 1–3 рёбра режутся отдельно:
-на эшелоне k не летаем над зданием, если height_m ≥ (высота_эшелона_k − 5 м) — см. voronoi_by_echelon.
-Станции стоят на крышах: если высота здания под станцией ≥ этому же порогу, все рёбра, касающиеся станции,
-на этом эшелоне удаляются (union по упрощённым контурам мог не содержать точку станции).
-NFZ учитывается на всех эшелонах (как в _filter_voronoi_fc_linestrings_nfz).
+ТЗ в терминах Voronoi-слоя:
+Этап 4: детализация кластеров (KMeans-агрегация сайтов) -> `_aggregate_points_to_centroids()`.
+Этап 8: локальная маршрутная сеть внутри кластеров -> `build_voronoi_local_paths_fc()`.
+Этап 10: учет no-fly и препятствий -> `_filter_voronoi_fc_linestrings_nfz()`, `_filter_voronoi_fc_building_clearance()`.
+Этап 11: учет эшелонирования (1-3) -> эшелонные фильтры в `build_voronoi_edges_from_pipeline_raw()`.
 """
 from __future__ import annotations
 
@@ -110,6 +102,7 @@ _MAX_INTRA_BRIDGE_PAIR_EVAL = 80_000
 
 
 def _cluster_id_prop_from_key(cid: str) -> Any:
+    """Преобразует строковой ключ кластера в int, если это возможно."""
     try:
         return int(cid)
     except ValueError:
@@ -309,6 +302,7 @@ def _voronoi_cluster_building_centroids(
 
 
 def _normalize_hulls_gdf(hulls_gdf: gpd.GeoDataFrame | None) -> gpd.GeoDataFrame | None:
+    """Приводит hull-данные к EPSG:4326 и гарантирует наличие `cluster_id`."""
     if hulls_gdf is None or len(hulls_gdf) == 0:
         return None
     h = hulls_gdf.to_crs("EPSG:4326").copy()
@@ -322,6 +316,7 @@ def _normalize_hulls_gdf(hulls_gdf: gpd.GeoDataFrame | None) -> gpd.GeoDataFrame
 
 
 def _hull_polygon_for_cluster(hulls_norm: gpd.GeoDataFrame | None, cluster_id: Any):
+    """Возвращает полигон hull для конкретного кластера."""
     if hulls_norm is None or len(hulls_norm) == 0:
         return None
     try:
@@ -339,6 +334,7 @@ def _hull_polygon_for_cluster(hulls_norm: gpd.GeoDataFrame | None, cluster_id: A
 
 
 def _point_in_hull(lon: float, lat: float, hull_poly) -> bool:
+    """Проверяет попадание точки в hull (касающиеся границы точки тоже допустимы)."""
     if hull_poly is None or getattr(hull_poly, "is_empty", True):
         return True
     try:
@@ -458,6 +454,7 @@ def _no_fly_obstacles_union(no_fly_zones: Any) -> Any:
 
 
 def _point_in_nfz_union(lon: float, lat: float, nfz_union: Any) -> bool:
+    """Возвращает True, если точка попадает внутрь объединённой no-fly геометрии."""
     if nfz_union is None or getattr(nfz_union, "is_empty", True):
         return False
     try:
@@ -676,6 +673,7 @@ def _filter_voronoi_fc_station_roof_echelon(
     hmap = _batch_max_building_heights_m_at_lonlat(need_pts, buildings_wgs)
 
     def _h(lo: float, la: float) -> float:
+        # По координате станции возвращаем максимальную высоту здания под ней (или 0.0).
         return float(hmap.get((round(float(lo), 6), round(float(la), 6)), 0.0))
 
     kept: list[dict] = []
@@ -918,11 +916,13 @@ def dedupe_close_parallel_voronoi_edges(
     angle_thr = np.radians(float(max_angle_diff_deg))
 
     def _xy_m(lon: float, lat: float, ref_lat: float) -> tuple[float, float]:
+        # Локальная аппроксимация lon/lat -> метры для оценки длины/угла сегмента.
         m_per_deg_lat = 111_320.0
         m_per_deg_lon = 111_320.0 * np.cos(np.radians(ref_lat))
         return lon * m_per_deg_lon, lat * m_per_deg_lat
 
     def _enrich(feature: dict):
+        # Вычисляет служебные метрики сегмента для дедупликации (длина, угол, midpoint).
         geom = (feature or {}).get("geometry") or {}
         if geom.get("type") != "LineString":
             return None
@@ -1004,6 +1004,7 @@ def dedupe_close_parallel_voronoi_edges(
 
 
 def _require_voronoi():
+    """Ленивая проверка зависимости SciPy и возврат класса Voronoi."""
     try:
         from scipy.spatial import Voronoi
 
@@ -1055,6 +1056,7 @@ def _station_edge_props(
     source_i: int | None = None,
     target_i: int | None = None,
 ) -> dict:
+    """Собирает стандартный набор свойств ребра с метаданными о станциях и источниках."""
     sa = bool(is_station[a]) if a < len(is_station) else False
     sb = bool(is_station[b]) if b < len(is_station) else False
     props: dict[str, Any] = {
@@ -1171,17 +1173,20 @@ def _append_voronoi_edges_for_cluster(
 
 
 def _cluster_label_for_props(cid: Any) -> Any:
+    """Нормализует id кластера для записи в properties GeoJSON."""
     if isinstance(cid, (int, np.integer)):
         return int(cid)
     return str(cid)
 
 
 def _inter_cluster_pair_label(cid_a: Any, cid_b: Any) -> str:
+    """Строит строковый идентификатор пары кластеров в каноническом порядке."""
     sa, sb = sorted((str(cid_a), str(cid_b)))
     return f"{sa}|{sb}"
 
 
 def _canonical_cluster_pair_key(cid_a: Any, cid_b: Any) -> tuple[str, str]:
+    """Возвращает канонический ключ пары кластеров для словарей/множеств."""
     return tuple(sorted((str(cid_a), str(cid_b))))
 
 
@@ -1923,6 +1928,7 @@ def _append_voronoi_edges_global(
     return len(features) > n0
 
 
+# Этап 4 + Этап 8: детализация кластеров и построение локальной Voronoi-сети.
 def build_voronoi_local_paths_fc(
     data_service: DataService,
     city: str,
@@ -1939,6 +1945,7 @@ def build_voronoi_local_paths_fc(
     *,
     city_data: dict | None = None,
 ) -> dict:
+    """Строит локальные Voronoi-рёбра по кластерам с фильтрацией NFZ/препятствий и мостами связности."""
     _require_voronoi()
 
     if city_data is not None:
@@ -2323,6 +2330,7 @@ def build_voronoi_edges_from_station_geojson(geo: dict) -> dict:
     return {"type": "FeatureCollection", "features": out_features}
 
 
+# Этап 10-11: no-fly/препятствия и разбиение Voronoi-рёбер по эшелонам.
 def build_voronoi_edges_from_pipeline_raw(
     data_service: DataService,
     raw: dict,
