@@ -2331,7 +2331,8 @@ def build_voronoi_edges_from_station_geojson(geo: dict) -> dict:
     return {"type": "FeatureCollection", "features": out_features}
 
 
-# Этап 10-11: no-fly/препятствия и разбиение Voronoi-рёбер по эшелонам.
+# Этап 10: учёт no-fly зон и препятствий городской среды в Voronoi-рёбрах.
+# Этап 11: разбиение/фильтрация Voronoi-рёбер по эшелонам (1-3).
 def build_voronoi_edges_from_pipeline_raw(
     data_service: DataService,
     raw: dict,
@@ -2364,6 +2365,7 @@ def build_voronoi_edges_from_pipeline_raw(
 
     hulls_norm = _normalize_hulls_gdf(raw.get("demand_hulls"))
     large_city_mkd_dense = _voronoi_city_has_large_hull_cluster(hulls_norm)
+    # Этап 10: объединяем геометрию no-fly зон для последующей фильтрации точек и рёбер.
     nfz_union_f = _no_fly_obstacles_union(raw.get("no_fly_zones"))
 
     grouped_points: dict[str, list[list[float]]] = {}
@@ -2378,6 +2380,7 @@ def build_voronoi_edges_from_pipeline_raw(
                 lo, la = float(g.x), float(g.y)
             except Exception:
                 continue
+            # Этап 10: отбрасываем точки, попавшие в no-fly.
             if nfz_union_f is not None and _point_in_nfz_union(lo, la, nfz_union_f):
                 continue
             pts.append([lo, la])
@@ -2436,6 +2439,7 @@ def build_voronoi_edges_from_pipeline_raw(
                                 lo, la = float(g.x), float(g.y)
                             except Exception:
                                 continue
+                            # Этап 10: дополнительная очистка fallback-точек зданий от no-fly.
                             if nfz_union_f is not None and _point_in_nfz_union(lo, la, nfz_union_f):
                                 continue
                             sk = str(cid)
@@ -2476,6 +2480,7 @@ def build_voronoi_edges_from_pipeline_raw(
             if cid is None:
                 continue
             lo, la = float(coords[0]), float(coords[1])
+            # Этап 10: станции внутри no-fly не участвуют в построении Voronoi-сети.
             if nfz_union_f is not None and _point_in_nfz_union(lo, la, nfz_union_f):
                 continue
             charging_by_cluster.setdefault(str(cid), []).append([lo, la])
@@ -2504,6 +2509,7 @@ def build_voronoi_edges_from_pipeline_raw(
             pts_arr = np.asarray(pts, dtype=float)
             pts_arr = _aggregate_points_to_centroids(pts_arr, target_group_size)
 
+        # Этап 10: фильтрация сайтов Вороного вне no-fly перед построением рёбер.
         pts_arr, _ = _filter_xy_rows_outside_nfz(pts_arr, None, nfz_union_f)
 
         st_pts = charging_by_cluster.get(str(cluster_id), [])
@@ -2516,6 +2522,7 @@ def build_voronoi_edges_from_pipeline_raw(
             ]
         st_arr = np.asarray(st_pts, dtype=float) if st_pts else None
         pts_arr, is_station = merge_xy_with_station_flags(pts_arr, st_arr)
+        # Этап 10: финальная фильтрация объединённого набора (здания + станции) по no-fly.
         pts_arr, is_station = _filter_xy_rows_outside_nfz(pts_arr, is_station, nfz_union_f)
 
         if len(pts_arr) < 2:
@@ -2538,6 +2545,7 @@ def build_voronoi_edges_from_pipeline_raw(
                 b_w = data_service._compute_building_heights(b_w)
             from station_placement import buildings_footprint_union_min_height_wgs84
 
+            # Этап 11: вычисляем высоты эшелонов для Voronoi-слоёв (1-3).
             v_alts = DataService.voronoi_echelon_altitudes_m(raw.get("flight_levels"))
             levels = list(DataService.VORONOI_FLIGHT_ECHELON_LEVELS)
             vbe: dict[str, dict[str, Any]] = {}
@@ -2549,8 +2557,11 @@ def build_voronoi_edges_from_pipeline_raw(
                     "type": "FeatureCollection",
                     "features": copy.deepcopy(list(fc_pre.get("features") or [])),
                 }
+                # Этап 10: на каждом эшелоне вырезаем рёбра, пересекающие no-fly.
                 fc_i = _filter_voronoi_fc_linestrings_nfz(fc_i, nfz_union_f)
+                # Этап 10: удаляем рёбра, нарушающие clearance относительно высоких зданий.
                 fc_i = _filter_voronoi_fc_building_clearance(fc_i, tall_u)
+                # Этап 11: учитываем ограничение «станция на крыше» для текущего эшелона.
                 fc_i = _filter_voronoi_fc_station_roof_echelon(fc_i, b_w, min_h_b)
                 vbe[str(level)] = {
                     "type": "FeatureCollection",
@@ -2562,6 +2573,7 @@ def build_voronoi_edges_from_pipeline_raw(
             e1 = vbe.get("1")
             if e1:
                 fc_out["features"] = list(e1["features"])
+            # Этап 11: сохраняем отдельные FeatureCollection по эшелонам.
             fc_out["voronoi_by_echelon"] = vbe
             fc_out["voronoi_echelon_levels"] = list(DataService.VORONOI_FLIGHT_ECHELON_LEVELS)
             fc_out["voronoi_echelon_altitudes_m"] = [float(x) for x in v_alts]
@@ -2578,5 +2590,6 @@ def build_voronoi_edges_from_pipeline_raw(
             return fc_out
     except Exception:
         pass
+    # Этап 10: fallback-фильтрация no-fly, если эшелонное построение не удалось.
     fc_out = _filter_voronoi_fc_linestrings_nfz(fc_out, nfz_union_f)
     return fc_out

@@ -4004,6 +4004,7 @@ def run_full_pipeline(
     Запускает полный пайплайн: данные города → спрос → зарядки → гаражи/ТО → магистраль (эшелоны 4–5) → ветки Б→А / гараж и ТО→А (4–5) → локальные Б↔Б (4–5) → слой Вороного (эшелоны 1–3, с сайтами станций).
     """
     logger = logging.getLogger(__name__)
+    # Этап 10: загружаем no-fly и базовые геоданные города для последующих ограничений маршрутизации.
     data = data_service.get_city_data(city_name, network_type=network_type, simplify=simplify, load_no_fly_zones=True)
     buildings = data.get("buildings")
     road_graph = data.get("road_graph")
@@ -4012,6 +4013,7 @@ def run_full_pipeline(
 
     placement = StationPlacement(data_service, logger=logger)
 
+    # Этап 5: подготовка точек спроса, на которые затем ставятся станции инфраструктуры.
     # Важно: если demand_method=dbscan и в get_city_data уже есть demand_points/demand_hulls,
     # то не пересчитываем demand заново (иначе логически будет "DBSCAN районов" второй раз).
     demand = None
@@ -4222,6 +4224,7 @@ def run_full_pipeline(
             demand = _assign_synthetic_regions(demand.copy())
             demand = _repack_regions_by_nearest_clusters(demand, group_size=5)
 
+    # Этап 5: формирование кандидатов и размещение зарядных станций типа A/B.
     candidates_rooftop = data_service.get_station_candidates(
         buildings, city_boundary, no_fly_zones, road_graph, station_type="rooftop"
     )
@@ -4249,7 +4252,7 @@ def run_full_pipeline(
     else:
         charge_candidates = charge_candidates_full
 
-    # Hull-полигоны кластеров нужны для строгой и устойчивой привязки станций к "своей" геометрии.
+    # Этап 5: hull-полигоны кластеров для устойчивой геопривязки станций к своим кластерам.
     cluster_hulls_gdf = None
     if demand_method == "dbscan":
         try:
@@ -4303,6 +4306,7 @@ def run_full_pipeline(
         force_type_a_per_region=True,
         force_type_a_per_cluster=False,
     )
+    # Этап 5: корректная привязка зарядок к геометрии кластера (hull-first + fallback).
     # --- Корректная привязка зарядок к "своей" геометрии кластера ---
     # Мы делаем hull-first привязку:
     # - если точка станции попадает ровно в один hull -> cluster_id = cluster_id этого hull
@@ -4444,6 +4448,7 @@ def run_full_pipeline(
         # - иначе можно полностью потерять размещение, если hull'ы не покрывают точные координаты кандидатов
         # - UI/линии привязки при None просто не смогут построиться корректно, что безопаснее неверного cluster_id.
 
+    # Этап 5: перенос region_id на станции через cluster_id кластеров спроса.
     # Проставляем region_id станциям через cluster_id demand-кластеров.
     if (
         charge_stations is not None
@@ -4489,6 +4494,7 @@ def run_full_pipeline(
             else:
                 charging_buildings_in_clusters = int(demand["n_buildings"].sum())
 
+    # Этап 5: размещение гаражей и станций ТО (доп. инфраструктура).
     # --- Гаражи и ТО: ceil(N_a/3) каждого типа; связь с ближайшими A как у B→A (ветка на карте) ---
     obstacles_union = None
     if no_fly_zones is not None:
@@ -4501,8 +4507,10 @@ def run_full_pipeline(
         except Exception:
             obstacles_union = None
 
+    # Этап 10: объединение no-fly зон с препятствиями городской среды (высокие здания).
     # Маршрутизация и обходы — по геометрии no-fly из данных, без дополнительного метрического буфера.
     # Эшелоны 4–5: магистраль А–А, ветки Б→А, локальные Б↔Б, гараж→А, ТО→А — высокие здания как NFZ (см. DataService).
+    # Этап 11: применение порогов высот для эшелонов 4-5 при формировании препятствий маршрутизации.
     obstacles_routing = obstacles_union
     try:
         from data_service import DataService
@@ -4560,6 +4568,7 @@ def run_full_pipeline(
         garages = gpd.GeoDataFrame()
         to_stations = gpd.GeoDataFrame()
 
+    # Этап 6: построение транспортного "воздушного" графа для поиска безопасных маршрутов.
     # Магистраль на карте — только между зарядками A. Ветки спутник→A в пайплайне не строятся.
     # Воздушный граф БПЛА строим отдельно как сетку свободного пространства,
     # чтобы detour обходил no-fly зоны "по воздуху", а не по дорогам.
@@ -4582,6 +4591,7 @@ def run_full_pipeline(
         logger.warning("Не удалось построить воздушный граф для обходов: %s", e)
         uav_air_graph = None
 
+    # Этап 7: формирование магистральных связей между опорными станциями A (trunk).
     trunk = placement.build_trunk_graph(
         charge_stations,
         gpd.GeoDataFrame(),
@@ -4604,6 +4614,8 @@ def run_full_pipeline(
                 if trunk.has_node(nid):
                     charge_stations.iloc[pos, charge_stations.columns.get_loc("trunk_degree")] = int(trunk.degree[nid])
     cs_for_edges = charge_stations if charge_stations is not None else gpd.GeoDataFrame()
+    # Этап 6: добавление ветвей инфраструктурного транспортного графа (B->A, гаражи/ТО -> A).
+    # Этап 9: маршруты ветвей строятся с обходами (A*/detour) через air_graph и obstacles.
     branch_edges = placement.build_branch_edges(
         cs_for_edges,
         max_b_per_type_a=MAX_TYPE_B_BRANCHES_PER_TYPE_A,
@@ -4623,6 +4635,8 @@ def run_full_pipeline(
             no_fly_safety_buffer=0.0,
         )
     )
+    # Этап 8: формирование локальной маршрутной сети (локальные связи внутри кластеров станций).
+    # Этап 9: локальные связи также строятся через безопасную маршрутизацию с обходом препятствий.
     local_edges = placement.build_local_edges(
         cs_for_edges,
         obstacles_routing,
@@ -4634,6 +4648,7 @@ def run_full_pipeline(
 
     from voronoi_paths import build_voronoi_local_paths_fc, charging_station_gdfs_to_features
 
+    # Этап 8: построение внутрикластерной сети Вороного с учётом расставленных станций.
     st_voronoi_features = charging_station_gdfs_to_features(
         charge_stations if charge_stations is not None and len(charge_stations) > 0 else None,
         garages if garages is not None and len(garages) > 0 else None,
@@ -4641,6 +4656,8 @@ def run_full_pipeline(
     )
     st_voronoi_arg: Optional[List[Dict[str, Any]]] = st_voronoi_features if st_voronoi_features else None
     try:
+        # Этап 10: фильтрация рёбер Вороного по no-fly и городским препятствиям.
+        # Этап 11: построение и возврат Voronoi-слоёв по эшелонам 1-3.
         voronoi_edges = build_voronoi_local_paths_fc(
             data_service,
             city_name,

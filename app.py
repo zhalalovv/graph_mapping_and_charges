@@ -506,6 +506,8 @@ def get_stations_placement(
     Полный пайплайн: зарядки A/B, гаражи/ТО, магистраль A–A, ветки B→A и гараж/ТО→A, локальные Б↔Б, слой Вороного (как у GET /api/buildings/voronoi-local-paths, с учётом точек станций в кластерах).
     Кэш в Redis — JSON ответа для карты.
     """
+    # Этапы 5-11: здесь выполняется orchestration полного пайплайна
+    # (конкретная детализация по этапам находится внутри `run_full_pipeline`).
     cache_key = _placement_cache_key(
         city=city,
         network_type=network_type,
@@ -520,6 +522,7 @@ def get_stations_placement(
     )
     redis_client = data_service.get_redis_client()
 
+    # Служебный pre-step: чтение сохранённого результата (без пересчёта этапов 5-11).
     if only_saved:
         if redis_client is None:
             raise HTTPException(status_code=503, detail="Redis недоступен")
@@ -528,6 +531,7 @@ def get_stations_placement(
             raise HTTPException(status_code=404, detail="Нет сохранённой расстановки")
         return JSONResponse(json.loads(cached.decode("utf-8")))
 
+    # Служебный pre-step: быстрый возврат кэшированного результата, если есть.
     if use_saved and redis_client is not None:
         cached = redis_client.get(cache_key)
         if cached:
@@ -537,6 +541,7 @@ def get_stations_placement(
 
     try:
         logger.info("Пайплайн placement: run_full_pipeline")
+        # Этап 5-11: запуск вычислительного пайплайна (размещение, графы, маршруты, no-fly, эшелоны).
         raw = run_full_pipeline(
             data_service,
             city.strip(),
