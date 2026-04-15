@@ -49,9 +49,14 @@ NO_FLY_CLEARANCE_M = 0.0
 # Максимум станций типа Б, присоединённых веткой к одной станции типа А.
 MAX_TYPE_B_BRANCHES_PER_TYPE_A = 4
 
-# Выбор между boundary и A*: сначала минимизируем длину/хорду (насколько обход близок к прямой), затем абсолютную длину.
+# Выбор между boundary и A*: минимизируем комбинированный score (длина/хорда + «вылет» от хорды).
 # Доп. штраф за километры «сверх хорды» (слабее ratio, чтобы не ломать выбор при почти равных ratio).
 DETOUR_SCORE_EXCESS_PER_KM = 0.08
+# Штраф за слишком широкий обход: max поперечное отклонение от хорды / длина хорды (безразмерно),
+# сверх «бесплатной» доли DETOUR_BULGE_FREE_RATIO — иначе boundary вдоль огромного полигона NFZ
+# часто выигрывает у A* по длине, но рисует огромные «петли» на карте.
+DETOUR_SCORE_BULGE = 0.52
+DETOUR_BULGE_FREE_RATIO = 0.12
 
 # Шаг дискретизации контура при обходе по границе (метры) — меньше = плавнее повороты.
 NO_FLY_BOUNDARY_STEP_M = 10.0
@@ -72,6 +77,12 @@ DETOUR_SMOOTH_SCHEDULE: Tuple[Tuple[float, int], ...] = (
     (0.22, 3),
     (0.20, 2),
 )
+# Ограничители «вылетов» после сглаживания детура:
+# - рост длины относительно базового (до сглаживания);
+# - рост максимального поперечного отклонения от хорды start->end.
+DETOUR_SMOOTH_MAX_LENGTH_GROWTH = 1.12
+DETOUR_SMOOTH_MAX_OFFSET_GROWTH = 1.22
+DETOUR_SMOOTH_MAX_OFFSET_EXTRA_M = 120.0
 # Обратная совместимость имён (если где-то импортировали константу).
 DETOUR_SMOOTH_EDGE_FRACS: Tuple[float, ...] = tuple(f for f, _ in DETOUR_SMOOTH_SCHEDULE)
 # Параметры сетки «воздушного» графа для A* (плотнее — короче допустимый обход при тех же ограничениях).
@@ -1021,6 +1032,44 @@ def remove_self_intersections_lonlat(
     return pts
 
 
+def route_max_cross_track_offset_m(
+    coords_lonlat: Optional[List[Tuple[float, float]]],
+    *,
+    anchor_lonlat: Tuple[float, float],
+) -> Optional[float]:
+    """Максимальное поперечное отклонение маршрута от хорды (start->end) в метрах."""
+    if coords_lonlat is None or len(coords_lonlat) < 2:
+        return None
+    try:
+        pts = [(float(lo), float(la)) for lo, la in coords_lonlat]
+        if len(pts) < 2:
+            return None
+        utm_epsg = _utm_epsg_from_lonlat(float(anchor_lonlat[0]), float(anchor_lonlat[1]))
+        fwd = Transformer.from_crs(CRS.from_epsg(4326), CRS.from_epsg(utm_epsg), always_xy=True)
+        p0x, p0y = fwd.transform(float(pts[0][0]), float(pts[0][1]))
+        p1x, p1y = fwd.transform(float(pts[-1][0]), float(pts[-1][1]))
+        vx = float(p1x) - float(p0x)
+        vy = float(p1y) - float(p0y)
+        vv = float(vx * vx + vy * vy)
+        best = 0.0
+        for lo, la in pts:
+            px, py = fwd.transform(float(lo), float(la))
+            wx = float(px) - float(p0x)
+            wy = float(py) - float(p0y)
+            if vv <= 1e-12:
+                d = float(np.hypot(wx, wy))
+            else:
+                t = max(0.0, min(1.0, float((wx * vx + wy * vy) / vv)))
+                qx = float(p0x) + t * vx
+                qy = float(p0y) + t * vy
+                d = float(np.hypot(float(px) - qx, float(py) - qy))
+            if d > best:
+                best = d
+        return float(best)
+    except Exception:
+        return None
+
+
 def polish_detour_polyline(
     coords_lonlat: List[Tuple[float, float]],
     nfz_union: Any,
@@ -1833,16 +1882,39 @@ def route_lonlat_segment_with_nfz_detours(
         return None
 
     chord_ref = max(float(d_km), 1e-9)
-
-    candidates.sort(
-        key=lambda t: (
-            (t[0] / chord_ref) + float(DETOUR_SCORE_EXCESS_PER_KM) * max(0.0, t[0] - chord_ref),
-            t[0],
-        )
+    anchor_score = (
+        (float(utm_anchor_lonlat[0]), float(utm_anchor_lonlat[1]))
+        if utm_anchor_lonlat is not None
+        else (float(lon1 + lon2) / 2.0, float(lat1 + lat2) / 2.0)
     )
+
+    def _detour_candidate_sort_key(t: Tuple[float, List[Tuple[float, float]], str]) -> Tuple[float, float]:
+        len_km, coords, _how = t
+        off_m = route_max_cross_track_offset_m(coords, anchor_lonlat=anchor_score)
+        bulge_ratio = 0.0
+        if off_m is not None:
+            bulge_ratio = (float(off_m) / 1000.0) / chord_ref
+        ratio = float(len_km) / chord_ref
+        excess_km = max(0.0, float(len_km) - chord_ref)
+        bulge_pen = float(DETOUR_SCORE_BULGE) * max(0.0, bulge_ratio - float(DETOUR_BULGE_FREE_RATIO))
+        primary = ratio + float(DETOUR_SCORE_EXCESS_PER_KM) * excess_km + bulge_pen
+        return (primary, float(len_km))
+
+    candidates.sort(key=_detour_candidate_sort_key)
     detour_len, detour_coords, how = candidates[0]
     detour_coords = _tighten_detour_route(detour_coords)
     detour_coords = remove_self_intersections_lonlat(detour_coords) or detour_coords
+    base_detour_coords = list(detour_coords) if detour_coords is not None else None
+    base_detour_len = _route_length_km(base_detour_coords)
+    anchor_for_offset = (
+        (float(utm_anchor_lonlat[0]), float(utm_anchor_lonlat[1]))
+        if utm_anchor_lonlat is not None
+        else (float(lon1 + lon2) / 2.0, float(lat1 + lat2) / 2.0)
+    )
+    base_offset_m = route_max_cross_track_offset_m(
+        base_detour_coords,
+        anchor_lonlat=anchor_for_offset,
+    )
     if detour_coords is not None:
         rl0 = _route_length_km(detour_coords)
         if rl0 is not None:
@@ -1881,6 +1953,30 @@ def route_lonlat_segment_with_nfz_detours(
         rl2 = _route_length_km(detour_coords)
         if rl2 is not None:
             detour_len = float(rl2)
+        cur_offset_m = route_max_cross_track_offset_m(detour_coords, anchor_lonlat=anchor_for_offset)
+        if (
+            base_detour_coords is not None
+            and base_detour_len is not None
+            and cur_offset_m is not None
+            and base_offset_m is not None
+        ):
+            too_long = float(detour_len) > float(base_detour_len) * float(DETOUR_SMOOTH_MAX_LENGTH_GROWTH)
+            max_allowed_offset = max(
+                float(base_offset_m) * float(DETOUR_SMOOTH_MAX_OFFSET_GROWTH),
+                float(base_offset_m) + float(DETOUR_SMOOTH_MAX_OFFSET_EXTRA_M),
+            )
+            too_wide = float(cur_offset_m) > max_allowed_offset
+            if too_long or too_wide:
+                detour_coords = list(base_detour_coords)
+                detour_len = float(base_detour_len)
+                log.debug(
+                    "Сглаживание отклонено для %s: вылет (len %.3f->%.3f км, offset %.1f->%.1f м)",
+                    lbl,
+                    float(base_detour_len),
+                    float(rl2) if rl2 is not None else float(detour_len),
+                    float(base_offset_m),
+                    float(cur_offset_m),
+                )
         # Не вызывать _tighten_detour_route после Chaikin: сжатие снова оставляет 3–4 угла и ломает скругление.
     ratio = float(detour_len) / chord_ref
     log.info(

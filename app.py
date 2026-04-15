@@ -98,7 +98,7 @@ def _placement_cache_key(
         "voronoi_intra_bridge_max_m": float(voronoi_intra_bridge_max_m),
         # Смена версии сбрасывает устаревший Redis-кэш (иначе после правок пайплайна
         # клиент может бесконечно получать пустой сохранённый ответ).
-        "placement_schema": 41,
+        "placement_schema": 42,
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()

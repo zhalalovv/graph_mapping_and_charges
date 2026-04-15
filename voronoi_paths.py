@@ -1,5 +1,4 @@
 """
-ТЗ в терминах Voronoi-слоя:
 Этап 4: детализация кластеров (KMeans-агрегация сайтов) -> `_aggregate_points_to_centroids()`.
 Этап 8: локальная маршрутная сеть внутри кластеров -> `build_voronoi_local_paths_fc()`.
 Этап 10: учет no-fly и препятствий -> `_filter_voronoi_fc_linestrings_nfz()`, `_filter_voronoi_fc_building_clearance()`.
