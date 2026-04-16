@@ -1158,16 +1158,61 @@
         async function loadStationsFromRedis() {
             const city = getCityQuery();
             const statsEl = document.getElementById('stationsRulesStats');
+            const statusEl = document.getElementById('status');
+            const stationsPanel = document.getElementById('stationsPanel');
+            const clustersPanel = document.getElementById('clustersPanel');
+            const buildingsPanel = document.getElementById('buildingsPanel');
             if (!city) {
                 alert('Сначала выберите город');
                 return;
             }
-            if (statsEl) statsEl.textContent = 'Загрузка: город и кластеры…';
+            ensureMap();
+            if (stationsPanel) stationsPanel.style.display = 'block';
+            if (clustersPanel) clustersPanel.style.display = 'none';
+            if (buildingsPanel) buildingsPanel.style.display = 'none';
+            if (statusEl) statusEl.textContent = 'Загрузка placement из Redis…';
+            if (statsEl) statsEl.textContent = 'Загрузка путей из БД (Redis)…';
             try {
-                // 1) Город + здания + кластеры
-                await loadCityMap(false, false);
-                if (statsEl) statsEl.textContent = 'Загрузка: расстановка из Redis…';
-                // 2) Расстановка из Redis (без пересчёта)
+                // Убираем кластеры, если они были на карте
+                if (clustersLayer) {
+                    map.removeLayer(clustersLayer);
+                    clustersLayer = null;
+                }
+                if (clusterHullsLayer) {
+                    map.removeLayer(clusterHullsLayer);
+                    clusterHullsLayer = null;
+                }
+                if (clusterPointsLayer) {
+                    map.removeLayer(clusterPointsLayer);
+                    clusterPointsLayer = null;
+                }
+                const pointsBtn = document.getElementById('toggleClusterPointsBtn');
+                if (pointsBtn) pointsBtn.style.display = 'none';
+
+                // Подстраиваем карту под город (но без перерисовки слоёв города и кластеров)
+                try {
+                    const mapUrl = new URL('/api/city/map', window.location.origin);
+                    mapUrl.searchParams.set('city', city);
+                    mapUrl.searchParams.set('network_type', 'drive');
+                    mapUrl.searchParams.set('simplify', 'true');
+                    mapUrl.searchParams.set('force_refresh', 'false');
+                    const mapResp = await fetch(mapUrl);
+                    if (mapResp.ok) {
+                        const mapData = await mapResp.json();
+                        if (mapData && mapData.center) {
+                            map.setView([mapData.center.lat, mapData.center.lon], 11);
+                        }
+                        const bbox = mapData && mapData.bbox;
+                        if (bbox && bbox.length >= 4) {
+                            const [minLon, minLat, maxLon, maxLat] = bbox;
+                            map.fitBounds(L.latLngBounds([[minLat, minLon], [maxLat, maxLon]]), { padding: [20, 20] });
+                        }
+                    }
+                } catch (e) {
+                    console.warn('Не удалось получить bbox города для перемещения карты:', e);
+                }
+
+                // Загружаем только сохранённую расстановку (пути/станции) из Redis, без пересчёта и без перезагрузки города
                 const url = buildStationsPlacementUrl(true, true);
                 const resp = await fetch(url);
                 if (!resp.ok) {
@@ -1176,8 +1221,10 @@
                 }
                 const data = await resp.json();
                 renderStationsRulesPlacement(data);
+                if (statusEl) statusEl.textContent = '✓ Placement загружен из Redis';
             } catch (e) {
                 console.error(e);
+                if (statusEl) statusEl.textContent = '✗ Ошибка загрузки из Redis';
                 if (statsEl) statsEl.textContent = 'Ошибка: ' + e.message;
             }
         }
