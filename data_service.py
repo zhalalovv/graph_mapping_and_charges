@@ -49,6 +49,15 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"osmnx\.f
 
 class DataService:
     def __init__(self, cache_dir="cache_data"):
+        """
+        Сервис доступа к геоданным и подготовке данных для пайплайна БПЛА.
+
+        - Загрузка OSM/границ/зданий: `get_city_data()`, `_download_city_data()`.
+        - Обработка и нормализация геоданных: `_compute_building_heights()`, `ensure_flight_levels()`.
+        - Кластеризация зданий DBSCAN: `get_demand_points_weighted()`.
+        - Кандидаты под инфраструктуру: `get_station_candidates()`.
+        - Запретные зоны и препятствия: `_get_no_fly_zones()`, высотные методы эшелонов.
+        """
         # Локальный кэш на диске больше не используется как хранилище данных.
         # Параметр оставлен для совместимости, но директории мы не создаём и файлы не пишем.
         self.cache_dir = cache_dir
@@ -69,15 +78,35 @@ class DataService:
             # Локальный диск для кэша данных больше не используется
             self.logger.info("Redis not available for DataService cache; диск как кэш не используется")
     
+    # PATTERN: Observer — внешние подписчики регистрируются и получают события прогресса.
+    # Почему: DataService не знает, кто слушатель; он лишь рассылает уведомления всем callbacks.
     def add_progress_callback(self, callback):
+        """Регистрирует callback для статуса этапов загрузки/обработки."""
         self.progress_callbacks.append(callback)
     
+    # PATTERN: Observer — единая точка нотификации всех подписанных обработчиков.
+    # Почему: событие прогресса транслируется списку listeners без жёсткой связки с UI/API.
     def _update_progress(self, stage, percentage, message=""):
+        """Публикует прогресс во все зарегистрированные callbacks."""
         for callback in self.progress_callbacks:
             callback(stage, percentage, message)
     
-    def get_city_data(self, city_name: str, network_type: str = 'drive', simplify: bool = True, load_no_fly_zones: bool = True):
-        """Получение данных города (универсально для любой страны). load_no_fly_zones=False — только дороги, без загрузки беспилотных зон."""
+    # PATTERN: Facade — единый «вход» в сложный процесс загрузки/кэша/нормализации.
+    # Почему: вызывающий код использует один метод вместо множества внутренних шагов и fallback-сценариев.
+    # Этап 1: вход в загрузку данных города из кэша/OSM.
+    def get_city_data(
+        self,
+        city_name: str,
+        network_type: str = 'drive',
+        simplify: bool = True,
+        load_no_fly_zones: bool = True,
+        force_refresh: bool = False,
+    ):
+        """Получение данных города (универсально для любой страны).
+
+        load_no_fly_zones=False — только дороги, без загрузки беспилотных зон.
+        force_refresh=True — принудительно загружает свежие данные из OSM и обновляет Redis-кэш.
+        """
         normalized_name = city_name.strip()
         # Для совместимости: при load_no_fly_zones=True ключ без суффикса (старый кэш); при False — __nofly0
         base_suffix = f"{self._sanitize_name(normalized_name)}__{self._sanitize_name(network_type)}__{int(bool(simplify))}"
@@ -85,8 +114,8 @@ class DataService:
         redis_key = f"drone_planner:city:{key_suffix}"
         redis_clusters_key = f"drone_planner:city_clusters:{key_suffix}"
         
-        # Try Redis first
-        if self._redis is not None:
+        # Try Redis first (если не запрошено принудительное обновление)
+        if self._redis is not None and not force_refresh:
             try:
                 blob = self._redis.get(redis_key)
                 if blob:
@@ -168,7 +197,9 @@ class DataService:
             load_no_fly_zones=load_no_fly_zones,
         )
     
+    # Этап 1: фактическая загрузка дорог/границ/зданий и no-fly из OSM.
     def _download_city_data(self, city_name, redis_key: str | None = None, clusters_redis_key: str | None = None, *, network_type: str = 'drive', simplify: bool = True, load_no_fly_zones: bool = True):
+        """Загружает геоданные из OSM и формирует нормализованный пакет данных города."""
         self._update_progress("download", 0, "Начало загрузки данных")
         
         try:
@@ -766,13 +797,10 @@ class DataService:
         'school', 'university', 'college', 'hospital', 'kindergarten', 'civic', 'government',
         'train_station', 'service',
     ))
-    # Вес спроса: многоквартирники дают повышенный спрос (больше людей)
-    APARTMENT_DEMAND_WEIGHT = 4
 
     def _filter_buildings_for_demand(self, buildings: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         """
         Оставляет только здания, релевантные для спроса: жилые и часть коммерции (retail/office).
-        Пром/склады исключены.
         """
         if buildings is None or len(buildings) == 0:
             return buildings
@@ -807,6 +835,9 @@ class DataService:
             out["area_m2"] = 0.0
             return out
 
+    # PATTERN: Strategy — выбор алгоритма кластеризации через параметр method.
+    # Почему: один и тот же контракт функции поддерживает разные взаимозаменяемые стратегии (grid/dbscan).
+    # Этап 3: формирование кластеров спроса (DBSCAN) и их hull.
     def get_demand_points_weighted(
         self,
         buildings: gpd.GeoDataFrame,
@@ -1070,6 +1101,7 @@ class DataService:
         hull_rows = [] if (method == "dbscan" and return_hulls) else None
         if method == "dbscan" and use_utm and crs_utm is not None:
             try:
+                # Этап 3 (DBSCAN): основной алгоритм кластеризации спроса по координатам зданий.
                 from sklearn.cluster import DBSCAN
                 from pyproj import Transformer
                 eps_m = dbscan_eps_m
@@ -1087,6 +1119,7 @@ class DataService:
                     fill_step_m = max(400.0, float(eps_m) * 2.0)
                 from shapely.ops import transform as sh_transform
 
+                # Этап 4 (KMeans): детализация крупных DBSCAN-кластеров на подгруппы.
                 from sklearn.cluster import KMeans, MiniBatchKMeans
                 MAX_WEIGHT_PER_HULL = 10000.0
                 # За один вызов KMeans не дробим на тысячи кластеров — только порциями, иначе 80k+ точек «висит» часами.
@@ -1122,9 +1155,11 @@ class DataService:
                             max_iter=200,
                             reassignment_ratio=0.02,
                         )
+                        # Этап 4 (KMeans): запуск MiniBatchKMeans для больших выборок.
                         return np.asarray(mb.fit(sub_pts).labels_, dtype=int)
                     n_init = 5 if n < 8000 else 3
                     km = KMeans(n_clusters=k, random_state=42, n_init=n_init, max_iter=300)
+                    # Этап 4 (KMeans): запуск классического KMeans для умеренных размеров кластера.
                     return np.asarray(km.fit(sub_pts).labels_, dtype=int)
 
                 def _partition_by_target_weight(indices):
@@ -1343,9 +1378,11 @@ class DataService:
                 _dbscan_kw = {"eps": REGION_EPS_M, "min_samples": REGION_MIN_SAMPLES, "metric": "euclidean"}
                 _dbscan_kw["n_jobs"] = -1
                 try:
+                    # Этап 3 (DBSCAN): первичный fit по всем точкам спроса в UTM.
                     region_labels = np.array(DBSCAN(**_dbscan_kw).fit(pts_utm).labels_, dtype=int)
                 except TypeError:
                     _dbscan_kw.pop("n_jobs", None)
+                    # Этап 3 (DBSCAN): fallback fit без n_jobs для совместимости версий sklearn.
                     region_labels = np.array(DBSCAN(**_dbscan_kw).fit(pts_utm).labels_, dtype=int)
                 self.logger.info("DBSCAN районов завершён, разбиение по весу %.0f…", MAX_WEIGHT_PER_HULL)
                 region_ids = sorted(set(region_labels) - {-1})
@@ -1618,6 +1655,7 @@ class DataService:
         return tag in cls._PRIVATE_BUILDING_TAGS
     
     def _sanitize_name(self, name):
+        """Нормализует строку для безопасного использования в ключах кэша."""
         import re
         name = re.sub(r'[^\w\s-]', '', name)
         return re.sub(r'[-\s]+', '_', name).strip('_')[:100]
@@ -1656,6 +1694,7 @@ class DataService:
             return num
         return None
 
+    # Этап 2: нормализация высот зданий из OSM-тегов.
     def _compute_building_heights(self, buildings: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         """
         Добавляет колонку height_m к зданиям на основе OSM-тегов.
@@ -1809,6 +1848,7 @@ class DataService:
         """Синоним порога для всех маршрутов станций на эшелонах 4–5 (см. magistral_building_obstacle_min_height_m)."""
         return DataService.magistral_building_obstacle_min_height_m(flight_levels)
 
+    # Этап 11: расчет/проверка эшелонов воздушного пространства в пакете данных.
     def ensure_flight_levels(self, data: dict, num_levels: int | None = None) -> dict:
         """
         Добавляет в data поля buildings (с height_m), building_height_stats, flight_levels.

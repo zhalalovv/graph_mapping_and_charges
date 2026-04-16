@@ -1,15 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-Размещение станций зарядки, гаражей и ТО по правилам:
-- Зарядка+ожидание (туда-обратно): R_charge = 0.4 * D_max = 6.4 км (FlyCart 30, D_max=16 км).
-- Гаражи/ТО (в одну сторону): R_garage/TO = 0.8 * D_max = 12.8 км.
-
 Шаги:
-  1) Точки спроса (кластеры/сетка 250×250 м с весом).
-  2) Зарядки: weighted maximum coverage / set cover (жадный).
+  1) Зоны спроса
+  2) Зарядки
   3) Гаражи и ТО: по ceil(N_A/3) каждого, промзона; разнос между точками и от зарядок (см. MIN_FACILITY_SEPARATION_KM); ветви только к ближайшей зарядке A.
   4) Магистраль: только между станциями Charge_A (MST по A); станции Б — по одной ветке к A (глобальный min-cost при квоте MAX_TYPE_B_BRANCHES_PER_TYPE_A Б на A), плюс до двух локальных связей Б↔Б; гараж/ТО — только к A.
   5) Локальная сеть Б↔Б, метрики; в ответе placement — полный слой Вороного (сайты зданий + станции с cluster_id).
+
+Тут реализовано:
+Этап 5: размещение инфраструктурных объектов -> `StationPlacement` и жадные функции покрытия.
+Этап 6-7: транспортный граф и магистраль -> `run_full_pipeline()` + trunk/branch сборка.
+Этап 8: локальная внутрикластерная сеть -> слой Voronoi подключается в финале пайплайна.
+Этап 9-10: маршруты A* и обход препятствий/no-fly -> `astar_path_safe()` и detour-функции.
+Этап 11: эшелонирование -> эшелоны 4-5 для магистралей/ветвей, 1-3 для Voronoi (через соседний модуль).
 """
 
 from __future__ import annotations
@@ -46,9 +49,14 @@ NO_FLY_CLEARANCE_M = 0.0
 # Максимум станций типа Б, присоединённых веткой к одной станции типа А.
 MAX_TYPE_B_BRANCHES_PER_TYPE_A = 4
 
-# Выбор между boundary и A*: сначала минимизируем длину/хорду (насколько обход близок к прямой), затем абсолютную длину.
+# Выбор между boundary и A*: минимизируем комбинированный score (длина/хорда + «вылет» от хорды).
 # Доп. штраф за километры «сверх хорды» (слабее ratio, чтобы не ломать выбор при почти равных ratio).
 DETOUR_SCORE_EXCESS_PER_KM = 0.08
+# Штраф за слишком широкий обход: max поперечное отклонение от хорды / длина хорды (безразмерно),
+# сверх «бесплатной» доли DETOUR_BULGE_FREE_RATIO — иначе boundary вдоль огромного полигона NFZ
+# часто выигрывает у A* по длине, но рисует огромные «петли» на карте.
+DETOUR_SCORE_BULGE = 0.52
+DETOUR_BULGE_FREE_RATIO = 0.12
 
 # Шаг дискретизации контура при обходе по границе (метры) — меньше = плавнее повороты.
 NO_FLY_BOUNDARY_STEP_M = 10.0
@@ -69,6 +77,12 @@ DETOUR_SMOOTH_SCHEDULE: Tuple[Tuple[float, int], ...] = (
     (0.22, 3),
     (0.20, 2),
 )
+# Ограничители «вылетов» после сглаживания детура:
+# - рост длины относительно базового (до сглаживания);
+# - рост максимального поперечного отклонения от хорды start->end.
+DETOUR_SMOOTH_MAX_LENGTH_GROWTH = 1.12
+DETOUR_SMOOTH_MAX_OFFSET_GROWTH = 1.22
+DETOUR_SMOOTH_MAX_OFFSET_EXTRA_M = 120.0
 # Обратная совместимость имён (если где-то импортировали константу).
 DETOUR_SMOOTH_EDGE_FRACS: Tuple[float, ...] = tuple(f for f, _ in DETOUR_SMOOTH_SCHEDULE)
 # Параметры сетки «воздушного» графа для A* (плотнее — короче допустимый обход при тех же ограничениях).
@@ -94,6 +108,7 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def _coords_from_geom(g) -> Tuple[float, float]:
+    """Извлекает координаты (lon, lat) из Point/геометрии (через centroid как fallback)."""
     if g is None:
         return (0.0, 0.0)
     if hasattr(g, "x") and hasattr(g, "y"):
@@ -105,6 +120,7 @@ def _coords_from_geom(g) -> Tuple[float, float]:
 
 
 def _points_array(gdf: gpd.GeoDataFrame) -> np.ndarray:
+    """Преобразует GeoDataFrame геометрий в массив координат Nx2."""
     if gdf is None or len(gdf) == 0:
         return np.empty((0, 2))
     coords = []
@@ -129,6 +145,7 @@ def _respect_min_separation(
     exclude_lonlat: List[Tuple[float, float]],
     min_sep_km: float,
 ) -> bool:
+    """Проверяет, что кандидат не ближе `min_sep_km` к выбранным и исключённым точкам."""
     if min_sep_km <= 0:
         return True
     for elon, elat in exclude_lonlat:
@@ -304,6 +321,7 @@ def _iter_no_fly_geoms(no_fly_zones: Any) -> List[Any]:
 
 
 def is_point_in_no_fly_zone(point: Tuple[float, float], no_fly_zones: Any, safety_buffer: float = 0.0) -> bool:
+    """Проверяет, находится ли точка внутри no-fly зоны (граница считается допустимой)."""
     if no_fly_zones is None:
         return False
     lon, lat = float(point[0]), float(point[1])
@@ -458,6 +476,7 @@ def build_safe_graph(graph: nx.Graph, no_fly_zones: Any, safety_buffer: float = 
 
 
 def _node_lon_lat_from_graph(graph: nx.Graph, nid: Any) -> Optional[Tuple[float, float]]:
+    """Читает координаты узла графа из полей lon/lat или x/y."""
     d = graph.nodes[nid]
     lon = d.get("lon") if isinstance(d, dict) else None
     lat = d.get("lat") if isinstance(d, dict) else None
@@ -470,6 +489,7 @@ def _node_lon_lat_from_graph(graph: nx.Graph, nid: Any) -> Optional[Tuple[float,
     return float(lon), float(lat)
 
 
+# Этап 9: построение маршрута A* с учетом no-fly ограничений.
 def astar_path_safe(
     graph: nx.Graph,
     start_node: Any,
@@ -854,6 +874,51 @@ def smooth_lonlat_polyline_chaikin(
     return out
 
 
+def densify_lonlat_polyline_metric(
+    coords_lonlat: List[Tuple[float, float]],
+    anchor_lon: float,
+    anchor_lat: float,
+    *,
+    max_step_m: float = 180.0,
+    max_output_points: int = 48,
+) -> List[Tuple[float, float]]:
+    """
+    Уплотняет ломаную в UTM: на длинных сегментах добавляет промежуточные точки
+    с шагом не больше max_step_m. Концы сохраняются.
+    """
+    if len(coords_lonlat) < 2:
+        return list(coords_lonlat)
+    step_m = max(20.0, float(max_step_m))
+    utm_epsg = _utm_epsg_from_lonlat(float(anchor_lon), float(anchor_lat))
+    src_crs = CRS.from_epsg(4326)
+    dst_crs = CRS.from_epsg(utm_epsg)
+    fwd = Transformer.from_crs(src_crs, dst_crs, always_xy=True)
+    inv = Transformer.from_crs(dst_crs, src_crs, always_xy=True)
+    xy = [fwd.transform(float(lo), float(la)) for lo, la in coords_lonlat]
+    out_xy: List[Tuple[float, float]] = [tuple(xy[0])]
+    for i in range(len(xy) - 1):
+        x0, y0 = xy[i]
+        x1, y1 = xy[i + 1]
+        dx = float(x1) - float(x0)
+        dy = float(y1) - float(y0)
+        seg_len = float(np.hypot(dx, dy))
+        n_parts = max(1, int(np.ceil(seg_len / step_m)))
+        for k in range(1, n_parts + 1):
+            t = float(k) / float(n_parts)
+            out_xy.append((float(x0 + t * dx), float(y0 + t * dy)))
+            if len(out_xy) >= max(8, int(max_output_points)):
+                break
+        if len(out_xy) >= max(8, int(max_output_points)):
+            break
+    if out_xy[-1] != tuple(xy[-1]):
+        out_xy.append(tuple(xy[-1]))
+    out: List[Tuple[float, float]] = []
+    for x, y in out_xy:
+        lo, la = inv.transform(float(x), float(y))
+        out.append((float(lo), float(la)))
+    return out
+
+
 def route_coords_clear_of_nfz(
     route_coords: Optional[List[Tuple[float, float]]],
     nfz_union: Any,
@@ -897,6 +962,114 @@ def route_coords_clear_of_nfz(
         return False
 
 
+def remove_self_intersections_lonlat(
+    coords_lonlat: Optional[List[Tuple[float, float]]],
+    *,
+    max_passes: int = 16,
+    eps: float = 1e-9,
+) -> Optional[List[Tuple[float, float]]]:
+    """
+    Удаляет «петли» (самопересечения) из ломаной, сохраняя непрерывный путь start->end.
+    Идём слева направо и при первом не-соседнем пересечении вырезаем внутренний цикл.
+    """
+    if coords_lonlat is None:
+        return None
+    pts: List[Tuple[float, float]] = [(float(lo), float(la)) for lo, la in coords_lonlat]
+    if len(pts) < 4:
+        return pts
+
+    def _dedup_consecutive(seq: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+        if not seq:
+            return seq
+        out = [seq[0]]
+        for p in seq[1:]:
+            if abs(p[0] - out[-1][0]) > eps or abs(p[1] - out[-1][1]) > eps:
+                out.append(p)
+        return out
+
+    pts = _dedup_consecutive(pts)
+    if len(pts) < 4:
+        return pts
+
+    for _ in range(max(1, int(max_passes))):
+        changed = False
+        n = len(pts)
+        for i in range(n - 1):
+            seg_a = LineString([pts[i], pts[i + 1]])
+            for j in range(i + 2, n - 1):
+                # Соседние сегменты и общий endpoint конечного ребра не считаем петлёй.
+                if j == i + 1:
+                    continue
+                if i == 0 and j == n - 2:
+                    continue
+                seg_b = LineString([pts[j], pts[j + 1]])
+                inter = seg_a.intersection(seg_b)
+                if inter.is_empty:
+                    continue
+                if getattr(inter, "geom_type", "") in ("Point", "MultiPoint"):
+                    if inter.geom_type == "Point":
+                        ip = (float(inter.x), float(inter.y))
+                    else:
+                        geoms = list(getattr(inter, "geoms", []))
+                        if not geoms:
+                            continue
+                        ip = (float(geoms[0].x), float(geoms[0].y))
+                    pts = pts[: i + 1] + [ip] + pts[j + 1 :]
+                    pts = _dedup_consecutive(pts)
+                    changed = True
+                    break
+                # Коллинеарное наложение (LineString/GeometryCollection): тоже вырезаем цикл.
+                pts = pts[: i + 1] + pts[j + 1 :]
+                pts = _dedup_consecutive(pts)
+                changed = True
+                break
+            if changed:
+                break
+        if not changed:
+            break
+        if len(pts) < 2:
+            return None
+    return pts
+
+
+def route_max_cross_track_offset_m(
+    coords_lonlat: Optional[List[Tuple[float, float]]],
+    *,
+    anchor_lonlat: Tuple[float, float],
+) -> Optional[float]:
+    """Максимальное поперечное отклонение маршрута от хорды (start->end) в метрах."""
+    if coords_lonlat is None or len(coords_lonlat) < 2:
+        return None
+    try:
+        pts = [(float(lo), float(la)) for lo, la in coords_lonlat]
+        if len(pts) < 2:
+            return None
+        utm_epsg = _utm_epsg_from_lonlat(float(anchor_lonlat[0]), float(anchor_lonlat[1]))
+        fwd = Transformer.from_crs(CRS.from_epsg(4326), CRS.from_epsg(utm_epsg), always_xy=True)
+        p0x, p0y = fwd.transform(float(pts[0][0]), float(pts[0][1]))
+        p1x, p1y = fwd.transform(float(pts[-1][0]), float(pts[-1][1]))
+        vx = float(p1x) - float(p0x)
+        vy = float(p1y) - float(p0y)
+        vv = float(vx * vx + vy * vy)
+        best = 0.0
+        for lo, la in pts:
+            px, py = fwd.transform(float(lo), float(la))
+            wx = float(px) - float(p0x)
+            wy = float(py) - float(p0y)
+            if vv <= 1e-12:
+                d = float(np.hypot(wx, wy))
+            else:
+                t = max(0.0, min(1.0, float((wx * vx + wy * vy) / vv)))
+                qx = float(p0x) + t * vx
+                qy = float(p0y) + t * vy
+                d = float(np.hypot(float(px) - qx, float(py) - qy))
+            if d > best:
+                best = d
+        return float(best)
+    except Exception:
+        return None
+
+
 def polish_detour_polyline(
     coords_lonlat: List[Tuple[float, float]],
     nfz_union: Any,
@@ -914,6 +1087,7 @@ def polish_detour_polyline(
     alon = float(utm_anchor_lonlat[0]) if utm_anchor_lonlat is not None else float(coords_lonlat[0][0])
     alat = float(utm_anchor_lonlat[1]) if utm_anchor_lonlat is not None else float(coords_lonlat[0][1])
     best = list(coords_lonlat)
+    best_changed = False
     for frac, iters in DETOUR_SMOOTH_SCHEDULE:
         cand = smooth_lonlat_polyline_chaikin(
             coords_lonlat, alon, alat, int(iters), edge_frac=float(frac)
@@ -925,6 +1099,22 @@ def polish_detour_polyline(
             no_fly_safety_buffer=no_fly_safety_buffer,
         ):
             best = cand
+            best_changed = True
+    # Fallback для коротких/плотных обходов у границы NFZ:
+    # очень мягкое Chaikin сглаживание, чтобы не оставлять исходные 3–4 точки.
+    if not best_changed:
+        for frac, iters in ((0.08, 1), (0.06, 1)):
+            cand = smooth_lonlat_polyline_chaikin(
+                coords_lonlat, alon, alat, int(iters), edge_frac=float(frac)
+            )
+            if route_coords_clear_of_nfz(
+                cand,
+                nfz_union,
+                nfz_metric=nfz_metric,
+                no_fly_safety_buffer=no_fly_safety_buffer,
+            ):
+                best = cand
+                break
     return best
 
 
@@ -941,7 +1131,7 @@ def light_extra_smoothing_lonlat(
         return list(coords_lonlat)
     alon = float(utm_anchor_lonlat[0]) if utm_anchor_lonlat is not None else float(coords_lonlat[0][0])
     alat = float(utm_anchor_lonlat[1]) if utm_anchor_lonlat is not None else float(coords_lonlat[0][1])
-    for it, ef in ((2, 0.17), (1, 0.14)):
+    for it, ef in ((2, 0.18), (1, 0.14)):
         cand = smooth_lonlat_polyline_chaikin(coords_lonlat, alon, alat, int(it), edge_frac=float(ef))
         if len(cand) < 3:
             continue
@@ -1107,6 +1297,7 @@ def _build_boundary_arcs_metric(
 
 
 def _calculate_metric_path_length_m(path_xy: List[Tuple[float, float]]) -> float:
+    """Считает длину метрической полилинии как сумму длин сегментов."""
     if not path_xy or len(path_xy) < 2:
         return 0.0
     total = 0.0
@@ -1691,19 +1882,54 @@ def route_lonlat_segment_with_nfz_detours(
         return None
 
     chord_ref = max(float(d_km), 1e-9)
-    candidates.sort(
-        key=lambda t: (
-            (t[0] / chord_ref) + float(DETOUR_SCORE_EXCESS_PER_KM) * max(0.0, t[0] - chord_ref),
-            t[0],
-        )
+    anchor_score = (
+        (float(utm_anchor_lonlat[0]), float(utm_anchor_lonlat[1]))
+        if utm_anchor_lonlat is not None
+        else (float(lon1 + lon2) / 2.0, float(lat1 + lat2) / 2.0)
     )
+
+    def _detour_candidate_sort_key(t: Tuple[float, List[Tuple[float, float]], str]) -> Tuple[float, float]:
+        len_km, coords, _how = t
+        off_m = route_max_cross_track_offset_m(coords, anchor_lonlat=anchor_score)
+        bulge_ratio = 0.0
+        if off_m is not None:
+            bulge_ratio = (float(off_m) / 1000.0) / chord_ref
+        ratio = float(len_km) / chord_ref
+        excess_km = max(0.0, float(len_km) - chord_ref)
+        bulge_pen = float(DETOUR_SCORE_BULGE) * max(0.0, bulge_ratio - float(DETOUR_BULGE_FREE_RATIO))
+        primary = ratio + float(DETOUR_SCORE_EXCESS_PER_KM) * excess_km + bulge_pen
+        return (primary, float(len_km))
+
+    candidates.sort(key=_detour_candidate_sort_key)
     detour_len, detour_coords, how = candidates[0]
     detour_coords = _tighten_detour_route(detour_coords)
+    detour_coords = remove_self_intersections_lonlat(detour_coords) or detour_coords
+    base_detour_coords = list(detour_coords) if detour_coords is not None else None
+    base_detour_len = _route_length_km(base_detour_coords)
+    anchor_for_offset = (
+        (float(utm_anchor_lonlat[0]), float(utm_anchor_lonlat[1]))
+        if utm_anchor_lonlat is not None
+        else (float(lon1 + lon2) / 2.0, float(lat1 + lat2) / 2.0)
+    )
+    base_offset_m = route_max_cross_track_offset_m(
+        base_detour_coords,
+        anchor_lonlat=anchor_for_offset,
+    )
     if detour_coords is not None:
         rl0 = _route_length_km(detour_coords)
         if rl0 is not None:
             detour_len = float(rl0)
     if how != "straight" and len(detour_coords) >= 3:
+        if len(detour_coords) <= 6:
+            # Для коротких A*/boundary обходов сначала уплотняем вершины, затем скругляем:
+            # иначе Chaikin даёт недостаточно «мягкую» линию (мало контрольных точек).
+            detour_coords = densify_lonlat_polyline_metric(
+                detour_coords,
+                float(utm_anchor_lonlat[0]) if utm_anchor_lonlat is not None else float(detour_coords[0][0]),
+                float(utm_anchor_lonlat[1]) if utm_anchor_lonlat is not None else float(detour_coords[0][1]),
+                max_step_m=320.0,
+                max_output_points=36,
+            )
         detour_coords = polish_detour_polyline(
             detour_coords,
             nfz_union,
@@ -1711,6 +1937,7 @@ def route_lonlat_segment_with_nfz_detours(
             utm_anchor_lonlat=utm_anchor_lonlat,
             no_fly_safety_buffer=no_fly_safety_buffer,
         )
+        detour_coords = remove_self_intersections_lonlat(detour_coords) or detour_coords
         # После Chaikin не делаем Douglas–Peucker simplify: он срезает точки и снова даёт острые углы.
         rl = _route_length_km(detour_coords)
         if rl is not None:
@@ -1722,9 +1949,34 @@ def route_lonlat_segment_with_nfz_detours(
             utm_anchor_lonlat=utm_anchor_lonlat,
             no_fly_safety_buffer=no_fly_safety_buffer,
         )
+        detour_coords = remove_self_intersections_lonlat(detour_coords) or detour_coords
         rl2 = _route_length_km(detour_coords)
         if rl2 is not None:
             detour_len = float(rl2)
+        cur_offset_m = route_max_cross_track_offset_m(detour_coords, anchor_lonlat=anchor_for_offset)
+        if (
+            base_detour_coords is not None
+            and base_detour_len is not None
+            and cur_offset_m is not None
+            and base_offset_m is not None
+        ):
+            too_long = float(detour_len) > float(base_detour_len) * float(DETOUR_SMOOTH_MAX_LENGTH_GROWTH)
+            max_allowed_offset = max(
+                float(base_offset_m) * float(DETOUR_SMOOTH_MAX_OFFSET_GROWTH),
+                float(base_offset_m) + float(DETOUR_SMOOTH_MAX_OFFSET_EXTRA_M),
+            )
+            too_wide = float(cur_offset_m) > max_allowed_offset
+            if too_long or too_wide:
+                detour_coords = list(base_detour_coords)
+                detour_len = float(base_detour_len)
+                log.debug(
+                    "Сглаживание отклонено для %s: вылет (len %.3f->%.3f км, offset %.1f->%.1f м)",
+                    lbl,
+                    float(base_detour_len),
+                    float(rl2) if rl2 is not None else float(detour_len),
+                    float(base_offset_m),
+                    float(cur_offset_m),
+                )
         # Не вызывать _tighten_detour_route после Chaikin: сжатие снова оставляет 3–4 угла и ломает скругление.
     ratio = float(detour_len) / chord_ref
     log.info(
@@ -1812,6 +2064,7 @@ def prepare_air_detour_auxiliary(
 
 class StationPlacement:
     def __init__(self, data_service, logger=None):
+        """Инициализирует сервис размещения станций поверх подготовленных городских данных."""
         self.data_service = data_service
         self.logger = logger or logging.getLogger(__name__)
 
@@ -1830,6 +2083,7 @@ class StationPlacement:
         fill_clusters: bool = False,
         cluster_fill_step_m: Optional[float] = None,
     ) -> gpd.GeoDataFrame:
+        """Строит точки спроса для размещения станций (DBSCAN/сетка) через DataService."""
         return self.data_service.get_demand_points_weighted(
             buildings,
             road_graph,
@@ -3514,6 +3768,7 @@ class StationPlacement:
         min_distance_factor: float = 2.0,
         max_to_stations: int = 100,
     ) -> gpd.GeoDataFrame:
+        """Размещает станции ТО рядом с магистралью и покрывает спрос в заданном радиусе."""
         if to_candidates is None or len(to_candidates) == 0:
             return gpd.GeoDataFrame()
         if trunk_graph is None:
@@ -3723,6 +3978,9 @@ class StationPlacement:
         return metrics
 
 
+# PATTERN: Pipeline (конвейер) — строго заданная последовательность стадий обработки.
+# Почему: метод оркестрирует фиксированные этапы (данные -> размещение -> графы -> маршруты -> Voronoi -> метрики).
+# Этап 5-11: полный конвейер размещения, графов, маршрутов и эшелонов.
 def run_full_pipeline(
     data_service,
     city_name: str,
@@ -3748,6 +4006,7 @@ def run_full_pipeline(
     Запускает полный пайплайн: данные города → спрос → зарядки → гаражи/ТО → магистраль (эшелоны 4–5) → ветки Б→А / гараж и ТО→А (4–5) → локальные Б↔Б (4–5) → слой Вороного (эшелоны 1–3, с сайтами станций).
     """
     logger = logging.getLogger(__name__)
+    # Этап 10: загружаем no-fly и базовые геоданные города для последующих ограничений маршрутизации.
     data = data_service.get_city_data(city_name, network_type=network_type, simplify=simplify, load_no_fly_zones=True)
     buildings = data.get("buildings")
     road_graph = data.get("road_graph")
@@ -3756,6 +4015,7 @@ def run_full_pipeline(
 
     placement = StationPlacement(data_service, logger=logger)
 
+    # Этап 5: подготовка точек спроса, на которые затем ставятся станции инфраструктуры.
     # Важно: если demand_method=dbscan и в get_city_data уже есть demand_points/demand_hulls,
     # то не пересчитываем demand заново (иначе логически будет "DBSCAN районов" второй раз).
     demand = None
@@ -3966,6 +4226,7 @@ def run_full_pipeline(
             demand = _assign_synthetic_regions(demand.copy())
             demand = _repack_regions_by_nearest_clusters(demand, group_size=5)
 
+    # Этап 5: формирование кандидатов и размещение зарядных станций типа A/B.
     candidates_rooftop = data_service.get_station_candidates(
         buildings, city_boundary, no_fly_zones, road_graph, station_type="rooftop"
     )
@@ -3993,7 +4254,7 @@ def run_full_pipeline(
     else:
         charge_candidates = charge_candidates_full
 
-    # Hull-полигоны кластеров нужны для строгой и устойчивой привязки станций к "своей" геометрии.
+    # Этап 5: hull-полигоны кластеров для устойчивой геопривязки станций к своим кластерам.
     cluster_hulls_gdf = None
     if demand_method == "dbscan":
         try:
@@ -4047,6 +4308,7 @@ def run_full_pipeline(
         force_type_a_per_region=True,
         force_type_a_per_cluster=False,
     )
+    # Этап 5: корректная привязка зарядок к геометрии кластера (hull-first + fallback).
     # --- Корректная привязка зарядок к "своей" геометрии кластера ---
     # Мы делаем hull-first привязку:
     # - если точка станции попадает ровно в один hull -> cluster_id = cluster_id этого hull
@@ -4188,6 +4450,7 @@ def run_full_pipeline(
         # - иначе можно полностью потерять размещение, если hull'ы не покрывают точные координаты кандидатов
         # - UI/линии привязки при None просто не смогут построиться корректно, что безопаснее неверного cluster_id.
 
+    # Этап 5: перенос region_id на станции через cluster_id кластеров спроса.
     # Проставляем region_id станциям через cluster_id demand-кластеров.
     if (
         charge_stations is not None
@@ -4233,6 +4496,7 @@ def run_full_pipeline(
             else:
                 charging_buildings_in_clusters = int(demand["n_buildings"].sum())
 
+    # Этап 5: размещение гаражей и станций ТО (доп. инфраструктура).
     # --- Гаражи и ТО: ceil(N_a/3) каждого типа; связь с ближайшими A как у B→A (ветка на карте) ---
     obstacles_union = None
     if no_fly_zones is not None:
@@ -4245,8 +4509,10 @@ def run_full_pipeline(
         except Exception:
             obstacles_union = None
 
+    # Этап 10: объединение no-fly зон с препятствиями городской среды (высокие здания).
     # Маршрутизация и обходы — по геометрии no-fly из данных, без дополнительного метрического буфера.
     # Эшелоны 4–5: магистраль А–А, ветки Б→А, локальные Б↔Б, гараж→А, ТО→А — высокие здания как NFZ (см. DataService).
+    # Этап 11: применение порогов высот для эшелонов 4-5 при формировании препятствий маршрутизации.
     obstacles_routing = obstacles_union
     try:
         from data_service import DataService
@@ -4304,6 +4570,7 @@ def run_full_pipeline(
         garages = gpd.GeoDataFrame()
         to_stations = gpd.GeoDataFrame()
 
+    # Этап 6: построение транспортного "воздушного" графа для поиска безопасных маршрутов.
     # Магистраль на карте — только между зарядками A. Ветки спутник→A в пайплайне не строятся.
     # Воздушный граф БПЛА строим отдельно как сетку свободного пространства,
     # чтобы detour обходил no-fly зоны "по воздуху", а не по дорогам.
@@ -4326,6 +4593,7 @@ def run_full_pipeline(
         logger.warning("Не удалось построить воздушный граф для обходов: %s", e)
         uav_air_graph = None
 
+    # Этап 7: формирование магистральных связей между опорными станциями A (trunk).
     trunk = placement.build_trunk_graph(
         charge_stations,
         gpd.GeoDataFrame(),
@@ -4348,6 +4616,8 @@ def run_full_pipeline(
                 if trunk.has_node(nid):
                     charge_stations.iloc[pos, charge_stations.columns.get_loc("trunk_degree")] = int(trunk.degree[nid])
     cs_for_edges = charge_stations if charge_stations is not None else gpd.GeoDataFrame()
+    # Этап 6: добавление ветвей инфраструктурного транспортного графа (B->A, гаражи/ТО -> A).
+    # Этап 9: маршруты ветвей строятся с обходами (A*/detour) через air_graph и obstacles.
     branch_edges = placement.build_branch_edges(
         cs_for_edges,
         max_b_per_type_a=MAX_TYPE_B_BRANCHES_PER_TYPE_A,
@@ -4367,6 +4637,8 @@ def run_full_pipeline(
             no_fly_safety_buffer=0.0,
         )
     )
+    # Этап 8: формирование локальной маршрутной сети (локальные связи внутри кластеров станций).
+    # Этап 9: локальные связи также строятся через безопасную маршрутизацию с обходом препятствий.
     local_edges = placement.build_local_edges(
         cs_for_edges,
         obstacles_routing,
@@ -4378,6 +4650,7 @@ def run_full_pipeline(
 
     from voronoi_paths import build_voronoi_local_paths_fc, charging_station_gdfs_to_features
 
+    # Этап 8: построение внутрикластерной сети Вороного с учётом расставленных станций.
     st_voronoi_features = charging_station_gdfs_to_features(
         charge_stations if charge_stations is not None and len(charge_stations) > 0 else None,
         garages if garages is not None and len(garages) > 0 else None,
@@ -4385,6 +4658,8 @@ def run_full_pipeline(
     )
     st_voronoi_arg: Optional[List[Dict[str, Any]]] = st_voronoi_features if st_voronoi_features else None
     try:
+        # Этап 10: фильтрация рёбер Вороного по no-fly и городским препятствиям.
+        # Этап 11: построение и возврат Voronoi-слоёв по эшелонам 1-3.
         voronoi_edges = build_voronoi_local_paths_fc(
             data_service,
             city_name,
@@ -4450,6 +4725,7 @@ def run_full_pipeline(
 
 
 def _empty_fc() -> Dict[str, Any]:
+    """Пустой GeoJSON FeatureCollection."""
     return {"type": "FeatureCollection", "features": []}
 
 
@@ -4483,6 +4759,7 @@ def _gdf_to_fc(gdf: Optional[gpd.GeoDataFrame]) -> Dict[str, Any]:
 
 
 def _list_features_to_fc(features: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
+    """Оборачивает список GeoJSON-фич в FeatureCollection."""
     if not features:
         return _empty_fc()
     return {"type": "FeatureCollection", "features": list(features)}
@@ -4543,6 +4820,7 @@ def _annotate_station_fc_vertical_echelon_links(fc: Dict[str, Any]) -> None:
         )
 
 
+# Этап 12-13: упаковка результата в GeoJSON-слои для карты.
 def pipeline_result_to_geojson(raw: Dict[str, Any]) -> Dict[str, Any]:
     """Ответ API `/api/stations/placement`: слои для карты + метрики и параметры."""
     err = raw.get("error")

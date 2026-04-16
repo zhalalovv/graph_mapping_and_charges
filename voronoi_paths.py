@@ -1,16 +1,8 @@
 """
-Локальные рёбра диаграммы Вороного по кластерам спроса.
-Сайты — центроиды зданий (возможно агрегированные) и точки зарядных станций в кластере.
-Площадь hull (м²) до порога 3_000_000: для не-МКД в однородном малом кластере — 3 здания на сайт;
-МКД в малом кластере (только МКД или в смеси с другими) — 2 здания на сайт. Выше порога —
-агрегация по buildings_per_centroid (по умолчанию 60).
-Если площадь hull не больше порога и в кластере одновременно есть МКД и прочие типы зданий,
-не-МКД — по buildings_per_centroid зданий на сайт (по умолчанию 60).
-Сайты (центроиды), попадающие в no-fly, отбрасываются; для эшелонов 1–3 рёбра режутся отдельно:
-на эшелоне k не летаем над зданием, если height_m ≥ (высота_эшелона_k − 5 м) — см. voronoi_by_echelon.
-Станции стоят на крышах: если высота здания под станцией ≥ этому же порогу, все рёбра, касающиеся станции,
-на этом эшелоне удаляются (union по упрощённым контурам мог не содержать точку станции).
-NFZ учитывается на всех эшелонах (как в _filter_voronoi_fc_linestrings_nfz).
+Этап 4: детализация кластеров (KMeans-агрегация сайтов) -> `_aggregate_points_to_centroids()`.
+Этап 8: локальная маршрутная сеть внутри кластеров -> `build_voronoi_local_paths_fc()`.
+Этап 10: учет no-fly и препятствий -> `_filter_voronoi_fc_linestrings_nfz()`, `_filter_voronoi_fc_building_clearance()`.
+Этап 11: учет эшелонирования (1-3) -> эшелонные фильтры в `build_voronoi_edges_from_pipeline_raw()`.
 """
 from __future__ import annotations
 
@@ -46,6 +38,8 @@ def _merge_polygon_unions_wgs84(*parts: Any) -> Any:
         return geoms[0]
 
 
+# PATTERN: Chain of Responsibility — объект проходит цепочку независимых фильтров/шагов.
+# Почему: каждый этап трансформирует FC и передаёт дальше (NFZ -> clearance -> bridges -> roof/echelon).
 def _voronoi_fc_copy_filter_and_bridges(
     fc_base: dict,
     *,
@@ -100,12 +94,16 @@ _SMALL_CLUSTER_EXTRA_EDGE_MAX_M = 450.0
 _SMALL_CLUSTER_EXTRA_MAX_POINTS = 1500
 # Если в запросе не задан buildings_per_centroid, для крупных кластеров используется это значение.
 _VORONOI_BPC_LARGE_CLUSTER_FALLBACK = 60
+# Hull строго > _VORONOI_BPC_SMALL_CLUSTER_MAX_AREA_M2 (локально или city-wide — см. _voronoi_city_has_large_hull_cluster):
+# для МКД — 5 зданий на один сайт Вороного (5:1).
+_VORONOI_BPC_LARGE_CLUSTER_MKD_BUILDINGS_PER_CENTROID = 5
 # Мосты между компонентами графа внутри кластера (если включён фильтр по препятствиям — с проверкой пересечений).
 _DEFAULT_VORONOI_INTRA_COMPONENT_BRIDGE_MAX_M = 600.0
 _MAX_INTRA_BRIDGE_PAIR_EVAL = 80_000
 
 
 def _cluster_id_prop_from_key(cid: str) -> Any:
+    """Преобразует строковой ключ кластера в int, если это возможно."""
     try:
         return int(cid)
     except ValueError:
@@ -124,11 +122,28 @@ def _hull_area_m2(hull_poly: Any) -> float:
         return 0.0
 
 
+def _voronoi_city_has_large_hull_cluster(hulls_norm: gpd.GeoDataFrame | None) -> bool:
+    """True, если у любого demand hull площадь (м², 3857) строго больше порога — МКД 5:1 во всех кластерах."""
+    if hulls_norm is None or len(hulls_norm) == 0:
+        return False
+    thr = float(_VORONOI_BPC_SMALL_CLUSTER_MAX_AREA_M2)
+    try:
+        for g in hulls_norm.geometry:
+            if g is None or getattr(g, "is_empty", True):
+                continue
+            if _hull_area_m2(g) > thr:
+                return True
+    except Exception:
+        return False
+    return False
+
+
 def _voronoi_effective_buildings_per_centroid(base_bpc: int, hull_poly: Any) -> int:
     """
     При площади hull ≤ порога — 3 здания на сайт для однородного не-МКД кластера
-    (для только МКД размер группы задаётся отдельно — см. _VORONOI_BPC_SMALL_CLUSTER_MKD_BUILDINGS_PER_CENTROID).
-    При большей площади — `base_bpc` зданий на сайт (или fallback 60).
+    (однородный только МКД — см. _VORONOI_BPC_SMALL_CLUSTER_MKD_BUILDINGS_PER_CENTROID).
+    При площади hull > порога — для не-МКД: `base_bpc` зданий на сайт (или fallback 60);
+    для МКД при city-wide крупном режиме или большом локальном hull — см. _VORONOI_BPC_LARGE_CLUSTER_MKD_BUILDINGS_PER_CENTROID.
     """
     area_m2 = _hull_area_m2(hull_poly)
     if area_m2 <= _VORONOI_BPC_SMALL_CLUSTER_MAX_AREA_M2:
@@ -148,6 +163,7 @@ def _aggregate_points_to_centroids(pts_arr: np.ndarray, target_group_size: int) 
     n_groups = int(np.ceil(len(pts_arr) / float(tg)))
     n_groups = max(2, min(n_groups, len(pts_arr)))
     try:
+        # Этап 4 (KMeans): агрегация зданий в сайты (центроиды) для локальной сети.
         from sklearn.cluster import MiniBatchKMeans
 
         km = MiniBatchKMeans(
@@ -157,6 +173,7 @@ def _aggregate_points_to_centroids(pts_arr: np.ndarray, target_group_size: int) 
             n_init=3,
             max_iter=200,
         )
+        # Этап 4 (KMeans): непосредственный запуск кластеризации и получение меток групп.
         labels = km.fit_predict(pts_arr)
         centers = []
         for k in range(n_groups):
@@ -213,7 +230,82 @@ def _small_cluster_mixed_mkd_nonmkd(
     return len(pts_mkd) > 0 and len(pts_non) > 0
 
 
+def _voronoi_cluster_building_centroids(
+    hull_poly: Any,
+    pts_mkd: list[list[float]],
+    pts_non: list[list[float]],
+    buildings_per_centroid: int,
+    *,
+    large_city_mkd_dense: bool = False,
+) -> np.ndarray:
+    """
+    Центроиды сайтов Вороного для одного кластера (МКД / не-МКД раздельно где нужно).
+    Локально hull > 3_000_000 м²: МКД — 5:1, не-МКД — BPC по локальному hull.
+    Если large_city_mkd_dense (хотя бы один hull в городе > порога): МКД — 5:1 во всех кластерах;
+    не-МКД — без изменений относительно локальной площади hull кластера.
+    """
+    if _small_cluster_mixed_mkd_nonmkd(hull_poly, pts_mkd, pts_non):
+        bpc_mkd = (
+            _VORONOI_BPC_LARGE_CLUSTER_MKD_BUILDINGS_PER_CENTROID
+            if large_city_mkd_dense
+            else _VORONOI_BPC_SMALL_CLUSTER_MKD_BUILDINGS_PER_CENTROID
+        )
+        return _voronoi_centroids_mixed_small_cluster(
+            pts_mkd,
+            pts_non,
+            bpc_mkd=bpc_mkd,
+            bpc_non=max(1, int(buildings_per_centroid or _VORONOI_BPC_LARGE_CLUSTER_FALLBACK)),
+        )
+
+    area_m2 = _hull_area_m2(hull_poly)
+    n_mkd, n_non = len(pts_mkd), len(pts_non)
+
+    if area_m2 > _VORONOI_BPC_SMALL_CLUSTER_MAX_AREA_M2:
+        bpc_non = max(1, _voronoi_effective_buildings_per_centroid(buildings_per_centroid, hull_poly))
+        if n_mkd > 0 and n_non > 0:
+            return _voronoi_centroids_mixed_small_cluster(
+                pts_mkd,
+                pts_non,
+                bpc_mkd=_VORONOI_BPC_LARGE_CLUSTER_MKD_BUILDINGS_PER_CENTROID,
+                bpc_non=bpc_non,
+            )
+        if n_mkd > 0 and n_non == 0:
+            return _aggregate_points_to_centroids(
+                np.asarray(pts_mkd, dtype=float),
+                _VORONOI_BPC_LARGE_CLUSTER_MKD_BUILDINGS_PER_CENTROID,
+            )
+        pts_all = np.asarray(pts_non, dtype=float)
+        return _aggregate_points_to_centroids(pts_all, bpc_non)
+
+    if large_city_mkd_dense:
+        if n_mkd > 0 and n_non == 0:
+            return _aggregate_points_to_centroids(
+                np.asarray(pts_mkd, dtype=float),
+                _VORONOI_BPC_LARGE_CLUSTER_MKD_BUILDINGS_PER_CENTROID,
+            )
+        if n_non > 0 and n_mkd == 0:
+            tg = max(
+                1,
+                _voronoi_effective_buildings_per_centroid(buildings_per_centroid, hull_poly),
+            )
+            return _aggregate_points_to_centroids(np.asarray(pts_non, dtype=float), tg)
+
+    target_group_size = max(
+        1,
+        _voronoi_effective_buildings_per_centroid(buildings_per_centroid, hull_poly),
+    )
+    if (
+        area_m2 <= _VORONOI_BPC_SMALL_CLUSTER_MAX_AREA_M2
+        and n_non == 0
+        and n_mkd >= 2
+    ):
+        target_group_size = max(1, _VORONOI_BPC_SMALL_CLUSTER_MKD_BUILDINGS_PER_CENTROID)
+    pts_arr = np.asarray(pts_mkd + pts_non, dtype=float)
+    return _aggregate_points_to_centroids(pts_arr, target_group_size)
+
+
 def _normalize_hulls_gdf(hulls_gdf: gpd.GeoDataFrame | None) -> gpd.GeoDataFrame | None:
+    """Приводит hull-данные к EPSG:4326 и гарантирует наличие `cluster_id`."""
     if hulls_gdf is None or len(hulls_gdf) == 0:
         return None
     h = hulls_gdf.to_crs("EPSG:4326").copy()
@@ -227,6 +319,7 @@ def _normalize_hulls_gdf(hulls_gdf: gpd.GeoDataFrame | None) -> gpd.GeoDataFrame
 
 
 def _hull_polygon_for_cluster(hulls_norm: gpd.GeoDataFrame | None, cluster_id: Any):
+    """Возвращает полигон hull для конкретного кластера."""
     if hulls_norm is None or len(hulls_norm) == 0:
         return None
     try:
@@ -244,6 +337,7 @@ def _hull_polygon_for_cluster(hulls_norm: gpd.GeoDataFrame | None, cluster_id: A
 
 
 def _point_in_hull(lon: float, lat: float, hull_poly) -> bool:
+    """Проверяет попадание точки в hull (касающиеся границы точки тоже допустимы)."""
     if hull_poly is None or getattr(hull_poly, "is_empty", True):
         return True
     try:
@@ -363,6 +457,7 @@ def _no_fly_obstacles_union(no_fly_zones: Any) -> Any:
 
 
 def _point_in_nfz_union(lon: float, lat: float, nfz_union: Any) -> bool:
+    """Возвращает True, если точка попадает внутрь объединённой no-fly геометрии."""
     if nfz_union is None or getattr(nfz_union, "is_empty", True):
         return False
     try:
@@ -581,6 +676,7 @@ def _filter_voronoi_fc_station_roof_echelon(
     hmap = _batch_max_building_heights_m_at_lonlat(need_pts, buildings_wgs)
 
     def _h(lo: float, la: float) -> float:
+        # По координате станции возвращаем максимальную высоту здания под ней (или 0.0).
         return float(hmap.get((round(float(lo), 6), round(float(la), 6)), 0.0))
 
     kept: list[dict] = []
@@ -790,7 +886,7 @@ def apply_nfz_detours_to_voronoi_fc(
             feat["properties"] = props
             continue
         path_ll, _len_km, how = routed
-        if how != "straight" and path_ll and len(path_ll) >= 2:
+        if path_ll and len(path_ll) >= 2:
             feat["geometry"] = {
                 "type": "LineString",
                 "coordinates": [[float(lon), float(lat)] for lon, lat in path_ll],
@@ -823,11 +919,13 @@ def dedupe_close_parallel_voronoi_edges(
     angle_thr = np.radians(float(max_angle_diff_deg))
 
     def _xy_m(lon: float, lat: float, ref_lat: float) -> tuple[float, float]:
+        # Локальная аппроксимация lon/lat -> метры для оценки длины/угла сегмента.
         m_per_deg_lat = 111_320.0
         m_per_deg_lon = 111_320.0 * np.cos(np.radians(ref_lat))
         return lon * m_per_deg_lon, lat * m_per_deg_lat
 
     def _enrich(feature: dict):
+        # Вычисляет служебные метрики сегмента для дедупликации (длина, угол, midpoint).
         geom = (feature or {}).get("geometry") or {}
         if geom.get("type") != "LineString":
             return None
@@ -909,6 +1007,7 @@ def dedupe_close_parallel_voronoi_edges(
 
 
 def _require_voronoi():
+    """Ленивая проверка зависимости SciPy и возврат класса Voronoi."""
     try:
         from scipy.spatial import Voronoi
 
@@ -960,6 +1059,7 @@ def _station_edge_props(
     source_i: int | None = None,
     target_i: int | None = None,
 ) -> dict:
+    """Собирает стандартный набор свойств ребра с метаданными о станциях и источниках."""
     sa = bool(is_station[a]) if a < len(is_station) else False
     sb = bool(is_station[b]) if b < len(is_station) else False
     props: dict[str, Any] = {
@@ -1076,17 +1176,20 @@ def _append_voronoi_edges_for_cluster(
 
 
 def _cluster_label_for_props(cid: Any) -> Any:
+    """Нормализует id кластера для записи в properties GeoJSON."""
     if isinstance(cid, (int, np.integer)):
         return int(cid)
     return str(cid)
 
 
 def _inter_cluster_pair_label(cid_a: Any, cid_b: Any) -> str:
+    """Строит строковый идентификатор пары кластеров в каноническом порядке."""
     sa, sb = sorted((str(cid_a), str(cid_b)))
     return f"{sa}|{sb}"
 
 
 def _canonical_cluster_pair_key(cid_a: Any, cid_b: Any) -> tuple[str, str]:
+    """Возвращает канонический ключ пары кластеров для словарей/множеств."""
     return tuple(sorted((str(cid_a), str(cid_b))))
 
 
@@ -1828,6 +1931,7 @@ def _append_voronoi_edges_global(
     return len(features) > n0
 
 
+# Этап 4 + Этап 8: детализация кластеров и построение локальной Voronoi-сети.
 def build_voronoi_local_paths_fc(
     data_service: DataService,
     city: str,
@@ -1844,6 +1948,7 @@ def build_voronoi_local_paths_fc(
     *,
     city_data: dict | None = None,
 ) -> dict:
+    """Строит локальные Voronoi-рёбра по кластерам с фильтрацией NFZ/препятствий и мостами связности."""
     _require_voronoi()
 
     if city_data is not None:
@@ -1931,6 +2036,7 @@ def build_voronoi_local_paths_fc(
         }
 
     hulls_norm = _normalize_hulls_gdf(hulls)
+    large_city_mkd_dense = _voronoi_city_has_large_hull_cluster(hulls_norm)
 
     b_proj = buildings_wgs.to_crs(epsg=3857)
     b_centroids_wgs = gpd.GeoSeries(b_proj.geometry.centroid, crs=b_proj.crs).to_crs("EPSG:4326")
@@ -2027,26 +2133,13 @@ def build_voronoi_local_paths_fc(
             continue
 
         hull_poly = _hull_polygon_for_cluster(hulls_norm, group_id)
-        if _small_cluster_mixed_mkd_nonmkd(hull_poly, pts_mkd, pts_non):
-            pts_arr = _voronoi_centroids_mixed_small_cluster(
-                pts_mkd,
-                pts_non,
-                bpc_mkd=_VORONOI_BPC_SMALL_CLUSTER_MKD_BUILDINGS_PER_CENTROID,
-                bpc_non=max(1, int(buildings_per_centroid or _VORONOI_BPC_LARGE_CLUSTER_FALLBACK)),
-            )
-        else:
-            target_group_size = max(
-                1,
-                _voronoi_effective_buildings_per_centroid(buildings_per_centroid, hull_poly),
-            )
-            if (
-                _hull_area_m2(hull_poly) <= _VORONOI_BPC_SMALL_CLUSTER_MAX_AREA_M2
-                and len(pts_non) == 0
-                and len(pts_mkd) >= 2
-            ):
-                target_group_size = max(1, _VORONOI_BPC_SMALL_CLUSTER_MKD_BUILDINGS_PER_CENTROID)
-            pts_arr = np.asarray(pts_mkd + pts_non, dtype=float)
-            pts_arr = _aggregate_points_to_centroids(pts_arr, target_group_size)
+        pts_arr = _voronoi_cluster_building_centroids(
+            hull_poly,
+            pts_mkd,
+            pts_non,
+            buildings_per_centroid,
+            large_city_mkd_dense=large_city_mkd_dense,
+        )
 
         pts_arr, _ = _filter_xy_rows_outside_nfz(pts_arr, None, nfz_union_f)
 
@@ -2240,6 +2333,8 @@ def build_voronoi_edges_from_station_geojson(geo: dict) -> dict:
     return {"type": "FeatureCollection", "features": out_features}
 
 
+# Этап 10: учёт no-fly зон и препятствий городской среды в Voronoi-рёбрах.
+# Этап 11: разбиение/фильтрация Voronoi-рёбер по эшелонам (1-3).
 def build_voronoi_edges_from_pipeline_raw(
     data_service: DataService,
     raw: dict,
@@ -2271,6 +2366,8 @@ def build_voronoi_edges_from_pipeline_raw(
         return {"type": "FeatureCollection", "features": []}
 
     hulls_norm = _normalize_hulls_gdf(raw.get("demand_hulls"))
+    large_city_mkd_dense = _voronoi_city_has_large_hull_cluster(hulls_norm)
+    # Этап 10: объединяем геометрию no-fly зон для последующей фильтрации точек и рёбер.
     nfz_union_f = _no_fly_obstacles_union(raw.get("no_fly_zones"))
 
     grouped_points: dict[str, list[list[float]]] = {}
@@ -2285,6 +2382,7 @@ def build_voronoi_edges_from_pipeline_raw(
                 lo, la = float(g.x), float(g.y)
             except Exception:
                 continue
+            # Этап 10: отбрасываем точки, попавшие в no-fly.
             if nfz_union_f is not None and _point_in_nfz_union(lo, la, nfz_union_f):
                 continue
             pts.append([lo, la])
@@ -2343,6 +2441,7 @@ def build_voronoi_edges_from_pipeline_raw(
                                 lo, la = float(g.x), float(g.y)
                             except Exception:
                                 continue
+                            # Этап 10: дополнительная очистка fallback-точек зданий от no-fly.
                             if nfz_union_f is not None and _point_in_nfz_union(lo, la, nfz_union_f):
                                 continue
                             sk = str(cid)
@@ -2383,6 +2482,7 @@ def build_voronoi_edges_from_pipeline_raw(
             if cid is None:
                 continue
             lo, la = float(coords[0]), float(coords[1])
+            # Этап 10: станции внутри no-fly не участвуют в построении Voronoi-сети.
             if nfz_union_f is not None and _point_in_nfz_union(lo, la, nfz_union_f):
                 continue
             charging_by_cluster.setdefault(str(cid), []).append([lo, la])
@@ -2395,31 +2495,23 @@ def build_voronoi_edges_from_pipeline_raw(
         hull_poly = _hull_polygon_for_cluster(hulls_norm, cluster_id)
         sk = str(cluster_id)
         split = mkd_split_by_cluster.get(sk) if mkd_split_by_cluster else None
-        if (
-            split is not None
-            and _small_cluster_mixed_mkd_nonmkd(hull_poly, split[0], split[1])
-        ):
-            pts_arr = _voronoi_centroids_mixed_small_cluster(
+        if split is not None:
+            pts_arr = _voronoi_cluster_building_centroids(
+                hull_poly,
                 split[0],
                 split[1],
-                bpc_mkd=_VORONOI_BPC_SMALL_CLUSTER_MKD_BUILDINGS_PER_CENTROID,
-                bpc_non=max(1, int(buildings_per_centroid or _VORONOI_BPC_LARGE_CLUSTER_FALLBACK)),
+                buildings_per_centroid,
+                large_city_mkd_dense=large_city_mkd_dense,
             )
         else:
             target_group_size = max(
                 1,
                 _voronoi_effective_buildings_per_centroid(buildings_per_centroid, hull_poly),
             )
-            if (
-                split is not None
-                and _hull_area_m2(hull_poly) <= _VORONOI_BPC_SMALL_CLUSTER_MAX_AREA_M2
-                and len(split[0]) >= 2
-                and len(split[1]) == 0
-            ):
-                target_group_size = max(1, _VORONOI_BPC_SMALL_CLUSTER_MKD_BUILDINGS_PER_CENTROID)
             pts_arr = np.asarray(pts, dtype=float)
             pts_arr = _aggregate_points_to_centroids(pts_arr, target_group_size)
 
+        # Этап 10: фильтрация сайтов Вороного вне no-fly перед построением рёбер.
         pts_arr, _ = _filter_xy_rows_outside_nfz(pts_arr, None, nfz_union_f)
 
         st_pts = charging_by_cluster.get(str(cluster_id), [])
@@ -2432,6 +2524,7 @@ def build_voronoi_edges_from_pipeline_raw(
             ]
         st_arr = np.asarray(st_pts, dtype=float) if st_pts else None
         pts_arr, is_station = merge_xy_with_station_flags(pts_arr, st_arr)
+        # Этап 10: финальная фильтрация объединённого набора (здания + станции) по no-fly.
         pts_arr, is_station = _filter_xy_rows_outside_nfz(pts_arr, is_station, nfz_union_f)
 
         if len(pts_arr) < 2:
@@ -2454,6 +2547,7 @@ def build_voronoi_edges_from_pipeline_raw(
                 b_w = data_service._compute_building_heights(b_w)
             from station_placement import buildings_footprint_union_min_height_wgs84
 
+            # Этап 11: вычисляем высоты эшелонов для Voronoi-слоёв (1-3).
             v_alts = DataService.voronoi_echelon_altitudes_m(raw.get("flight_levels"))
             levels = list(DataService.VORONOI_FLIGHT_ECHELON_LEVELS)
             vbe: dict[str, dict[str, Any]] = {}
@@ -2465,8 +2559,11 @@ def build_voronoi_edges_from_pipeline_raw(
                     "type": "FeatureCollection",
                     "features": copy.deepcopy(list(fc_pre.get("features") or [])),
                 }
+                # Этап 10: на каждом эшелоне вырезаем рёбра, пересекающие no-fly.
                 fc_i = _filter_voronoi_fc_linestrings_nfz(fc_i, nfz_union_f)
+                # Этап 10: удаляем рёбра, нарушающие clearance относительно высоких зданий.
                 fc_i = _filter_voronoi_fc_building_clearance(fc_i, tall_u)
+                # Этап 11: учитываем ограничение «станция на крыше» для текущего эшелона.
                 fc_i = _filter_voronoi_fc_station_roof_echelon(fc_i, b_w, min_h_b)
                 vbe[str(level)] = {
                     "type": "FeatureCollection",
@@ -2478,6 +2575,7 @@ def build_voronoi_edges_from_pipeline_raw(
             e1 = vbe.get("1")
             if e1:
                 fc_out["features"] = list(e1["features"])
+            # Этап 11: сохраняем отдельные FeatureCollection по эшелонам.
             fc_out["voronoi_by_echelon"] = vbe
             fc_out["voronoi_echelon_levels"] = list(DataService.VORONOI_FLIGHT_ECHELON_LEVELS)
             fc_out["voronoi_echelon_altitudes_m"] = [float(x) for x in v_alts]
@@ -2494,5 +2592,6 @@ def build_voronoi_edges_from_pipeline_raw(
             return fc_out
     except Exception:
         pass
+    # Этап 10: fallback-фильтрация no-fly, если эшелонное построение не удалось.
     fc_out = _filter_voronoi_fc_linestrings_nfz(fc_out, nfz_union_f)
     return fc_out
