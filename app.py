@@ -128,11 +128,16 @@ def get_city_map(
     city: str = Query(..., description="Название города"),
     network_type: str = Query("drive", description="Тип сети OSM"),
     simplify: bool = Query(True, description="Упрощение"),
+    force_refresh: bool = Query(False, description="Принудительно загрузить свежие данные из OSM"),
 ):
     """Границы города, no_fly_zones, bbox/center для карты."""
     try:
         data = data_service.get_city_data(
-            city, network_type=network_type, simplify=simplify, load_no_fly_zones=True
+            city,
+            network_type=network_type,
+            simplify=simplify,
+            load_no_fly_zones=True,
+            force_refresh=force_refresh,
         )
         city_boundary = data.get("city_boundary")
         road_graph = data.get("road_graph")
@@ -184,10 +189,16 @@ def export_buildings_with_heights(
     city: str = Query(..., description="Название города"),
     network_type: str = Query("drive", description="Тип сети OSM"),
     simplify: bool = Query(True, description="Упрощение"),
+    force_refresh: bool = Query(False, description="Принудительно загрузить свежие данные из OSM"),
 ):
     """Здания с высотами для подложки карты."""
     try:
-        data = data_service.get_city_data(city, network_type=network_type, simplify=simplify)
+        data = data_service.get_city_data(
+            city,
+            network_type=network_type,
+            simplify=simplify,
+            force_refresh=force_refresh,
+        )
         buildings = data.get("buildings")
         flight_levels = data.get("flight_levels", [])
         if buildings is None or len(buildings) == 0:
@@ -272,6 +283,7 @@ def get_building_clusters(
     dbscan_eps_m: float = Query(180.0, description="Радиус локального уровня (м)"),
     dbscan_min_samples: int = Query(15, description="min_samples DBSCAN локального уровня"),
     use_all_buildings: bool = Query(False, description="Все здания вне no-fly"),
+    force_refresh: bool = Query(False, description="Принудительно загрузить свежие данные из OSM"),
 ):
     """Кластеры спроса (двухуровневая кластеризация в data_service) + полигоны hull."""
 
@@ -288,7 +300,12 @@ def get_building_clusters(
         raise HTTPException(status_code=400, detail="Поддерживается только method=dbscan")
 
     try:
-        data = data_service.get_city_data(city, network_type=network_type, simplify=simplify)
+        data = data_service.get_city_data(
+            city,
+            network_type=network_type,
+            simplify=simplify,
+            force_refresh=force_refresh,
+        )
         buildings = data.get("buildings")
         road_graph = data.get("road_graph")
         city_boundary = data.get("city_boundary")

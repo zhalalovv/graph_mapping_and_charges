@@ -94,8 +94,19 @@ class DataService:
     # PATTERN: Facade — единый «вход» в сложный процесс загрузки/кэша/нормализации.
     # Почему: вызывающий код использует один метод вместо множества внутренних шагов и fallback-сценариев.
     # Этап 1: вход в загрузку данных города из кэша/OSM.
-    def get_city_data(self, city_name: str, network_type: str = 'drive', simplify: bool = True, load_no_fly_zones: bool = True):
-        """Получение данных города (универсально для любой страны). load_no_fly_zones=False — только дороги, без загрузки беспилотных зон."""
+    def get_city_data(
+        self,
+        city_name: str,
+        network_type: str = 'drive',
+        simplify: bool = True,
+        load_no_fly_zones: bool = True,
+        force_refresh: bool = False,
+    ):
+        """Получение данных города (универсально для любой страны).
+
+        load_no_fly_zones=False — только дороги, без загрузки беспилотных зон.
+        force_refresh=True — принудительно загружает свежие данные из OSM и обновляет Redis-кэш.
+        """
         normalized_name = city_name.strip()
         # Для совместимости: при load_no_fly_zones=True ключ без суффикса (старый кэш); при False — __nofly0
         base_suffix = f"{self._sanitize_name(normalized_name)}__{self._sanitize_name(network_type)}__{int(bool(simplify))}"
@@ -103,8 +114,8 @@ class DataService:
         redis_key = f"drone_planner:city:{key_suffix}"
         redis_clusters_key = f"drone_planner:city_clusters:{key_suffix}"
         
-        # Try Redis first
-        if self._redis is not None:
+        # Try Redis first (если не запрошено принудительное обновление)
+        if self._redis is not None and not force_refresh:
             try:
                 blob = self._redis.get(redis_key)
                 if blob:
