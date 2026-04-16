@@ -78,15 +78,21 @@ class DataService:
             # Локальный диск для кэша данных больше не используется
             self.logger.info("Redis not available for DataService cache; диск как кэш не используется")
     
+    # PATTERN: Observer — внешние подписчики регистрируются и получают события прогресса.
+    # Почему: DataService не знает, кто слушатель; он лишь рассылает уведомления всем callbacks.
     def add_progress_callback(self, callback):
         """Регистрирует callback для статуса этапов загрузки/обработки."""
         self.progress_callbacks.append(callback)
     
+    # PATTERN: Observer — единая точка нотификации всех подписанных обработчиков.
+    # Почему: событие прогресса транслируется списку listeners без жёсткой связки с UI/API.
     def _update_progress(self, stage, percentage, message=""):
         """Публикует прогресс во все зарегистрированные callbacks."""
         for callback in self.progress_callbacks:
             callback(stage, percentage, message)
     
+    # PATTERN: Facade — единый «вход» в сложный процесс загрузки/кэша/нормализации.
+    # Почему: вызывающий код использует один метод вместо множества внутренних шагов и fallback-сценариев.
     # Этап 1: вход в загрузку данных города из кэша/OSM.
     def get_city_data(self, city_name: str, network_type: str = 'drive', simplify: bool = True, load_no_fly_zones: bool = True):
         """Получение данных города (универсально для любой страны). load_no_fly_zones=False — только дороги, без загрузки беспилотных зон."""
@@ -780,13 +786,10 @@ class DataService:
         'school', 'university', 'college', 'hospital', 'kindergarten', 'civic', 'government',
         'train_station', 'service',
     ))
-    # Вес спроса: многоквартирники дают повышенный спрос (больше людей)
-    APARTMENT_DEMAND_WEIGHT = 4
 
     def _filter_buildings_for_demand(self, buildings: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         """
         Оставляет только здания, релевантные для спроса: жилые и часть коммерции (retail/office).
-        Пром/склады исключены.
         """
         if buildings is None or len(buildings) == 0:
             return buildings
@@ -821,6 +824,8 @@ class DataService:
             out["area_m2"] = 0.0
             return out
 
+    # PATTERN: Strategy — выбор алгоритма кластеризации через параметр method.
+    # Почему: один и тот же контракт функции поддерживает разные взаимозаменяемые стратегии (grid/dbscan).
     # Этап 3: формирование кластеров спроса (DBSCAN) и их hull.
     def get_demand_points_weighted(
         self,

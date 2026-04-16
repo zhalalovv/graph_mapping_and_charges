@@ -38,6 +38,8 @@ def _merge_polygon_unions_wgs84(*parts: Any) -> Any:
         return geoms[0]
 
 
+# PATTERN: Chain of Responsibility — объект проходит цепочку независимых фильтров/шагов.
+# Почему: каждый этап трансформирует FC и передаёт дальше (NFZ -> clearance -> bridges -> roof/echelon).
 def _voronoi_fc_copy_filter_and_bridges(
     fc_base: dict,
     *,

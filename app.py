@@ -17,7 +17,6 @@ from voronoi_paths import build_voronoi_local_paths_fc
 """
 API-слой пайплайна городской инфраструктуры БПЛА.
 
-
 Этап 1. Загрузка геопространственных данных OSM:
     `get_city_map()` -> `DataService.get_city_data()` / `DataService._download_city_data()`.
 Этап 2. Обработка и нормализация геоданных:
@@ -57,6 +56,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# PATTERN: Facade usage — API-слой обращается к DataService как к единой точке доступа к геоданным.
+# Почему: контроллеры не управляют внутренними шагами загрузки/кэша/нормализации напрямую.
 data_service = DataService()
 logger = logging.getLogger(__name__)
 
