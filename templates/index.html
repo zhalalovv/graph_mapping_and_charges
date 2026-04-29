@@ -959,6 +959,18 @@
                                 : '—';
                             const isGarage = st === 'garage';
                             const isTo = st === 'to';
+                            const tTotalVal = (p.to_drones_total != null && p.to_drones_total !== '' && !Number.isNaN(Number(p.to_drones_total)))
+                                ? String(Math.max(0, Math.round(Number(p.to_drones_total))))
+                                : '—';
+                            const tCargoVal = (p.to_drones_cargo != null && p.to_drones_cargo !== '' && !Number.isNaN(Number(p.to_drones_cargo)))
+                                ? String(Math.max(0, Math.round(Number(p.to_drones_cargo))))
+                                : '—';
+                            const tMonitoringVal = (p.to_drones_monitoring != null && p.to_drones_monitoring !== '' && !Number.isNaN(Number(p.to_drones_monitoring)))
+                                ? String(Math.max(0, Math.round(Number(p.to_drones_monitoring))))
+                                : '—';
+                            const tServiceVal = (p.to_drones_service != null && p.to_drones_service !== '' && !Number.isNaN(Number(p.to_drones_service)))
+                                ? String(Math.max(0, Math.round(Number(p.to_drones_service))))
+                                : '—';
                             const details = isGarage
                                 ? (
                                     '<br>Площадь здания: ' + areaVal
@@ -972,7 +984,13 @@
                                     + '<br>Сервисные (10%): ' + gServiceVal
                                 )
                                 : isTo
-                                ? ('<br>Площадь здания: ' + areaVal)
+                                ? (
+                                    '<br>Площадь здания: ' + areaVal
+                                    + '<br>Дронов в обслуживании (всего): ' + tTotalVal
+                                    + '<br>Грузовые (75%): ' + tCargoVal
+                                    + '<br>Мониторинговые (15%): ' + tMonitoringVal
+                                    + '<br>Сервисные (10%): ' + tServiceVal
+                                )
                                 : (
                                     '<br>Мест для дронов (всего): ' + totalVal
                                     + '<br>Грузовые (75%): ' + cargoVal
