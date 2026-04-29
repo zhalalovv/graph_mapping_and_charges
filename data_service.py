@@ -2124,12 +2124,26 @@ class DataService:
                 # Кандидаты зарядки — apartments / dormitory.
                 if not is_rooftop:
                     continue
-                rows.append({"geometry": Point(lon, lat), "source": "building", "osm_index": idx})
+                rows.append(
+                    {
+                        "geometry": Point(lon, lat),
+                        "source": "building",
+                        "osm_index": idx,
+                        "area_m2": float(area),
+                    }
+                )
             elif station_type == "ground":
                 if is_rooftop:
                     continue
                 if tag in self._GROUND_BUILDING_TAGS or tag in ("office",) or area > 400:
-                    rows.append({"geometry": Point(lon, lat), "source": "ground", "osm_index": idx})
+                    rows.append(
+                        {
+                            "geometry": Point(lon, lat),
+                            "source": "ground",
+                            "osm_index": idx,
+                            "area_m2": float(area),
+                        }
+                    )
             elif station_type in ("garage", "to"):
                 if tag in self._GARAGE_TO_EXCLUDED_BUILDING_TAGS:
                     continue
@@ -2157,6 +2171,7 @@ class DataService:
                         "geometry": Point(lon, lat),
                         "source": "industrial",
                         "osm_index": idx,
+                        "area_m2": float(area),
                     }
                 )
             else:
@@ -2171,6 +2186,7 @@ class DataService:
                             "geometry": Point(float(shpt.x), float(shpt.y)),
                             "source": "landuse_interior",
                             "osm_index": -(i + 1),
+                            "area_m2": None,
                         }
                     )
                 if rows:

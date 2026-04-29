@@ -633,6 +633,27 @@
                 if (clustersPanel) clustersPanel.style.display = 'block';
                 if (stationsPanel) stationsPanel.style.display = 'block';
                 if (buildingsPanel) buildingsPanel.style.display = 'block';
+                // После загрузки города автоматически подтягиваем stations placement
+                // (станции + магистрали + ветки + локальные + Voronoi), чтобы кнопка
+                // "Загрузить" показывала не только кластеры.
+                try {
+                    if (statusEl) statusEl.textContent = 'Загрузка станций и маршрутов...';
+                    // Для кнопки "Загрузить" запускаем полный пересчёт (без кэша Redis).
+                    const placementUrl = buildStationsPlacementUrl(false, false);
+                    const placementResp = await fetch(placementUrl);
+                    if (placementResp.ok) {
+                        const placementData = await placementResp.json();
+                        renderStationsRulesPlacement(placementData);
+                        if (statusEl) statusEl.textContent = '✓ Город, станции и маршруты загружены';
+                    } else {
+                        const err = await placementResp.json().catch(() => ({}));
+                        console.warn('Placement не загружен после пересчёта:', err);
+                        if (statusEl) statusEl.textContent = '✓ Город загружен (станции/маршруты не получены)';
+                    }
+                } catch (placementError) {
+                    console.warn('Ошибка автозагрузки stations placement:', placementError);
+                    if (statusEl) statusEl.textContent = '✓ Город загружен (станции/маршруты не получены)';
+                }
             } catch (e) {
                 console.error(e);
                 statusEl.textContent = '✗ Ошибка: ' + e.message;
@@ -905,10 +926,62 @@
                         onEachFeature: function(feature, layer) {
                             const p = feature.properties || {};
                             const cid = p.cluster_id != null ? p.cluster_id : '—';
-                            const vnote = p.vertical_planning_note;
+                            const st = String(p.station_type || '');
+                            const totalRaw = (p.cluster_drones_total != null) ? p.cluster_drones_total : p.cluster_drones_capacity;
+                            const totalVal = (totalRaw != null && totalRaw !== '' && !Number.isNaN(Number(totalRaw)))
+                                ? String(Math.max(0, Math.round(Number(totalRaw))))
+                                : '—';
+                            const cargoVal = (p.cluster_drones_cargo != null && p.cluster_drones_cargo !== '' && !Number.isNaN(Number(p.cluster_drones_cargo)))
+                                ? String(Math.max(0, Math.round(Number(p.cluster_drones_cargo))))
+                                : '—';
+                            const monitoringVal = (p.cluster_drones_monitoring != null && p.cluster_drones_monitoring !== '' && !Number.isNaN(Number(p.cluster_drones_monitoring)))
+                                ? String(Math.max(0, Math.round(Number(p.cluster_drones_monitoring))))
+                                : '—';
+                            const serviceVal = (p.cluster_drones_service != null && p.cluster_drones_service !== '' && !Number.isNaN(Number(p.cluster_drones_service)))
+                                ? String(Math.max(0, Math.round(Number(p.cluster_drones_service))))
+                                : '—';
+                            const areaRaw = (p.area_m2 != null) ? p.area_m2 : p.building_area_m2;
+                            const areaVal = (areaRaw != null && areaRaw !== '' && !Number.isNaN(Number(areaRaw)))
+                                ? Number(areaRaw).toLocaleString('ru-RU', { maximumFractionDigits: 0 }) + ' м²'
+                                : '—';
+                            const gTotalRaw = p.garage_drones_total;
+                            const gTotalVal = (gTotalRaw != null && gTotalRaw !== '' && !Number.isNaN(Number(gTotalRaw)))
+                                ? String(Math.max(0, Math.round(Number(gTotalRaw))))
+                                : '—';
+                            const gCargoVal = (p.garage_drones_cargo != null && p.garage_drones_cargo !== '' && !Number.isNaN(Number(p.garage_drones_cargo)))
+                                ? String(Math.max(0, Math.round(Number(p.garage_drones_cargo))))
+                                : '—';
+                            const gMonitoringVal = (p.garage_drones_monitoring != null && p.garage_drones_monitoring !== '' && !Number.isNaN(Number(p.garage_drones_monitoring)))
+                                ? String(Math.max(0, Math.round(Number(p.garage_drones_monitoring))))
+                                : '—';
+                            const gServiceVal = (p.garage_drones_service != null && p.garage_drones_service !== '' && !Number.isNaN(Number(p.garage_drones_service)))
+                                ? String(Math.max(0, Math.round(Number(p.garage_drones_service))))
+                                : '—';
+                            const isGarage = st === 'garage';
+                            const isTo = st === 'to';
+                            const details = isGarage
+                                ? (
+                                    '<br>Площадь здания: ' + areaVal
+                                    + '<br>Дронов на связанных зарядках (A+B): '
+                                    + ((p.garage_linked_charging_total != null && p.garage_linked_charging_total !== '' && !Number.isNaN(Number(p.garage_linked_charging_total)))
+                                        ? String(Math.max(0, Math.round(Number(p.garage_linked_charging_total))))
+                                        : '—')
+                                    + '<br>Дронов в гараже (всего): ' + gTotalVal
+                                    + '<br>Грузовые (75%): ' + gCargoVal
+                                    + '<br>Мониторинговые (15%): ' + gMonitoringVal
+                                    + '<br>Сервисные (10%): ' + gServiceVal
+                                )
+                                : isTo
+                                ? ('<br>Площадь здания: ' + areaVal)
+                                : (
+                                    '<br>Мест для дронов (всего): ' + totalVal
+                                    + '<br>Грузовые (75%): ' + cargoVal
+                                    + '<br>Мониторинговые (15%): ' + monitoringVal
+                                    + '<br>Сервисные (10%): ' + serviceVal
+                                );
                             layer.bindPopup(
                                 title + '<br>Кластер №' + cid
-                                + (vnote ? '<br><small style="color:#475569">' + vnote + '</small>' : '')
+                                + details
                             );
                         },
                     }).addTo(stationsRulesLayerGroup);
