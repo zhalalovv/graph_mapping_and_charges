@@ -1062,15 +1062,26 @@ def _station_edge_props(
     """Собирает стандартный набор свойств ребра с метаданными о станциях и источниках."""
     sa = bool(is_station[a]) if a < len(is_station) else False
     sb = bool(is_station[b]) if b < len(is_station) else False
+    # Совместимость с потребителями, которые разрешают движение только по edge_type="local".
+    # Для рёбер Вороного сохраняем исходный тип в edge_type_voronoi_source,
+    # но публикуем edge_type="local", чтобы их не отфильтровывали как неизвестные.
+    effective_edge_type = str(edge_type)
+    voronoi_source_type = None
+    if effective_edge_type in ("voronoi_local", "voronoi_station_local"):
+        voronoi_source_type = effective_edge_type
+        effective_edge_type = "local"
     props: dict[str, Any] = {
         "cluster_id": cluster_prop,
-        "edge_type": edge_type,
+        "edge_type": effective_edge_type,
         "source_i": int(source_i if source_i is not None else a),
         "target_i": int(target_i if target_i is not None else b),
         "source_is_station": sa,
         "target_is_station": sb,
         "connects_station": sa or sb,
     }
+    if voronoi_source_type is not None:
+        props["edge_type_voronoi_source"] = voronoi_source_type
+        props["local_edge_mode"] = "voronoi"
     if group_mode is not None:
         props["group_mode"] = group_mode
     return props

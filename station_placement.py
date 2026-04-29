@@ -48,6 +48,23 @@ NO_FLY_DETOUR_OFFSET_M = 10.0
 NO_FLY_CLEARANCE_M = 0.0
 # Максимум станций типа Б, присоединённых веткой к одной станции типа А.
 MAX_TYPE_B_BRANCHES_PER_TYPE_A = 4
+# Формула ёмкости зарядки по весу кластера:
+# drones_per_cluster = cluster_weight * 0.04 / 2 = cluster_weight * 0.02
+CHARGING_CLUSTER_WEIGHT_COEFF = 0.04
+CHARGING_CLUSTER_WEIGHT_DIVISOR = 2.0
+DRONE_CARGO_SHARE = 0.75
+DRONE_MONITORING_SHARE = 0.15
+DRONE_SERVICE_SHARE = 0.10
+
+# Паспортные объёмы дронов (м³) с технологическим запасом (разложенное состояние + допуск).
+DRONE_CARGO_VOLUME_M3 = 4.470       # DJI Matrice 600 Pro
+DRONE_MONITORING_VOLUME_M3 = 1.075  # DJI Matrice 350 RTK
+DRONE_SERVICE_VOLUME_M3 = 3.093     # Lucid Bots Sherpa
+
+# Полезный коэффициент объёма гаража: 20% уходит под аккумуляторы/оборудование.
+GARAGE_USABLE_VOLUME_FACTOR = 0.80
+# Если высота у точки гаража не пришла, используем консервативный дефолт для оценки объёма.
+GARAGE_DEFAULT_HEIGHT_M = 3.5
 
 # Выбор между boundary и A*: минимизируем комбинированный score (длина/хорда + «вылет» от хорды).
 # Доп. штраф за километры «сверх хорды» (слабее ratio, чтобы не ломать выбор при почти равных ratio).
@@ -128,6 +145,289 @@ def _points_array(gdf: gpd.GeoDataFrame) -> np.ndarray:
         g = row.geometry
         coords.append(_coords_from_geom(g))
     return np.array(coords)
+
+
+def _attach_charging_capacity_from_cluster_weight(
+    charge_stations: Optional[gpd.GeoDataFrame],
+    demand: Optional[gpd.GeoDataFrame],
+) -> Optional[gpd.GeoDataFrame]:
+    """
+    Проставляет станциям зарядки расчёт ёмкости по весу кластера:
+    drones = weight(cluster) * CHARGING_CLUSTER_WEIGHT_COEFF / CHARGING_CLUSTER_WEIGHT_DIVISOR.
+    """
+    def _split_drone_capacity_by_type(total: int) -> tuple[int, int, int]:
+        """Разбивка общего количества дронов: грузовые/мониторинговые/сервисные."""
+        t = max(0, int(total))
+        cargo = int(round(t * DRONE_CARGO_SHARE))
+        monitoring = int(round(t * DRONE_MONITORING_SHARE))
+        service = t - cargo - monitoring
+        if service < 0:
+            deficit = -service
+            cut_cargo = min(deficit, cargo)
+            cargo -= cut_cargo
+            deficit -= cut_cargo
+            if deficit > 0:
+                cut_monitoring = min(deficit, monitoring)
+                monitoring -= cut_monitoring
+                deficit -= cut_monitoring
+            service = 0
+        return cargo, monitoring, service
+
+    if charge_stations is None or len(charge_stations) == 0:
+        return charge_stations
+    if demand is None or len(demand) == 0:
+        out = charge_stations.copy()
+        out["cluster_weight"] = None
+        out["cluster_drones_capacity"] = None
+        out["cluster_drones_capacity_raw"] = None
+        out["cluster_drones_total"] = None
+        out["cluster_drones_cargo"] = None
+        out["cluster_drones_monitoring"] = None
+        out["cluster_drones_service"] = None
+        return out
+
+    cluster_col = None
+    if "cluster_id" in demand.columns:
+        cluster_col = "cluster_id"
+    elif "subcluster_id" in demand.columns:
+        cluster_col = "subcluster_id"
+    if cluster_col is None or "weight" not in demand.columns or "cluster_id" not in charge_stations.columns:
+        out = charge_stations.copy()
+        out["cluster_weight"] = None
+        out["cluster_drones_capacity"] = None
+        out["cluster_drones_capacity_raw"] = None
+        out["cluster_drones_total"] = None
+        out["cluster_drones_cargo"] = None
+        out["cluster_drones_monitoring"] = None
+        out["cluster_drones_service"] = None
+        return out
+
+    d = demand.copy()
+    if "is_cluster_fill" in d.columns:
+        d = d[~d["is_cluster_fill"].fillna(False).astype(bool)].copy()
+    if len(d) == 0:
+        out = charge_stations.copy()
+        out["cluster_weight"] = None
+        out["cluster_drones_capacity"] = None
+        out["cluster_drones_capacity_raw"] = None
+        out["cluster_drones_total"] = None
+        out["cluster_drones_cargo"] = None
+        out["cluster_drones_monitoring"] = None
+        out["cluster_drones_service"] = None
+        return out
+
+    def _cluster_key(v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        try:
+            if isinstance(v, float) and np.isnan(v):
+                return None
+        except Exception:
+            pass
+        s = str(v).strip()
+        if not s:
+            return None
+        # Канонизируем числовые id: 1, 1.0, "1.0" -> "1"
+        try:
+            f = float(s)
+            if np.isfinite(f) and abs(f - round(f)) < 1e-9:
+                return str(int(round(f)))
+        except Exception:
+            pass
+        return s
+
+    d["__cid_key"] = d[cluster_col].map(_cluster_key)
+    d["__w_norm"] = pd.to_numeric(d["weight"], errors="coerce")
+    d = d[d["__cid_key"].notna() & d["__w_norm"].notna()].copy()
+    if len(d) == 0:
+        out = charge_stations.copy()
+        out["cluster_weight"] = None
+        out["cluster_drones_capacity"] = None
+        out["cluster_drones_capacity_raw"] = None
+        out["cluster_drones_total"] = None
+        out["cluster_drones_cargo"] = None
+        out["cluster_drones_monitoring"] = None
+        out["cluster_drones_service"] = None
+        return out
+
+    # Вес кластера — сумма весов его demand-точек.
+    cluster_weight_map: Dict[str, float] = (
+        d.groupby("__cid_key")["__w_norm"].sum().astype(float).to_dict()
+    )
+    # Центры кластеров для fallback-матчинга станции по геометрии (если cluster_id пустой/не найден).
+    center_lon_by_key: Dict[str, float] = {}
+    center_lat_by_key: Dict[str, float] = {}
+    try:
+        d["__lon"] = d.geometry.map(lambda g: float(getattr(g, "x", getattr(getattr(g, "centroid", None), "x", 0.0))))
+        d["__lat"] = d.geometry.map(lambda g: float(getattr(g, "y", getattr(getattr(g, "centroid", None), "y", 0.0))))
+        grouped = d.groupby("__cid_key", as_index=True)
+        for k, grp in grouped:
+            ws = grp["__w_norm"].to_numpy(dtype=float)
+            lons = grp["__lon"].to_numpy(dtype=float)
+            lats = grp["__lat"].to_numpy(dtype=float)
+            wsum = float(np.sum(ws))
+            if wsum > 0:
+                center_lon_by_key[k] = float(np.sum(lons * ws) / wsum)
+                center_lat_by_key[k] = float(np.sum(lats * ws) / wsum)
+            else:
+                center_lon_by_key[k] = float(np.mean(lons)) if len(lons) > 0 else 0.0
+                center_lat_by_key[k] = float(np.mean(lats)) if len(lats) > 0 else 0.0
+    except Exception:
+        center_lon_by_key = {}
+        center_lat_by_key = {}
+
+    out = charge_stations.copy()
+    cw_vals: List[Optional[float]] = []
+    cap_raw_vals: List[Optional[float]] = []
+    cap_int_vals: List[Optional[int]] = []
+    total_vals: List[Optional[int]] = []
+    cargo_vals: List[Optional[int]] = []
+    monitoring_vals: List[Optional[int]] = []
+    service_vals: List[Optional[int]] = []
+    for _, row in out.iterrows():
+        cid_key = _cluster_key(row.get("cluster_id"))
+        if cid_key is None or cid_key not in cluster_weight_map:
+            # Fallback только для зарядок: берём ближайший центр demand-кластера.
+            st = str(row.get("station_type") or "")
+            if st in ("charge_a", "charge_b") and center_lon_by_key:
+                lon_s, lat_s = _coords_from_geom(row.get("geometry"))
+                best_key = None
+                best_d = float("inf")
+                for k in center_lon_by_key.keys():
+                    d_km = haversine_km(
+                        float(lat_s),
+                        float(lon_s),
+                        float(center_lat_by_key.get(k, 0.0)),
+                        float(center_lon_by_key.get(k, 0.0)),
+                    )
+                    if d_km < best_d:
+                        best_d = d_km
+                        best_key = k
+                if best_key is not None:
+                    cid_key = best_key
+        if cid_key is None:
+            cw_vals.append(None)
+            cap_raw_vals.append(None)
+            cap_int_vals.append(None)
+            total_vals.append(None)
+            cargo_vals.append(None)
+            monitoring_vals.append(None)
+            service_vals.append(None)
+            continue
+        w = cluster_weight_map.get(cid_key)
+        if w is None:
+            cw_vals.append(None)
+            cap_raw_vals.append(None)
+            cap_int_vals.append(None)
+            total_vals.append(None)
+            cargo_vals.append(None)
+            monitoring_vals.append(None)
+            service_vals.append(None)
+            continue
+        cap_raw = float(w) * float(CHARGING_CLUSTER_WEIGHT_COEFF) / float(CHARGING_CLUSTER_WEIGHT_DIVISOR)
+        cap_total = int(round(cap_raw))
+        cargo_n, monitoring_n, service_n = _split_drone_capacity_by_type(cap_total)
+        cw_vals.append(float(w))
+        cap_raw_vals.append(cap_raw)
+        cap_int_vals.append(cap_total)
+        total_vals.append(cap_total)
+        cargo_vals.append(cargo_n)
+        monitoring_vals.append(monitoring_n)
+        service_vals.append(service_n)
+
+    out["cluster_weight"] = cw_vals
+    out["cluster_drones_capacity_raw"] = cap_raw_vals
+    out["cluster_drones_capacity"] = cap_int_vals
+    out["cluster_drones_total"] = total_vals
+    out["cluster_drones_cargo"] = cargo_vals
+    out["cluster_drones_monitoring"] = monitoring_vals
+    out["cluster_drones_service"] = service_vals
+    return out
+
+
+def _attach_garage_capacity_by_volume(
+    garages: Optional[gpd.GeoDataFrame],
+) -> Optional[gpd.GeoDataFrame]:
+    """
+    Оценивает вместимость гаража по полезному объёму:
+      usable_volume = area_m2 * height_m * 0.8
+    Затем вычисляет общее число дронов и разбивку по типам (75/15/10).
+    """
+    if garages is None or len(garages) == 0:
+        return garages
+
+    def _safe_float(v: Any) -> Optional[float]:
+        try:
+            if v is None:
+                return None
+            if isinstance(v, float) and np.isnan(v):
+                return None
+            return float(v)
+        except Exception:
+            return None
+
+    def _split_counts(total: int) -> tuple[int, int, int]:
+        t = max(0, int(total))
+        cargo = int(round(t * DRONE_CARGO_SHARE))
+        monitoring = int(round(t * DRONE_MONITORING_SHARE))
+        service = t - cargo - monitoring
+        if service < 0:
+            deficit = -service
+            cut_cargo = min(deficit, cargo)
+            cargo -= cut_cargo
+            deficit -= cut_cargo
+            if deficit > 0:
+                cut_monitoring = min(deficit, monitoring)
+                monitoring -= cut_monitoring
+            service = 0
+        return cargo, monitoring, service
+
+    avg_drone_volume = (
+        DRONE_CARGO_SHARE * DRONE_CARGO_VOLUME_M3
+        + DRONE_MONITORING_SHARE * DRONE_MONITORING_VOLUME_M3
+        + DRONE_SERVICE_SHARE * DRONE_SERVICE_VOLUME_M3
+    )
+    avg_drone_volume = max(float(avg_drone_volume), 1e-6)
+
+    out = garages.copy()
+    usable_volume_vals: List[Optional[float]] = []
+    total_vals: List[Optional[int]] = []
+    cargo_vals: List[Optional[int]] = []
+    monitoring_vals: List[Optional[int]] = []
+    service_vals: List[Optional[int]] = []
+    height_vals: List[Optional[float]] = []
+
+    for _, row in out.iterrows():
+        area = _safe_float(row.get("area_m2"))
+        if area is None or area <= 0:
+            usable_volume_vals.append(None)
+            total_vals.append(None)
+            cargo_vals.append(None)
+            monitoring_vals.append(None)
+            service_vals.append(None)
+            height_vals.append(None)
+            continue
+        h = _safe_float(row.get("height_m"))
+        if h is None or h <= 0:
+            h = float(GARAGE_DEFAULT_HEIGHT_M)
+        usable_volume = float(area) * float(h) * float(GARAGE_USABLE_VOLUME_FACTOR)
+        total = int(np.floor(usable_volume / avg_drone_volume))
+        cargo_n, monitoring_n, service_n = _split_counts(total)
+
+        usable_volume_vals.append(usable_volume)
+        total_vals.append(total)
+        cargo_vals.append(cargo_n)
+        monitoring_vals.append(monitoring_n)
+        service_vals.append(service_n)
+        height_vals.append(float(h))
+
+    out["garage_height_m_used"] = height_vals
+    out["garage_usable_volume_m3"] = usable_volume_vals
+    out["garage_drones_total"] = total_vals
+    out["garage_drones_cargo"] = cargo_vals
+    out["garage_drones_monitoring"] = monitoring_vals
+    out["garage_drones_service"] = service_vals
+    return out
 
 
 def _lonlat_exclusions_from_gdf(gdf: Optional[gpd.GeoDataFrame]) -> List[Tuple[float, float]]:
@@ -4478,6 +4778,12 @@ def run_full_pipeline(
         except Exception:
             pass
 
+    # Ёмкость по кластерам: drones = weight * 0.04 / 2 (для каждой зарядной станции по её cluster_id).
+    try:
+        charge_stations = _attach_charging_capacity_from_cluster_weight(charge_stations, demand)
+    except Exception as e:
+        logger.warning("Не удалось рассчитать capacity зарядок по весу кластеров: %s", e)
+
     # --- Информация о кластерах и “зданиях зарядки” ---
     cluster_count = 0
     charging_buildings_in_clusters = 0
@@ -4566,6 +4872,8 @@ def run_full_pipeline(
             min_separation_km=MIN_FACILITY_SEPARATION_KM,
             exclude_lonlat=busy_lonlat,
         )
+        # Вместимость гаражей по объёму с учётом 20% объёма под оборудование.
+        garages = _attach_garage_capacity_by_volume(garages)
     else:
         garages = gpd.GeoDataFrame()
         to_stations = gpd.GeoDataFrame()
