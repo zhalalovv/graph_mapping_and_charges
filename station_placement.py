@@ -65,6 +65,13 @@ DRONE_SERVICE_VOLUME_M3 = 3.093     # Lucid Bots Sherpa
 GARAGE_USABLE_VOLUME_FACTOR = 0.80
 # Если высота у точки гаража не пришла, используем консервативный дефолт для оценки объёма.
 GARAGE_DEFAULT_HEIGHT_M = 3.5
+# Для станции ТО под обслуживание дронов используем 60% площади здания.
+TO_USABLE_AREA_FACTOR = 0.60
+
+# Площадь на один дрон (м²) по габаритам "с запасом".
+DRONE_CARGO_FOOTPRINT_M2 = 2.068 * 1.918       # DJI Matrice 600 Pro
+DRONE_SERVICE_FOOTPRINT_M2 = 1.010 * 1.750     # Lucid Bots Sherpa
+DRONE_MONITORING_FOOTPRINT_M2 = 0.830 * 1.070  # DJI Matrice 350 RTK
 
 # Выбор между boundary и A*: минимизируем комбинированный score (длина/хорда + «вылет» от хорды).
 # Доп. штраф за километры «сверх хорды» (слабее ratio, чтобы не ломать выбор при почти равных ratio).
@@ -543,6 +550,84 @@ def _attach_garage_capacity_from_linked_charging(
     out["garage_drones_monitoring"] = monitorings
     out["garage_drones_service"] = services
     out["garage_linked_charging_total"] = linked_vals
+    return out
+
+
+def _attach_to_capacity_by_service_area(
+    to_stations: Optional[gpd.GeoDataFrame],
+) -> Optional[gpd.GeoDataFrame]:
+    """
+    Вместимость ТО по площади:
+      to_usable_area_m2 = area_m2 * 0.60
+      to_drones_total = floor(to_usable_area_m2 / weighted_avg_drone_footprint_m2)
+    С разбиением по типам 75/15/10.
+    """
+    if to_stations is None or len(to_stations) == 0:
+        return to_stations
+
+    def _safe_float(v: Any) -> Optional[float]:
+        try:
+            if v is None:
+                return None
+            if isinstance(v, float) and np.isnan(v):
+                return None
+            return float(v)
+        except Exception:
+            return None
+
+    def _split_counts(total: int) -> tuple[int, int, int]:
+        t = max(0, int(total))
+        cargo = int(round(t * DRONE_CARGO_SHARE))
+        monitoring = int(round(t * DRONE_MONITORING_SHARE))
+        service = t - cargo - monitoring
+        if service < 0:
+            deficit = -service
+            cut_cargo = min(deficit, cargo)
+            cargo -= cut_cargo
+            deficit -= cut_cargo
+            if deficit > 0:
+                cut_monitoring = min(deficit, monitoring)
+                monitoring -= cut_monitoring
+            service = 0
+        return cargo, monitoring, service
+
+    avg_drone_footprint = (
+        DRONE_CARGO_SHARE * DRONE_CARGO_FOOTPRINT_M2
+        + DRONE_MONITORING_SHARE * DRONE_MONITORING_FOOTPRINT_M2
+        + DRONE_SERVICE_SHARE * DRONE_SERVICE_FOOTPRINT_M2
+    )
+    avg_drone_footprint = max(float(avg_drone_footprint), 1e-6)
+
+    out = to_stations.copy()
+    usable_area_vals: List[Optional[float]] = []
+    total_vals: List[Optional[int]] = []
+    cargo_vals: List[Optional[int]] = []
+    monitoring_vals: List[Optional[int]] = []
+    service_vals: List[Optional[int]] = []
+
+    for _, row in out.iterrows():
+        area = _safe_float(row.get("area_m2"))
+        if area is None or area <= 0:
+            usable_area_vals.append(None)
+            total_vals.append(None)
+            cargo_vals.append(None)
+            monitoring_vals.append(None)
+            service_vals.append(None)
+            continue
+        usable_area = float(area) * float(TO_USABLE_AREA_FACTOR)
+        total = int(np.floor(usable_area / avg_drone_footprint))
+        c, m, s = _split_counts(total)
+        usable_area_vals.append(usable_area)
+        total_vals.append(total)
+        cargo_vals.append(c)
+        monitoring_vals.append(m)
+        service_vals.append(s)
+
+    out["to_usable_area_m2"] = usable_area_vals
+    out["to_drones_total"] = total_vals
+    out["to_drones_cargo"] = cargo_vals
+    out["to_drones_monitoring"] = monitoring_vals
+    out["to_drones_service"] = service_vals
     return out
 
 
@@ -3921,7 +4006,21 @@ class StationPlacement:
                         d_km,
                         max_branch_km,
                     )
-                pending.append((f"to_{i}", ia, lon_f, lat_f, lon_a, lat_a, "branch_to %s→A %s" % (i, ia), {}))
+                t_props: Dict[str, Any] = {}
+                for fld in (
+                    "to_drones_total",
+                    "to_drones_cargo",
+                    "to_drones_monitoring",
+                    "to_drones_service",
+                ):
+                    val = row.get(fld)
+                    if val is None or (isinstance(val, float) and np.isnan(val)):
+                        continue
+                    try:
+                        t_props[fld] = int(round(float(val)))
+                    except Exception:
+                        continue
+                pending.append((f"to_{i}", ia, lon_f, lat_f, lon_a, lat_a, "branch_to %s→A %s" % (i, ia), t_props))
 
         if not pending:
             return []
@@ -5015,6 +5114,8 @@ def run_full_pipeline(
             min_separation_km=MIN_FACILITY_SEPARATION_KM,
             exclude_lonlat=busy_lonlat,
         )
+        # Вместимость станций ТО по площади (60% площади здания под обслуживание).
+        to_stations = _attach_to_capacity_by_service_area(to_stations)
     else:
         garages = gpd.GeoDataFrame()
         to_stations = gpd.GeoDataFrame()
@@ -5160,6 +5261,16 @@ def run_full_pipeline(
         metrics["garage_drones_monitoring"] = _sum_int_col(garages, "garage_drones_monitoring")
         metrics["garage_drones_service"] = _sum_int_col(garages, "garage_drones_service")
         metrics["garage_linked_charging_total"] = _sum_int_col(garages, "garage_linked_charging_total")
+    if to_stations is not None and len(to_stations) > 0:
+        def _sum_int_col_to(df: gpd.GeoDataFrame, col: str) -> int:
+            if col not in df.columns:
+                return 0
+            s = pd.to_numeric(df[col], errors="coerce").fillna(0)
+            return int(s.sum())
+        metrics["to_drones_total"] = _sum_int_col_to(to_stations, "to_drones_total")
+        metrics["to_drones_cargo"] = _sum_int_col_to(to_stations, "to_drones_cargo")
+        metrics["to_drones_monitoring"] = _sum_int_col_to(to_stations, "to_drones_monitoring")
+        metrics["to_drones_service"] = _sum_int_col_to(to_stations, "to_drones_service")
 
     return {
         "buildings": buildings,
