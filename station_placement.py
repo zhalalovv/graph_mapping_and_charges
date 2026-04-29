@@ -3871,7 +3871,7 @@ class StationPlacement:
             la, lata = a_pts[best_ia]
             return best_ia, float(la), float(lata), float(best_d)
 
-        pending: List[Tuple[str, Any, float, float, float, float, str]] = []
+        pending: List[Tuple[str, Any, float, float, float, float, str, Dict[str, Any]]] = []
         if garage_points is not None:
             for i, row in garage_points.iterrows():
                 lon_f, lat_f = _coords_from_geom(row.geometry)
@@ -3883,7 +3883,33 @@ class StationPlacement:
                         d_km,
                         max_branch_km,
                     )
-                pending.append((f"garage_{i}", ia, lon_f, lat_f, lon_a, lat_a, "branch_garage %s→A %s" % (i, ia)))
+                g_props: Dict[str, Any] = {}
+                for fld in (
+                    "garage_drones_total",
+                    "garage_drones_cargo",
+                    "garage_drones_monitoring",
+                    "garage_drones_service",
+                    "garage_linked_charging_total",
+                ):
+                    val = row.get(fld)
+                    if val is None or (isinstance(val, float) and np.isnan(val)):
+                        continue
+                    try:
+                        g_props[fld] = int(round(float(val)))
+                    except Exception:
+                        continue
+                pending.append(
+                    (
+                        f"garage_{i}",
+                        ia,
+                        lon_f,
+                        lat_f,
+                        lon_a,
+                        lat_a,
+                        "branch_garage %s→A %s" % (i, ia),
+                        g_props,
+                    )
+                )
         if to_points is not None:
             for i, row in to_points.iterrows():
                 lon_f, lat_f = _coords_from_geom(row.geometry)
@@ -3895,7 +3921,7 @@ class StationPlacement:
                         d_km,
                         max_branch_km,
                     )
-                pending.append((f"to_{i}", ia, lon_f, lat_f, lon_a, lat_a, "branch_to %s→A %s" % (i, ia)))
+                pending.append((f"to_{i}", ia, lon_f, lat_f, lon_a, lat_a, "branch_to %s→A %s" % (i, ia), {}))
 
         if not pending:
             return []
@@ -3911,7 +3937,7 @@ class StationPlacement:
         )
         detour_counter = [0]
 
-        for sid, ia, lon_f, lat_f, lon_a, lat_a, lbl in pending:
+        for sid, ia, lon_f, lat_f, lon_a, lat_a, lbl, extra_props in pending:
             line_coords, w_km = self._route_branch_segment_lonlat(
                 lon_f,
                 lat_f,
@@ -3937,6 +3963,7 @@ class StationPlacement:
                         "source_id": sid,
                         "target_id": f"charge_{ia}",
                         "weight_km": w_km,
+                        **(extra_props or {}),
                     },
                 }
             )
@@ -5121,6 +5148,18 @@ def run_full_pipeline(
         }
     metrics["voronoi_clusters_with_paths"] = int((voronoi_edges or {}).get("clusters_with_paths") or 0)
     metrics["voronoi_clusters_total"] = int((voronoi_edges or {}).get("clusters_total") or 0)
+    # Операционные метрики по гаражам: это уже не только визуализация, а данные для downstream-логики.
+    if garages is not None and len(garages) > 0:
+        def _sum_int_col(df: gpd.GeoDataFrame, col: str) -> int:
+            if col not in df.columns:
+                return 0
+            s = pd.to_numeric(df[col], errors="coerce").fillna(0)
+            return int(s.sum())
+        metrics["garage_drones_total"] = _sum_int_col(garages, "garage_drones_total")
+        metrics["garage_drones_cargo"] = _sum_int_col(garages, "garage_drones_cargo")
+        metrics["garage_drones_monitoring"] = _sum_int_col(garages, "garage_drones_monitoring")
+        metrics["garage_drones_service"] = _sum_int_col(garages, "garage_drones_service")
+        metrics["garage_linked_charging_total"] = _sum_int_col(garages, "garage_linked_charging_total")
 
     return {
         "buildings": buildings,
