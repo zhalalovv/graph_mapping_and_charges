@@ -962,6 +962,10 @@
                             const details = isGarage
                                 ? (
                                     '<br>Площадь здания: ' + areaVal
+                                    + '<br>Дронов на связанных зарядках (A+B): '
+                                    + ((p.garage_linked_charging_total != null && p.garage_linked_charging_total !== '' && !Number.isNaN(Number(p.garage_linked_charging_total)))
+                                        ? String(Math.max(0, Math.round(Number(p.garage_linked_charging_total))))
+                                        : '—')
                                     + '<br>Дронов в гараже (всего): ' + gTotalVal
                                     + '<br>Грузовые (75%): ' + gCargoVal
                                     + '<br>Мониторинговые (15%): ' + gMonitoringVal

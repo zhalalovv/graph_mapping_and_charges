@@ -430,6 +430,122 @@ def _attach_garage_capacity_by_volume(
     return out
 
 
+def _attach_garage_capacity_from_linked_charging(
+    garages: Optional[gpd.GeoDataFrame],
+    charge_stations: Optional[gpd.GeoDataFrame],
+    branch_edges: Optional[List[Dict[str, Any]]],
+) -> Optional[gpd.GeoDataFrame]:
+    """
+    Для каждого гаража берёт только 30% от суммы дронов на связанных зарядках:
+    - базовая связь гараж -> A берётся из facility branch edges (source_id='garage_*', target_id='charge_*');
+    - к этой A добавляются все B, у которых branch B->A ведёт в ту же target_id='charge_*'.
+    """
+    if garages is None or len(garages) == 0:
+        return garages
+
+    out = garages.copy()
+    out["garage_drones_total"] = None
+    out["garage_drones_cargo"] = None
+    out["garage_drones_monitoring"] = None
+    out["garage_drones_service"] = None
+    out["garage_linked_charging_total"] = None
+
+    if charge_stations is None or len(charge_stations) == 0 or not branch_edges:
+        return out
+
+    def _split_counts(total: int) -> tuple[int, int, int]:
+        t = max(0, int(total))
+        cargo = int(round(t * DRONE_CARGO_SHARE))
+        monitoring = int(round(t * DRONE_MONITORING_SHARE))
+        service = t - cargo - monitoring
+        if service < 0:
+            deficit = -service
+            cut_cargo = min(deficit, cargo)
+            cargo -= cut_cargo
+            deficit -= cut_cargo
+            if deficit > 0:
+                cut_monitoring = min(deficit, monitoring)
+                monitoring -= cut_monitoring
+            service = 0
+        return cargo, monitoring, service
+
+    def _safe_int(v: Any) -> Optional[int]:
+        try:
+            if v is None:
+                return None
+            if isinstance(v, float) and np.isnan(v):
+                return None
+            return int(round(float(v)))
+        except Exception:
+            return None
+
+    # Дроны на станциях (A/B) по station_id:
+    # A -> "charge_<idx>", B -> "<idx>" (как source_id в branch B->A).
+    station_total_by_id: Dict[str, int] = {}
+    b_ids: set[str] = set()
+    for idx, row in charge_stations.iterrows():
+        st = str(row.get("station_type") or "")
+        total = _safe_int(row.get("cluster_drones_total"))
+        if total is None:
+            total = _safe_int(row.get("cluster_drones_capacity"))
+        if total is None:
+            continue
+        if st == "charge_a":
+            station_total_by_id[f"charge_{idx}"] = total
+        elif st == "charge_b":
+            sid = str(idx)
+            station_total_by_id[sid] = total
+            b_ids.add(sid)
+
+    # A -> sum(B), где B напрямую привязаны к A по веткам B->A.
+    b_sum_by_a: Dict[str, int] = {}
+    garage_to_a: Dict[str, str] = {}
+    for f in branch_edges:
+        p = (f or {}).get("properties") or {}
+        src = str(p.get("source_id") or "")
+        tgt = str(p.get("target_id") or "")
+        if not src or not tgt:
+            continue
+        if src.startswith("garage_") and tgt.startswith("charge_"):
+            garage_to_a[src] = tgt
+            continue
+        if src in b_ids and tgt.startswith("charge_"):
+            b_sum_by_a[tgt] = int(b_sum_by_a.get(tgt, 0)) + int(station_total_by_id.get(src, 0))
+
+    totals: List[Optional[int]] = []
+    cargos: List[Optional[int]] = []
+    monitorings: List[Optional[int]] = []
+    services: List[Optional[int]] = []
+    linked_vals: List[Optional[int]] = []
+
+    for gi, _ in out.iterrows():
+        gsid = f"garage_{gi}"
+        aid = garage_to_a.get(gsid)
+        if aid is None:
+            totals.append(None)
+            cargos.append(None)
+            monitorings.append(None)
+            services.append(None)
+            linked_vals.append(None)
+            continue
+        a_total = int(station_total_by_id.get(aid, 0))
+        linked_total = a_total + int(b_sum_by_a.get(aid, 0))
+        garage_total = int(round(float(linked_total) * 0.30))
+        c, m, s = _split_counts(garage_total)
+        totals.append(garage_total)
+        cargos.append(c)
+        monitorings.append(m)
+        services.append(s)
+        linked_vals.append(linked_total)
+
+    out["garage_drones_total"] = totals
+    out["garage_drones_cargo"] = cargos
+    out["garage_drones_monitoring"] = monitorings
+    out["garage_drones_service"] = services
+    out["garage_linked_charging_total"] = linked_vals
+    return out
+
+
 def _lonlat_exclusions_from_gdf(gdf: Optional[gpd.GeoDataFrame]) -> List[Tuple[float, float]]:
     """Список (lon, lat) для запрета колокации."""
     if gdf is None or len(gdf) == 0:
@@ -4872,8 +4988,6 @@ def run_full_pipeline(
             min_separation_km=MIN_FACILITY_SEPARATION_KM,
             exclude_lonlat=busy_lonlat,
         )
-        # Вместимость гаражей по объёму с учётом 20% объёма под оборудование.
-        garages = _attach_garage_capacity_by_volume(garages)
     else:
         garages = gpd.GeoDataFrame()
         to_stations = gpd.GeoDataFrame()
@@ -4945,6 +5059,8 @@ def run_full_pipeline(
             no_fly_safety_buffer=0.0,
         )
     )
+    # Вместимость гаражей: только 30% от суммы дронов на связанных зарядках (A + привязанные к этой A станции B).
+    garages = _attach_garage_capacity_from_linked_charging(garages, cs_for_edges, branch_edges)
     # Этап 8: формирование локальной маршрутной сети (локальные связи внутри кластеров станций).
     # Этап 9: локальные связи также строятся через безопасную маршрутизацию с обходом препятствий.
     local_edges = placement.build_local_edges(
